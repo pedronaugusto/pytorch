@@ -2135,6 +2135,22 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertEqual(save_mean.dtype, torch.float32)
         self.assertEqual(save_var.dtype, torch.float32)
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_reflection_pad2d_channels_last(self):
+        x = torch.randn(1, 3, 4, 4, device="meta").to(
+            memory_format=torch.channels_last
+        )
+        result = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="reflect")
+        self.assertTrue(result.is_contiguous(memory_format=torch.channels_last))
+        self.assertEqual(result.shape, (1, 3, 6, 6))
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_reflection_pad2d_contiguous(self):
+        x = torch.randn(1, 3, 4, 4, device="meta")
+        result = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="reflect")
+        self.assertTrue(result.is_contiguous())
+        self.assertEqual(result.shape, (1, 3, 6, 6))
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
