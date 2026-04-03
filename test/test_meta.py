@@ -1974,6 +1974,21 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertEqual(eigenvectors.stride(-2), 1)
         self.assertEqual(eigenvectors.stride(-1), 3)
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_randint_like_tensor_overload_dtype_kwarg(self):
+        x = torch.randn(3, 4, device="meta")
+        high = torch.tensor(10, device="meta")
+        y = torch.ops.aten.randint_like.Tensor(x, high, dtype=torch.int32)
+        self.assertEqual(y.dtype, torch.int32)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_randint_like_tensor_overload_preserves_default(self):
+        x = torch.randn(3, 4, device="meta", dtype=torch.float16)
+        high = torch.tensor(10, device="meta")
+        y = torch.ops.aten.randint_like.Tensor(x, high)
+        self.assertEqual(y.dtype, torch.float16)
+        self.assertEqual(y.shape, (3, 4))
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
