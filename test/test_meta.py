@@ -2151,6 +2151,66 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertTrue(result.is_contiguous())
         self.assertEqual(result.shape, (1, 3, 6, 6))
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_mkldnn_rnn_backward_dtype(self):
+        hidden_size = 16
+        seq_len, batch, input_size = 5, 2, 8
+        input_t = torch.randn(seq_len, batch, input_size, device="meta", dtype=torch.bfloat16)
+        weight1 = torch.randn(hidden_size * 4, input_size, device="meta", dtype=torch.bfloat16)
+        weight2 = torch.randn(hidden_size * 4, device="meta", dtype=torch.bfloat16)
+        weight3 = torch.randn(hidden_size * 4, device="meta", dtype=torch.bfloat16)
+        weight4 = torch.randn(hidden_size * 4, hidden_size, device="meta", dtype=torch.bfloat16)
+        hx = torch.randn(1, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        cx = torch.randn(1, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        output = torch.randn(seq_len, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        hy = torch.randn(1, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        cy = torch.randn(1, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        grad_output = torch.randn(seq_len, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        grad_hy = torch.randn(1, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        grad_cy = torch.randn(1, batch, hidden_size, device="meta", dtype=torch.bfloat16)
+        workspace = torch.randn(10, device="meta", dtype=torch.bfloat16)
+        result = torch.ops.aten.mkldnn_rnn_layer_backward(
+            input_t, weight1, weight2, weight3, weight4,
+            hx, cx, output, hy, cy,
+            grad_output, grad_hy, grad_cy,
+            False, 2, hidden_size, 1, True, True,
+            False, [], False, workspace,
+        )
+        diff_x, diff_w1, diff_w2, diff_b1, diff_b2, diff_hx, diff_cx = result
+        self.assertEqual(diff_x.dtype, torch.float32)
+        self.assertEqual(diff_w1.dtype, torch.float32)
+        self.assertEqual(diff_hx.dtype, torch.float32)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_mkldnn_rnn_backward_gru_bias_shape(self):
+        hidden_size = 16
+        seq_len, batch, input_size = 5, 2, 8
+        input_t = torch.randn(seq_len, batch, input_size, device="meta")
+        weight1 = torch.randn(hidden_size * 3, input_size, device="meta")
+        weight2 = torch.randn(hidden_size * 3, device="meta")
+        weight3 = torch.randn(hidden_size * 3, device="meta")
+        weight4 = torch.randn(hidden_size * 3, hidden_size, device="meta")
+        hx = torch.randn(1, batch, hidden_size, device="meta")
+        cx = torch.randn(1, batch, hidden_size, device="meta")
+        output = torch.randn(seq_len, batch, hidden_size, device="meta")
+        hy = torch.randn(1, batch, hidden_size, device="meta")
+        cy = torch.randn(1, batch, hidden_size, device="meta")
+        grad_output = torch.randn(seq_len, batch, hidden_size, device="meta")
+        grad_hy = torch.randn(1, batch, hidden_size, device="meta")
+        grad_cy = torch.randn(1, batch, hidden_size, device="meta")
+        workspace = torch.randn(10, device="meta")
+        result = torch.ops.aten.mkldnn_rnn_layer_backward(
+            input_t, weight1, weight2, weight3, weight4,
+            hx, cx, output, hy, cy,
+            grad_output, grad_hy, grad_cy,
+            False, 3, hidden_size, 1, True, True,
+            False, [], False, workspace,
+        )
+        diff_x, diff_w1, diff_w2, diff_b1, diff_b2, diff_hx, diff_cx = result
+        expected_bias_shape = torch.Size([4 * hidden_size])
+        self.assertEqual(diff_b1.shape, expected_bias_shape)
+        self.assertEqual(diff_b2.shape, expected_bias_shape)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 

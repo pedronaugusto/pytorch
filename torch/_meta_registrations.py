@@ -7954,12 +7954,17 @@ def mkldnn_rnn_layer_backward(
     batch_first,
     workspace,
 ):
-    diff_x = input.new_empty(input.shape)
-    diff_hx = hx_.new_empty(hx_.shape)
-    diff_cx = cx_tmp.new_empty(cx_tmp.shape)
-    diff_w1 = weight0.new_empty(weight0.shape)
-    diff_w2 = weight1.new_empty(weight1.shape)
-    diff_b = weight2.new_empty(weight2.shape)
+    # C++ backward creates diff tensors as fp32 regardless of input dtype.
+    # Bias shape comes from _shuffle_bias(weight2, weight3, mode) which
+    # produces [num_bias_gates * hidden_size]. num_bias_gates is 4 for
+    # both LSTM (mode=2) and GRU (mode=3), and 1 for RNN (mode=0,1).
+    num_bias_gates = 4 if mode in (2, 3) else 1
+    diff_x = input.new_empty(input.shape, dtype=torch.float)
+    diff_hx = hx_.new_empty(hx_.shape, dtype=torch.float)
+    diff_cx = cx_tmp.new_empty(cx_tmp.shape, dtype=torch.float)
+    diff_w1 = weight0.new_empty(weight0.shape, dtype=torch.float)
+    diff_w2 = weight1.new_empty(weight1.shape, dtype=torch.float)
+    diff_b = weight2.new_empty([num_bias_gates * hidden_size], dtype=torch.float)
     return diff_x, diff_w1, diff_w2, diff_b, diff_b, diff_hx, diff_cx
 
 
