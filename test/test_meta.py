@@ -2075,6 +2075,22 @@ class TestMetaKernelRegistrations(TestCase):
         )
         self.assertEqual(result.shape, (10, 3))
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_avg_pool3d_divisor_zero_error(self):
+        x = torch.randn(1, 1, 4, 4, 4, device="meta")
+        with self.assertRaisesRegex(RuntimeError, "divisor"):
+            torch.nn.functional.avg_pool3d(x, kernel_size=2, divisor_override=0)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_avg_pool3d_backward_divisor_zero_error(self):
+        grad_output = torch.randn(1, 1, 2, 2, 2, device="meta")
+        with self.assertRaisesRegex(RuntimeError, "divisor"):
+            torch.ops.aten.avg_pool3d_backward(
+                grad_output,
+                torch.randn(1, 1, 4, 4, 4, device="meta"),
+                [2, 2, 2], [2, 2, 2], [0, 0, 0], True, True, 0,
+            )
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
