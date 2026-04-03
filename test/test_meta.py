@@ -2105,6 +2105,22 @@ class TestMetaKernelRegistrations(TestCase):
         result = x.fill_(value)
         self.assertEqual(result.shape, (3, 4))
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_weight_int8pack_mm_inner_dim_mismatch(self):
+        A = torch.randn(4, 8, device="meta")
+        B = torch.randint(-128, 127, (3, 16), device="meta", dtype=torch.int8)
+        scales = torch.randn(3, device="meta")
+        with self.assertRaises(RuntimeError):
+            torch.ops.aten._weight_int8pack_mm(A, B, scales)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_weight_int8pack_mm_scales_mismatch(self):
+        A = torch.randn(4, 8, device="meta")
+        B = torch.randint(-128, 127, (3, 8), device="meta", dtype=torch.int8)
+        scales = torch.randn(5, device="meta")
+        with self.assertRaises(RuntimeError):
+            torch.ops.aten._weight_int8pack_mm(A, B, scales)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
