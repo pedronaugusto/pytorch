@@ -2006,6 +2006,35 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertEqual(result.shape, (3, 4))
         self.assertEqual(result.dtype, torch.float32)
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_pad_sequence_decomp_left(self):
+        from torch._decomp import decompositions
+        a = torch.tensor([1, 2, 3])
+        b = torch.tensor([4, 5])
+        result = decompositions.pad_sequence(
+            [a, b], batch_first=True, padding_value=0.0, padding_side='left'
+        )
+        expected = torch.tensor([[1, 2, 3], [0, 4, 5]])
+        self.assertEqual(result, expected)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_pad_sequence_decomp_left_meta(self):
+        a = torch.randn(3, 4, device='meta')
+        b = torch.randn(5, 4, device='meta')
+        result = torch.nn.utils.rnn.pad_sequence([a, b], batch_first=True, padding_side='left')
+        self.assertEqual(result.shape, (2, 5, 4))
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_pad_sequence_decomp_left_not_batch_first(self):
+        from torch._decomp import decompositions
+        a = torch.tensor([1, 2, 3])
+        b = torch.tensor([4, 5])
+        result = decompositions.pad_sequence(
+            [a, b], batch_first=False, padding_value=0.0, padding_side='left'
+        )
+        expected = torch.tensor([[1, 0], [2, 4], [3, 5]])
+        self.assertEqual(result, expected)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
