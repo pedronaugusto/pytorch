@@ -1956,6 +1956,17 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertEqual(result.dim(), 0)
         self.assertEqual(result.shape, torch.Size([]))
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_rrelu_backward_small_range(self):
+        from torch._decomp.decompositions import rrelu_with_noise_backward
+        x = torch.randn(5, requires_grad=True)
+        lower, upper = 0.125, 0.125 + 1e-7
+        noise = torch.rand(5)
+        grad = torch.ones(5)
+        expected = noise * grad
+        result = rrelu_with_noise_backward(grad, x, noise, lower, upper, True, False)
+        self.assertEqual(result, expected)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
