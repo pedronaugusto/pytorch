@@ -1989,6 +1989,23 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertEqual(y.dtype, torch.float16)
         self.assertEqual(y.shape, (3, 4))
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_prelu_decomp_dtype_mismatch_error(self):
+        from torch._refs.nn.functional import prelu as prelu_decomp
+        x = torch.randn(3, 4, device="meta", dtype=torch.float32)
+        weight = torch.randn(4, device="meta", dtype=torch.float16)
+        with self.assertRaisesRegex(RuntimeError, "Type promoting not supported"):
+            prelu_decomp(x, weight)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_prelu_decomp_same_dtype_ok(self):
+        from torch._refs.nn.functional import prelu as prelu_decomp
+        x = torch.randn(3, 4, device="meta", dtype=torch.float32)
+        weight = torch.randn(4, device="meta", dtype=torch.float32)
+        result = prelu_decomp(x, weight)
+        self.assertEqual(result.shape, (3, 4))
+        self.assertEqual(result.dtype, torch.float32)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
