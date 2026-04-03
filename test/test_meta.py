@@ -2059,6 +2059,22 @@ class TestMetaKernelRegistrations(TestCase):
             )
             self.assertEqual(len(result.shape), 2)
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_segment_reduce_shape_with_extra_dims(self):
+        data = torch.randn(10, 5, device="meta")
+        lengths = torch.tensor([3, 4, 3])
+        result = torch.segment_reduce(data, "sum", lengths=lengths, axis=0)
+        self.assertEqual(result.shape, (3, 5))
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_segment_reduce_2d_data_batched_lengths(self):
+        data = torch.randn(10, 5, device="meta")
+        lengths = torch.ones(2, 3, dtype=torch.long)
+        result = torch.segment_reduce(
+            data, "sum", lengths=lengths, axis=1, unsafe=True
+        )
+        self.assertEqual(result.shape, (10, 3))
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
