@@ -921,6 +921,10 @@ endif()
 
 if(USE_ROCM)
   set(ATen_HIP_SRCS ${all_hip_cpp})
+  # Hagane: add stub implementations for excluded kernel functions
+  if(HIP_PLATFORM STREQUAL "hagane" OR "$ENV{__HIP_PLATFORM_HAGANE__}" STREQUAL "1")
+    list(APPEND ATen_HIP_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/hip/HaganeStubs.cpp")
+  endif()
   # caffe2_nvrtc's stubs to driver APIs are useful for HIP.
   # See NOTE [ ATen NVRTC Stub and HIP ]
   set(ATen_NVRTC_STUB_SRCS ${hip_nvrtc_stub_cpp})

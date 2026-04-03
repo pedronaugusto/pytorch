@@ -293,6 +293,11 @@ template <typename func_t, typename array_t>
 static inline void launch_vectorized_kernel(
     int64_t N,
     const func_t& f,
+#if defined(__HIP_PLATFORM_HAGANE__) && !defined(__CUDACC__)
+    array_t data) {
+  (void)N; (void)f; (void)data;
+}
+#else
     array_t data) {
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
   using traits = function_traits<func_t>;
@@ -364,6 +369,7 @@ static inline void launch_vectorized_kernel(
       TORCH_INTERNAL_ASSERT(false, "Unexpected vectorization size");
   }
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 #ifdef USE_ROCM
 template <
@@ -437,6 +443,11 @@ static inline void launch_vectorized_templated_kernel(
     int64_t N,
     const func_t& f,
     array_t data,
+#if defined(__HIP_PLATFORM_HAGANE__) && !defined(__CUDACC__)
+    inp_calc_t ic, out_calc_t oc, loader_t l, storer_t s) {
+  (void)N; (void)f; (void)data; (void)ic; (void)oc; (void)l; (void)s;
+}
+#else
     inp_calc_t ic,
     out_calc_t oc,
     loader_t l,
@@ -497,6 +508,7 @@ static inline void launch_vectorized_templated_kernel(
       TORCH_INTERNAL_ASSERT(false, "Unexpected vectorization size");
   }
 }
+#endif // Hagane guard
 #endif
 
 template <
@@ -514,6 +526,9 @@ static inline void launch_unrolled_kernel(
     out_calc_t oc,
     loader_t l,
     storer_t s) {
+#if defined(__HIP_PLATFORM_HAGANE__) && !defined(__CUDACC__)
+  (void)N; (void)f; (void)data; (void)ic; (void)oc; (void)l; (void)s;
+#else
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
 
   int64_t grid = (N + elementwise_block_work_size() - 1) / elementwise_block_work_size();
@@ -521,8 +536,10 @@ static inline void launch_unrolled_kernel(
   unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size()>
       <<<grid, num_threads(), 0, stream>>>(N, f, data, ic, oc, l, s);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
+#if !defined(__HIP_PLATFORM_HAGANE__) || defined(__CUDACC__)
 template <int nt, int vt, typename func_t>
 C10_LAUNCH_BOUNDS_2(nt, 4)
 __global__ void elementwise_kernel(int N, func_t f) {
@@ -537,9 +554,13 @@ __global__ void elementwise_kernel(int N, func_t f) {
     }
   }
 }
+#endif
 
 template <int nt, int vt, typename func_t>
 static void launch_legacy_kernel(int64_t N, const func_t& f) {
+#if defined(__HIP_PLATFORM_HAGANE__) && !defined(__CUDACC__)
+  (void)N; (void)f;
+#else
   TORCH_INTERNAL_ASSERT(N >= 0 && N <= std::numeric_limits<int32_t>::max());
   if (N == 0) {
     return;
@@ -549,9 +570,11 @@ static void launch_legacy_kernel(int64_t N, const func_t& f) {
   auto stream = at::cuda::getCurrentCUDAStream();
   elementwise_kernel<nt, vt, func_t><<<grid, block, 0, stream>>>(N, f);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 #ifdef USE_ROCM
+#if !defined(__HIP_PLATFORM_HAGANE__) || defined(__CUDACC__)
 template <int nt, int vt, typename func_t>
 C10_LAUNCH_BOUNDS_2(nt, 4)
 __global__ void elementwise_kernel_manual_unroll(int N, func_t f) {
@@ -570,9 +593,13 @@ __global__ void elementwise_kernel_manual_unroll(int N, func_t f) {
     }
   }
 }
+#endif
 
 template <int nt, int vt, typename func_t>
 static void launch_legacy_kernel_manual_unroll(int64_t N, const func_t& f) {
+#if defined(__HIP_PLATFORM_HAGANE__) && !defined(__CUDACC__)
+  (void)N; (void)f;
+#else
   TORCH_INTERNAL_ASSERT(N >= 0 && N <= std::numeric_limits<int32_t>::max());
   if (N == 0) {
     return;
@@ -582,6 +609,7 @@ static void launch_legacy_kernel_manual_unroll(int64_t N, const func_t& f) {
   auto stream = at::cuda::getCurrentCUDAStream();
   elementwise_kernel_manual_unroll<nt, vt, func_t><<<grid, block, 0, stream>>>(N, f);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 #endif
 

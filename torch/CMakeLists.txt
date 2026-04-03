@@ -315,6 +315,10 @@ endif()
 
 
 add_library(torch_python SHARED ${TORCH_PYTHON_SRCS})
+# Hagane: allow undefined symbols from excluded .hip kernel files
+if("$ENV{__HIP_PLATFORM_HAGANE__}" STREQUAL "1")
+  target_link_options(torch_python PRIVATE "-undefined" "dynamic_lookup")
+endif()
 torch_compile_options(torch_python)  # see cmake/public/utils.cmake
 if(APPLE)
   target_compile_options(torch_python PRIVATE

@@ -56,7 +56,7 @@
 #include <ATen/ops/zeros.h>
 #endif
 
-#ifdef __HIP_PLATFORM_AMD__
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HAGANE__)
 #include <ATen/native/cudnn/hip/MHA.h>
 #else
 #include <ATen/native/cudnn/MHA.h>

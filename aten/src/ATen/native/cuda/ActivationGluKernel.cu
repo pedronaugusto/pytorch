@@ -123,6 +123,7 @@ void launch_glu_backward_kernel(
         auto gI = static_cast<scalar_t*>(iter.data_ptr(0));
         auto I = static_cast<const scalar_t*>(iter.data_ptr(1));
         auto gO = static_cast<const scalar_t*>(iter.data_ptr(2));
+#if !defined(__HIP_PLATFORM_HAGANE__)
         glu_backward_kernel<<<grid, block_size, 0, stream>>>(
             N,
             gI,
@@ -132,6 +133,7 @@ void launch_glu_backward_kernel(
             gI_stride * sizeof(scalar_t),
             I_stride * sizeof(scalar_t));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
       });
 }
 

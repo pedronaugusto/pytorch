@@ -1603,6 +1603,10 @@ def configure_extension_build() -> tuple[
     else:
         excludes.extend(["functorch", "functorch.*"])
     packages = find_packages(include=includes, exclude=excludes)
+    # Hagane: allow undefined symbols from excluded .hip kernel files
+    _hagane_link_args = []
+    if os.environ.get("__HIP_PLATFORM_HAGANE__"):
+        _hagane_link_args = ["-undefined", "dynamic_lookup"]
     C = Extension(
         "torch._C",
         libraries=main_libraries,
@@ -1618,6 +1622,7 @@ def configure_extension_build() -> tuple[
             *extra_link_args,
             *main_link_args,
             *make_relative_rpath_args("lib"),
+            *_hagane_link_args,
         ],
     )
     ext_modules.append(C)

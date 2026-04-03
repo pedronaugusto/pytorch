@@ -475,6 +475,9 @@ struct RegisterPRIVATEUSE1Dispatch {
 // is HIP in the PyTorch HIPify build.
 #define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
 // #define REGISTER_DISPATCH(name, fn) REGISTER_HIP_DISPATCH(name, fn)
+#elif defined(__HIP_PLATFORM_HAGANE__) && !defined(CPU_CAPABILITY)
+// Hagane: .hip files compiled as C++ without __HIPCC__, but still need CUDA dispatch
+#define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
 #elif defined(__OBJC__) && defined(USE_MPS)
 // NB: this macro must be used from a 'mm' file in order to dispatch a MPS kernel
 #define REGISTER_DISPATCH(name, fn) REGISTER_MPS_DISPATCH(name, fn)

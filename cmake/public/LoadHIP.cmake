@@ -250,7 +250,7 @@ if(HIP_FOUND)
         )
       try_compile(hipblaslt_compile_result_outer_vec ${PROJECT_RANDOM_BINARY_DIR} ${file}
         CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${ROCM_INCLUDE_DIRS}"
-        COMPILE_DEFINITIONS -D__HIP_PLATFORM_AMD__ -D__HIP_PLATFORM_HCC__
+        COMPILE_DEFINITIONS -D__HIP_PLATFORM_HAGANE__
         OUTPUT_VARIABLE hipblaslt_compile_output_outer_vec)
 
       # check whether hipblaslt provides HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT
@@ -265,7 +265,7 @@ if(HIP_FOUND)
         )
       try_compile(hipblaslt_compile_result_vec_ext ${PROJECT_RANDOM_BINARY_DIR} ${file}
         CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${ROCM_INCLUDE_DIRS}"
-        COMPILE_DEFINITIONS -D__HIP_PLATFORM_AMD__ -D__HIP_PLATFORM_HCC__
+        COMPILE_DEFINITIONS -D__HIP_PLATFORM_HAGANE__
         OUTPUT_VARIABLE hipblaslt_compile_output_vec_ext)
 
       if(hipblaslt_compile_result_outer_vec)

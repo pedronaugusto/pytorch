@@ -3,13 +3,15 @@
 /* This file defines math functions compatible across different gpu
  * platforms (currently CUDA and HIP).
  */
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if defined(__CUDACC__) || defined(__HIPCC__) || defined(__HIP_PLATFORM_HAGANE__)
 
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
 
 #ifdef __HIPCC__
 #define __MATH_FUNCTIONS_DECL__ inline C10_DEVICE
+#elif defined(__HIP_PLATFORM_HAGANE__)
+#define __MATH_FUNCTIONS_DECL__ inline
 #else /* __HIPCC__ */
 #ifdef __CUDACC_RTC__
 #define __MATH_FUNCTIONS_DECL__ C10_HOST_DEVICE
@@ -106,10 +108,18 @@ __MATH_FUNCTIONS_DECL__ double pow(double x, double y) {
 }
 
 __MATH_FUNCTIONS_DECL__ void sincos(float x, float* sptr, float* cptr) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  *sptr = ::sinf(x); *cptr = ::cosf(x);
+#else
   return ::sincosf(x, sptr, cptr);
+#endif
 }
 __MATH_FUNCTIONS_DECL__ void sincos(double x, double* sptr, double* cptr) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  *sptr = ::sin(x); *cptr = ::cos(x);
+#else
   return ::sincos(x, sptr, cptr);
+#endif
 }
 
 __MATH_FUNCTIONS_DECL__ float sqrt(float x) {
@@ -120,10 +130,18 @@ __MATH_FUNCTIONS_DECL__ double sqrt(double x) {
 }
 
 __MATH_FUNCTIONS_DECL__ float rsqrt(float x) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  return 1.0f / ::sqrtf(x);
+#else
   return ::rsqrtf(x);
+#endif
 }
 __MATH_FUNCTIONS_DECL__ double rsqrt(double x) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  return 1.0 / ::sqrt(x);
+#else
   return ::rsqrt(x);
+#endif
 }
 
 __MATH_FUNCTIONS_DECL__ float tan(float x) {
@@ -141,10 +159,18 @@ __MATH_FUNCTIONS_DECL__ double tanh(double x) {
 }
 
 __MATH_FUNCTIONS_DECL__ float normcdf(float x) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  return 0.5f * ::erfcf(-x * 0.7071067811865475f);
+#else
   return ::normcdff(x);
+#endif
 }
 __MATH_FUNCTIONS_DECL__ double normcdf(double x) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  return 0.5 * ::erfc(-x * 0.7071067811865475);
+#else
   return ::normcdf(x);
+#endif
 }
 
 } // namespace c10::cuda::compat

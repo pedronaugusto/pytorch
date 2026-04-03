@@ -1,6 +1,6 @@
 #include <ATen/jit_macros.h>
 
-#if AT_USE_JITERATOR()
+#if AT_USE_JITERATOR() && !defined(__HIP_PLATFORM_HAGANE__)
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/jiterator.h>
