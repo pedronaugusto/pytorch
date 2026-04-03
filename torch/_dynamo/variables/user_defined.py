@@ -1807,14 +1807,14 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
         while True:
             try:
-                r = iter_.next_variable(tx)
+                r = iter_.tp_iternext(tx)
                 result.append(r)
             except ObservedUserStopIteration:
                 handle_observed_exception(tx)
                 break
         return result
 
-    def next_variable(self, tx: "InstructionTranslator") -> VariableTracker:
+    def tp_iternext(self, tx: "InstructionTranslator") -> VariableTracker:
         return self.call_method(tx, "__next__", [], {})
 
     def is_supported_random(self) -> bool:
