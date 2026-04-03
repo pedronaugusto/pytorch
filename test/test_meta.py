@@ -2091,6 +2091,20 @@ class TestMetaKernelRegistrations(TestCase):
                 [2, 2, 2], [2, 2, 2], [0, 0, 0], True, True, 0,
             )
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_fill_tensor_dim_check(self):
+        x = torch.randn(3, 4, device='meta')
+        value = torch.randn(2, 3, device='meta')
+        with self.assertRaisesRegex(RuntimeError, "0-dimension"):
+            x.fill_(value)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_fill_tensor_scalar_ok(self):
+        x = torch.randn(3, 4, device='meta')
+        value = torch.tensor(1.0, device='meta')
+        result = x.fill_(value)
+        self.assertEqual(result.shape, (3, 4))
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
