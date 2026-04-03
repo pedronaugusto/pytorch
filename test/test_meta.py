@@ -2035,6 +2035,30 @@ class TestMetaKernelRegistrations(TestCase):
         expected = torch.tensor([[1, 0], [2, 4], [3, 5]])
         self.assertEqual(result, expected)
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_padded_dense_to_jagged_total_L_zero(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        with FakeTensorMode():
+            padded = torch.randn(2, 3, 4)
+            offsets = [torch.tensor([0, 0, 0])]
+            result = torch.ops.aten._padded_dense_to_jagged_forward(
+                padded, offsets, total_L=0
+            )
+            self.assertEqual(result.shape[0], 0)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_padded_dense_to_jagged_total_L_none(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        shape_env = ShapeEnv(allow_dynamic_output_shape_ops=True)
+        with FakeTensorMode(shape_env=shape_env):
+            padded = torch.randn(2, 3, 4)
+            offsets = [torch.tensor([0, 1, 3])]
+            result = torch.ops.aten._padded_dense_to_jagged_forward(
+                padded, offsets, total_L=None
+            )
+            self.assertEqual(len(result.shape), 2)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
