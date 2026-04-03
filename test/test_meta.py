@@ -2121,6 +2121,20 @@ class TestMetaKernelRegistrations(TestCase):
         with self.assertRaises(RuntimeError):
             torch.ops.aten._weight_int8pack_mm(A, B, scales)
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_miopen_batch_norm_save_dtype(self):
+        input_t = torch.randn(2, 3, 4, 4, device="meta", dtype=torch.float16)
+        weight = torch.randn(3, device="meta", dtype=torch.float32)
+        bias = torch.randn(3, device="meta", dtype=torch.float32)
+        running_mean = torch.randn(3, device="meta", dtype=torch.float32)
+        running_var = torch.randn(3, device="meta", dtype=torch.float32)
+        result = torch.ops.aten.miopen_batch_norm(
+            input_t, weight, bias, running_mean, running_var, True, 0.1, 1e-5
+        )
+        output, save_mean, save_var = result
+        self.assertEqual(save_mean.dtype, torch.float32)
+        self.assertEqual(save_var.dtype, torch.float32)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
