@@ -1967,6 +1967,13 @@ class TestMetaKernelRegistrations(TestCase):
         result = rrelu_with_noise_backward(grad, x, noise, lower, upper, True, False)
         self.assertEqual(result, expected)
 
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_linalg_eig_strides_meta(self):
+        A = torch.randn(3, 3, device='meta')
+        eigenvalues, eigenvectors = torch.linalg.eig(A)
+        self.assertEqual(eigenvectors.stride(-2), 1)
+        self.assertEqual(eigenvectors.stride(-1), 3)
+
 
 instantiate_device_type_tests(TestMeta, globals())
 
