@@ -5,8 +5,12 @@ Reads undefined symbols from libtorch_hip.dylib and generates a .cpp file
 where each function stub throws "not implemented on Hagane/Metal" and each
 data symbol (DispatchStub instances) is allocated as zeroed storage.
 
+Symbols already defined in libtorch_cpu.dylib are excluded — they will be
+resolved at load time via dynamic linking.
+
 Usage:
     python tools/hagane_gen_stubs.py build/lib/libtorch_hip.dylib \
+        --cpu-lib build/lib/libtorch_cpu.dylib \
         -o build/aten/src/ATen/HaganeKernelStubs.cpp
 """
 
@@ -16,7 +20,22 @@ import sys
 from pathlib import Path
 
 
-def get_undefined_native_symbols(dylib_path: str) -> list[tuple[str, str]]:
+def get_defined_symbols(dylib_path: str) -> set[str]:
+    """Return set of mangled symbol names defined (exported) in a dylib."""
+    result = subprocess.run(
+        ["nm", "-gU", dylib_path], capture_output=True, text=True, check=True
+    )
+    symbols = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            symbols.add(parts[2])
+    return symbols
+
+
+def get_undefined_native_symbols(
+    dylib_path: str, cpu_defined: set[str] | None = None
+) -> list[tuple[str, str]]:
     """Return (mangled, demangled) pairs for undefined symbols from excluded kernel files.
 
     Catches at::native::*, at::hip::detail::*, and at::cuda::* — anything that
@@ -43,10 +62,29 @@ def get_undefined_native_symbols(dylib_path: str) -> list[tuple[str, str]]:
     # prepended (e.g., "void at::native::foo<float>(...)")
     STUB_PATTERNS = ("at::native::", "at::hip::detail::", "at::cuda::jit::")
 
+    # Symbols with real implementations in HaganeOps.cpp — do not stub these.
+    HAGANE_IMPLEMENTED = (
+        "at::native::empty_cuda(",
+        "at::native::empty_strided_cuda(",
+    )
+
+    if cpu_defined is None:
+        cpu_defined = set()
+
     pairs = []
+    skipped_cpu = 0
     for m, d in zip(mangled, demangled):
         if any(pat in d for pat in STUB_PATTERNS):
+            if any(impl in d for impl in HAGANE_IMPLEMENTED):
+                continue
+            # Skip symbols defined in libtorch_cpu — resolved at load time
+            if m in cpu_defined:
+                skipped_cpu += 1
+                continue
             pairs.append((m, d))
+
+    if skipped_cpu:
+        print(f"  Skipped {skipped_cpu} symbols (defined in libtorch_cpu)")
     return pairs
 
 
@@ -137,11 +175,18 @@ def generate_cpp(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dylib", help="Path to libtorch_hip.dylib")
+    parser.add_argument("--cpu-lib", help="Path to libtorch_cpu.dylib (exclude its symbols)")
     parser.add_argument("-o", "--output", required=True, help="Output .cpp path")
     args = parser.parse_args()
 
-    pairs = get_undefined_native_symbols(args.dylib)
-    print(f"Found {len(pairs)} undefined at::native::* symbols")
+    cpu_defined = None
+    if args.cpu_lib:
+        print(f"Reading defined symbols from {args.cpu_lib}...")
+        cpu_defined = get_defined_symbols(args.cpu_lib)
+        print(f"  {len(cpu_defined)} symbols in libtorch_cpu")
+
+    pairs = get_undefined_native_symbols(args.dylib, cpu_defined)
+    print(f"Found {len(pairs)} symbols needing stubs")
 
     functions, data = classify_symbols(pairs)
     print(f"  Functions: {len(functions)}")
