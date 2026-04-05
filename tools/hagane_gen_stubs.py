@@ -67,6 +67,8 @@ def get_undefined_native_symbols(
         "at::native::empty_cuda(",
         "at::native::empty_strided_cuda(",
         "at::native::structured_ufunc_add_CUDA::impl(",
+        "at::native::GeluCUDAKernelImpl(",
+        "at::native::GeluBackwardCUDAKernelImpl(",
     )
 
     if cpu_defined is None:
