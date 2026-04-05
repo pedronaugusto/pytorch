@@ -66,6 +66,7 @@ def get_undefined_native_symbols(
     HAGANE_IMPLEMENTED = (
         "at::native::empty_cuda(",
         "at::native::empty_strided_cuda(",
+        "at::native::structured_ufunc_add_CUDA::impl(",
     )
 
     if cpu_defined is None:
