@@ -696,6 +696,804 @@ C10_EXPORT Tensor nonzero_cuda(const Tensor& self) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Batch 5: Foreach ops — Metal GPU via MLX
+// All foreach ops iterate tensor lists and apply element-wise MLX operations.
+// ---------------------------------------------------------------------------
+
+// --- Foreach unary ops ---
+
+#define FOREACH_UNARY_IMPL(name, cfunc) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_cuda(TensorList tensors) { \
+  std::vector<Tensor> r; r.reserve(tensors.size()); \
+  for (const auto& t : tensors) { \
+    auto out = at::empty_like(t); \
+    auto id = make_tensor_desc(t), od = make_tensor_desc(out); \
+    cfunc(&id, &od); \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_cuda_(TensorList tensors) { \
+  for (const auto& t : tensors) { \
+    auto d = make_tensor_desc(t); \
+    cfunc(&d, &d); \
+  } \
+}
+
+FOREACH_UNARY_IMPL(abs, haganeOpsAbs)
+FOREACH_UNARY_IMPL(neg, haganeOpsNeg)
+FOREACH_UNARY_IMPL(cos, haganeOpsCos)
+FOREACH_UNARY_IMPL(sin, haganeOpsSin)
+FOREACH_UNARY_IMPL(tan, haganeOpsTan)
+FOREACH_UNARY_IMPL(acos, haganeOpsAcos)
+FOREACH_UNARY_IMPL(asin, haganeOpsAsin)
+FOREACH_UNARY_IMPL(atan, haganeOpsAtan)
+FOREACH_UNARY_IMPL(cosh, haganeOpsCosh)
+FOREACH_UNARY_IMPL(sinh, haganeOpsSinh)
+FOREACH_UNARY_IMPL(tanh, haganeOpsTanh)
+FOREACH_UNARY_IMPL(exp, haganeOpsExp)
+FOREACH_UNARY_IMPL(expm1, haganeOpsExpm1)
+FOREACH_UNARY_IMPL(log, haganeOpsLog)
+FOREACH_UNARY_IMPL(log2, haganeOpsLog2)
+FOREACH_UNARY_IMPL(log10, haganeOpsLog10)
+FOREACH_UNARY_IMPL(log1p, haganeOpsLog1p)
+FOREACH_UNARY_IMPL(sqrt, haganeOpsSqrt)
+FOREACH_UNARY_IMPL(rsqrt, haganeOpsRsqrt)
+FOREACH_UNARY_IMPL(ceil, haganeOpsCeil)
+FOREACH_UNARY_IMPL(floor, haganeOpsFloor)
+FOREACH_UNARY_IMPL(round, haganeOpsRound)
+FOREACH_UNARY_IMPL(trunc, haganeOpsTrunc)
+FOREACH_UNARY_IMPL(frac, haganeOpsFrac)
+FOREACH_UNARY_IMPL(sign, haganeOpsSign)
+FOREACH_UNARY_IMPL(sigmoid, haganeOpsSigmoid)
+FOREACH_UNARY_IMPL(erf, haganeOpsErf)
+FOREACH_UNARY_IMPL(erfc, haganeOpsErfc)
+FOREACH_UNARY_IMPL(reciprocal, haganeOpsReciprocal)
+FOREACH_UNARY_IMPL(lgamma, haganeOpsLgamma)
+
+#undef FOREACH_UNARY_IMPL
+
+// zero_ is inplace-only
+C10_EXPORT void foreach_tensor_zero_cuda_(TensorList tensors) {
+  for (const auto& t : tensors) {
+    auto d = make_tensor_desc(t);
+    haganeOpsFill(&d, 0.0);
+  }
+}
+
+// clone returns new tensors (with optional memory format)
+C10_EXPORT std::vector<Tensor> foreach_tensor_clone_cuda(
+    TensorList tensors, std::optional<MemoryFormat> memory_format) {
+  std::vector<Tensor> r; r.reserve(tensors.size());
+  for (const auto& t : tensors) {
+    r.push_back(t.clone(memory_format.value_or(MemoryFormat::Preserve)));
+  }
+  return r;
+}
+
+// --- Foreach binary scalar ops ---
+
+#define FOREACH_BINARY_SCALAR_IMPL(name, op_expr) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_scalar_kernel_cuda( \
+    TensorList tensors, const Scalar& scalar) { \
+  std::vector<Tensor> r; r.reserve(tensors.size()); \
+  for (const auto& t : tensors) { \
+    auto out = at::empty_like(t); \
+    auto s = at::scalar_tensor(scalar, t.options()); \
+    auto id = make_tensor_desc(t), sd = make_tensor_desc(s), od = make_tensor_desc(out); \
+    op_expr; \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_scalar_kernel_cuda_( \
+    TensorList tensors, const Scalar& scalar) { \
+  for (const auto& t : tensors) { \
+    auto s = at::scalar_tensor(scalar, t.options()); \
+    auto id = make_tensor_desc(t), sd = make_tensor_desc(s); \
+    auto od = id; od.data = const_cast<void*>(t.const_data_ptr()); \
+    op_expr; \
+  } \
+}
+
+FOREACH_BINARY_SCALAR_IMPL(add, haganeOpsAdd(&id, &sd, &od, 1.0f))
+FOREACH_BINARY_SCALAR_IMPL(sub, haganeOpsSub(&id, &sd, &od, 1.0f))
+FOREACH_BINARY_SCALAR_IMPL(mul, haganeOpsMul(&id, &sd, &od))
+FOREACH_BINARY_SCALAR_IMPL(div, haganeOpsDiv(&id, &sd, &od))
+FOREACH_BINARY_SCALAR_IMPL(pow, haganeOpsPow(&id, &sd, &od))
+FOREACH_BINARY_SCALAR_IMPL(clamp_max, haganeOpsMinimum(&id, &sd, &od))
+FOREACH_BINARY_SCALAR_IMPL(clamp_min, haganeOpsMaximum(&id, &sd, &od))
+
+#undef FOREACH_BINARY_SCALAR_IMPL
+
+// scalar^tensor (pow with scalar base)
+C10_EXPORT std::vector<Tensor> foreach_scalar_pow_list_kernel_cuda(
+    const Scalar& scalar, TensorList exponent) {
+  std::vector<Tensor> r; r.reserve(exponent.size());
+  for (const auto& t : exponent) {
+    auto base = at::scalar_tensor(scalar, t.options());
+    auto out = at::empty_like(t);
+    auto bd = make_tensor_desc(base), td = make_tensor_desc(t), od = make_tensor_desc(out);
+    haganeOpsPow(&bd, &td, &od);
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+
+// --- Foreach binary list ops ---
+
+#define FOREACH_BINARY_LIST_IMPL(name, op_expr) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_list_kernel_cuda( \
+    TensorList t1, TensorList t2) { \
+  std::vector<Tensor> r; r.reserve(t1.size()); \
+  for (size_t i = 0; i < t1.size(); i++) { \
+    auto out = at::empty_like(t1[i]); \
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]), od = make_tensor_desc(out); \
+    op_expr; \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_list_kernel_cuda_( \
+    TensorList t1, TensorList t2) { \
+  for (size_t i = 0; i < t1.size(); i++) { \
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]); \
+    auto od = ad; od.data = const_cast<void*>(t1[i].const_data_ptr()); \
+    op_expr; \
+  } \
+}
+
+FOREACH_BINARY_LIST_IMPL(mul, haganeOpsMul(&ad, &bd, &od))
+FOREACH_BINARY_LIST_IMPL(div, haganeOpsDiv(&ad, &bd, &od))
+FOREACH_BINARY_LIST_IMPL(pow, haganeOpsPow(&ad, &bd, &od))
+FOREACH_BINARY_LIST_IMPL(clamp_max, haganeOpsMinimum(&ad, &bd, &od))
+FOREACH_BINARY_LIST_IMPL(clamp_min, haganeOpsMaximum(&ad, &bd, &od))
+
+#undef FOREACH_BINARY_LIST_IMPL
+
+// add/sub list with alpha parameter
+C10_EXPORT std::vector<Tensor> foreach_tensor_add_list_kernel_cuda(
+    TensorList t1, TensorList t2, const Scalar& alpha) {
+  std::vector<Tensor> r; r.reserve(t1.size());
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto out = at::empty_like(t1[i]);
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]), od = make_tensor_desc(out);
+    haganeOpsAdd(&ad, &bd, &od, alpha.toFloat());
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+C10_EXPORT void foreach_tensor_add_list_kernel_cuda_(
+    TensorList t1, TensorList t2, const Scalar& alpha) {
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]);
+    auto od = ad; od.data = const_cast<void*>(t1[i].const_data_ptr());
+    haganeOpsAdd(&ad, &bd, &od, alpha.toFloat());
+  }
+}
+
+C10_EXPORT std::vector<Tensor> foreach_tensor_sub_list_kernel_cuda(
+    TensorList t1, TensorList t2, const Scalar& alpha) {
+  std::vector<Tensor> r; r.reserve(t1.size());
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto out = at::empty_like(t1[i]);
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]), od = make_tensor_desc(out);
+    haganeOpsSub(&ad, &bd, &od, alpha.toFloat());
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+C10_EXPORT void foreach_tensor_sub_list_kernel_cuda_(
+    TensorList t1, TensorList t2, const Scalar& alpha) {
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]);
+    auto od = ad; od.data = const_cast<void*>(t1[i].const_data_ptr());
+    haganeOpsSub(&ad, &bd, &od, alpha.toFloat());
+  }
+}
+
+// copy list (inplace only)
+C10_EXPORT void foreach_tensor_copy_list_kernel_cuda_(
+    TensorList self, TensorList src, bool /*non_blocking*/) {
+  for (size_t i = 0; i < self.size(); i++) {
+    auto sd = make_tensor_desc(src[i]);
+    auto dd = make_tensor_desc(self[i]);
+    dd.data = const_cast<void*>(self[i].const_data_ptr());
+    std::memcpy(dd.data, sd.data, self[i].numel() * self[i].itemsize());
+  }
+}
+
+// --- Foreach binary scalarlist ops ---
+
+#define FOREACH_BINARY_SCALARLIST_IMPL(name, op_expr) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_scalarlist_kernel_cuda( \
+    TensorList tensors, at::ArrayRef<Scalar> scalars) { \
+  std::vector<Tensor> r; r.reserve(tensors.size()); \
+  for (size_t i = 0; i < tensors.size(); i++) { \
+    auto out = at::empty_like(tensors[i]); \
+    auto s = at::scalar_tensor(scalars[i], tensors[i].options()); \
+    auto td = make_tensor_desc(tensors[i]), sd = make_tensor_desc(s), od = make_tensor_desc(out); \
+    op_expr; \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_scalarlist_kernel_cuda_( \
+    TensorList tensors, at::ArrayRef<Scalar> scalars) { \
+  for (size_t i = 0; i < tensors.size(); i++) { \
+    auto s = at::scalar_tensor(scalars[i], tensors[i].options()); \
+    auto td = make_tensor_desc(tensors[i]), sd = make_tensor_desc(s); \
+    auto od = td; od.data = const_cast<void*>(tensors[i].const_data_ptr()); \
+    op_expr; \
+  } \
+}
+
+FOREACH_BINARY_SCALARLIST_IMPL(add, haganeOpsAdd(&td, &sd, &od, 1.0f))
+FOREACH_BINARY_SCALARLIST_IMPL(sub, haganeOpsSub(&td, &sd, &od, 1.0f))
+FOREACH_BINARY_SCALARLIST_IMPL(mul, haganeOpsMul(&td, &sd, &od))
+FOREACH_BINARY_SCALARLIST_IMPL(div, haganeOpsDiv(&td, &sd, &od))
+FOREACH_BINARY_SCALARLIST_IMPL(pow, haganeOpsPow(&td, &sd, &od))
+FOREACH_BINARY_SCALARLIST_IMPL(clamp_max, haganeOpsMinimum(&td, &sd, &od))
+FOREACH_BINARY_SCALARLIST_IMPL(clamp_min, haganeOpsMaximum(&td, &sd, &od))
+
+#undef FOREACH_BINARY_SCALARLIST_IMPL
+
+// --- Foreach binary tensor ops ---
+
+C10_EXPORT std::vector<Tensor> foreach_tensor_add_tensor_kernel_cuda(
+    TensorList tensors, const Tensor& tensor, const Scalar& alpha) {
+  std::vector<Tensor> r; r.reserve(tensors.size());
+  auto td2 = make_tensor_desc(tensor);
+  for (const auto& t : tensors) {
+    auto out = at::empty_like(t);
+    auto td1 = make_tensor_desc(t), od = make_tensor_desc(out);
+    haganeOpsAdd(&td1, &td2, &od, alpha.toFloat());
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+C10_EXPORT void foreach_tensor_add_tensor_kernel_cuda_(
+    TensorList tensors, const Tensor& tensor, const Scalar& alpha) {
+  auto td2 = make_tensor_desc(tensor);
+  for (const auto& t : tensors) {
+    auto td1 = make_tensor_desc(t);
+    auto od = td1; od.data = const_cast<void*>(t.const_data_ptr());
+    haganeOpsAdd(&td1, &td2, &od, alpha.toFloat());
+  }
+}
+
+#define FOREACH_BINARY_TENSOR_IMPL(name, op_expr) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_tensor_kernel_cuda( \
+    TensorList tensors, const Tensor& tensor) { \
+  std::vector<Tensor> r; r.reserve(tensors.size()); \
+  auto td2 = make_tensor_desc(tensor); \
+  for (const auto& t : tensors) { \
+    auto out = at::empty_like(t); \
+    auto td1 = make_tensor_desc(t), od = make_tensor_desc(out); \
+    op_expr; \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_tensor_kernel_cuda_( \
+    TensorList tensors, const Tensor& tensor) { \
+  auto td2 = make_tensor_desc(tensor); \
+  for (const auto& t : tensors) { \
+    auto td1 = make_tensor_desc(t); \
+    auto od = td1; od.data = const_cast<void*>(t.const_data_ptr()); \
+    op_expr; \
+  } \
+}
+
+FOREACH_BINARY_TENSOR_IMPL(mul, haganeOpsMul(&td1, &td2, &od))
+FOREACH_BINARY_TENSOR_IMPL(div, haganeOpsDiv(&td1, &td2, &od))
+
+#undef FOREACH_BINARY_TENSOR_IMPL
+
+// --- Foreach ternary (lerp) ops ---
+
+// lerp(a, b, weight) = a + weight * (b - a)
+C10_EXPORT std::vector<Tensor> foreach_tensor_lerp_ternary_cuda(
+    TensorList t1, TensorList t2, TensorList t3) {
+  std::vector<Tensor> r; r.reserve(t1.size());
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto out = at::empty_like(t1[i]);
+    // lerp(a, b, w) = a + w * (b - a)
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]);
+    auto wd = make_tensor_desc(t3[i]), od = make_tensor_desc(out);
+    // diff = b - a
+    auto diff = at::empty_like(t1[i]);
+    auto dd = make_tensor_desc(diff);
+    haganeOpsSub(&bd, &ad, &dd, 1.0f);
+    // w_diff = w * diff
+    auto w_diff = at::empty_like(t1[i]);
+    auto wdd = make_tensor_desc(w_diff);
+    haganeOpsMul(&wd, &dd, &wdd);
+    // out = a + w_diff
+    haganeOpsAdd(&ad, &wdd, &od, 1.0f);
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+C10_EXPORT void foreach_tensor_lerp_ternary_cuda_(
+    TensorList t1, TensorList t2, TensorList t3) {
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]), wd = make_tensor_desc(t3[i]);
+    auto diff = at::empty_like(t1[i]);
+    auto dd = make_tensor_desc(diff);
+    haganeOpsSub(&bd, &ad, &dd, 1.0f);
+    auto w_diff = at::empty_like(t1[i]);
+    auto wdd = make_tensor_desc(w_diff);
+    haganeOpsMul(&wd, &dd, &wdd);
+    auto od = ad; od.data = const_cast<void*>(t1[i].const_data_ptr());
+    haganeOpsAdd(&ad, &wdd, &od, 1.0f);
+  }
+}
+
+C10_EXPORT std::vector<Tensor> foreach_tensor_lerp_list_cuda(
+    TensorList t1, TensorList t2, const Scalar& weight) {
+  std::vector<Tensor> r; r.reserve(t1.size());
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto out = at::empty_like(t1[i]);
+    auto w = at::scalar_tensor(weight, t1[i].options());
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]);
+    auto wd = make_tensor_desc(w), od = make_tensor_desc(out);
+    auto diff = at::empty_like(t1[i]);
+    auto dd = make_tensor_desc(diff);
+    haganeOpsSub(&bd, &ad, &dd, 1.0f);
+    auto w_diff = at::empty_like(t1[i]);
+    auto wdd = make_tensor_desc(w_diff);
+    haganeOpsMul(&wd, &dd, &wdd);
+    haganeOpsAdd(&ad, &wdd, &od, 1.0f);
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+C10_EXPORT void foreach_tensor_lerp_list_cuda_(
+    TensorList t1, TensorList t2, const Scalar& weight) {
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto w = at::scalar_tensor(weight, t1[i].options());
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]), wd = make_tensor_desc(w);
+    auto diff = at::empty_like(t1[i]);
+    auto dd = make_tensor_desc(diff);
+    haganeOpsSub(&bd, &ad, &dd, 1.0f);
+    auto w_diff = at::empty_like(t1[i]);
+    auto wdd = make_tensor_desc(w_diff);
+    haganeOpsMul(&wd, &dd, &wdd);
+    auto od = ad; od.data = const_cast<void*>(t1[i].const_data_ptr());
+    haganeOpsAdd(&ad, &wdd, &od, 1.0f);
+  }
+}
+
+C10_EXPORT std::vector<Tensor> foreach_tensor_lerp_scalarlist_cuda(
+    TensorList t1, TensorList t2, at::ArrayRef<Scalar> scalars) {
+  std::vector<Tensor> r; r.reserve(t1.size());
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto out = at::empty_like(t1[i]);
+    auto w = at::scalar_tensor(scalars[i], t1[i].options());
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]);
+    auto wd = make_tensor_desc(w), od = make_tensor_desc(out);
+    auto diff = at::empty_like(t1[i]);
+    auto dd = make_tensor_desc(diff);
+    haganeOpsSub(&bd, &ad, &dd, 1.0f);
+    auto w_diff = at::empty_like(t1[i]);
+    auto wdd = make_tensor_desc(w_diff);
+    haganeOpsMul(&wd, &dd, &wdd);
+    haganeOpsAdd(&ad, &wdd, &od, 1.0f);
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+C10_EXPORT void foreach_tensor_lerp_scalarlist_cuda_(
+    TensorList t1, TensorList t2, at::ArrayRef<Scalar> scalars) {
+  for (size_t i = 0; i < t1.size(); i++) {
+    auto w = at::scalar_tensor(scalars[i], t1[i].options());
+    auto ad = make_tensor_desc(t1[i]), bd = make_tensor_desc(t2[i]), wd = make_tensor_desc(w);
+    auto diff = at::empty_like(t1[i]);
+    auto dd = make_tensor_desc(diff);
+    haganeOpsSub(&bd, &ad, &dd, 1.0f);
+    auto w_diff = at::empty_like(t1[i]);
+    auto wdd = make_tensor_desc(w_diff);
+    haganeOpsMul(&wd, &dd, &wdd);
+    auto od = ad; od.data = const_cast<void*>(t1[i].const_data_ptr());
+    haganeOpsAdd(&ad, &wdd, &od, 1.0f);
+  }
+}
+
+// --- Foreach pointwise ops (addcmul, addcdiv) ---
+// addcmul(input, t1, t2, value) = input + value * t1 * t2
+// addcdiv(input, t1, t2, value) = input + value * t1 / t2
+
+#define FOREACH_POINTWISE_SCALAR_IMPL(name, inner_op) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_scalar_cuda( \
+    TensorList input, TensorList t1, TensorList t2, const Scalar& scalar) { \
+  std::vector<Tensor> r; r.reserve(input.size()); \
+  for (size_t i = 0; i < input.size(); i++) { \
+    auto tmp = at::empty_like(input[i]); \
+    auto t1d = make_tensor_desc(t1[i]), t2d = make_tensor_desc(t2[i]), td = make_tensor_desc(tmp); \
+    inner_op(&t1d, &t2d, &td); \
+    auto out = at::empty_like(input[i]); \
+    auto v = at::scalar_tensor(scalar, input[i].options()); \
+    auto vd = make_tensor_desc(v); \
+    auto scaled = at::empty_like(input[i]); \
+    auto scd = make_tensor_desc(scaled); \
+    haganeOpsMul(&td, &vd, &scd); \
+    auto ind = make_tensor_desc(input[i]), od = make_tensor_desc(out); \
+    haganeOpsAdd(&ind, &scd, &od, 1.0f); \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_scalar_cuda_( \
+    TensorList input, TensorList t1, TensorList t2, const Scalar& scalar) { \
+  for (size_t i = 0; i < input.size(); i++) { \
+    auto tmp = at::empty_like(input[i]); \
+    auto t1d = make_tensor_desc(t1[i]), t2d = make_tensor_desc(t2[i]), td = make_tensor_desc(tmp); \
+    inner_op(&t1d, &t2d, &td); \
+    auto v = at::scalar_tensor(scalar, input[i].options()); \
+    auto vd = make_tensor_desc(v); \
+    auto scaled = at::empty_like(input[i]); \
+    auto scd = make_tensor_desc(scaled); \
+    haganeOpsMul(&td, &vd, &scd); \
+    auto ind = make_tensor_desc(input[i]); \
+    auto od = ind; od.data = const_cast<void*>(input[i].const_data_ptr()); \
+    haganeOpsAdd(&ind, &scd, &od, 1.0f); \
+  } \
+}
+
+FOREACH_POINTWISE_SCALAR_IMPL(addcmul, haganeOpsMul)
+FOREACH_POINTWISE_SCALAR_IMPL(addcdiv, haganeOpsDiv)
+
+#undef FOREACH_POINTWISE_SCALAR_IMPL
+
+#define FOREACH_POINTWISE_TENSOR_IMPL(name, inner_op) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_tensor_cuda( \
+    TensorList input, TensorList t1, TensorList t2, const Tensor& scalars_) { \
+  std::vector<Tensor> r; r.reserve(input.size()); \
+  for (size_t i = 0; i < input.size(); i++) { \
+    auto s = scalars_[static_cast<int64_t>(i)]; \
+    auto tmp = at::empty_like(input[i]); \
+    auto t1d = make_tensor_desc(t1[i]), t2d = make_tensor_desc(t2[i]), td = make_tensor_desc(tmp); \
+    inner_op(&t1d, &t2d, &td); \
+    auto sv = at::scalar_tensor(s.item(), input[i].options()); \
+    auto svd = make_tensor_desc(sv); \
+    auto scaled = at::empty_like(input[i]); \
+    auto scd = make_tensor_desc(scaled); \
+    haganeOpsMul(&td, &svd, &scd); \
+    auto out = at::empty_like(input[i]); \
+    auto ind = make_tensor_desc(input[i]), od = make_tensor_desc(out); \
+    haganeOpsAdd(&ind, &scd, &od, 1.0f); \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_tensor_cuda_( \
+    TensorList input, TensorList t1, TensorList t2, const Tensor& scalars_) { \
+  for (size_t i = 0; i < input.size(); i++) { \
+    auto s = scalars_[static_cast<int64_t>(i)]; \
+    auto tmp = at::empty_like(input[i]); \
+    auto t1d = make_tensor_desc(t1[i]), t2d = make_tensor_desc(t2[i]), td = make_tensor_desc(tmp); \
+    inner_op(&t1d, &t2d, &td); \
+    auto sv = at::scalar_tensor(s.item(), input[i].options()); \
+    auto svd = make_tensor_desc(sv); \
+    auto scaled = at::empty_like(input[i]); \
+    auto scd = make_tensor_desc(scaled); \
+    haganeOpsMul(&td, &svd, &scd); \
+    auto ind = make_tensor_desc(input[i]); \
+    auto od = ind; od.data = const_cast<void*>(input[i].const_data_ptr()); \
+    haganeOpsAdd(&ind, &scd, &od, 1.0f); \
+  } \
+}
+
+FOREACH_POINTWISE_TENSOR_IMPL(addcmul, haganeOpsMul)
+FOREACH_POINTWISE_TENSOR_IMPL(addcdiv, haganeOpsDiv)
+
+#undef FOREACH_POINTWISE_TENSOR_IMPL
+
+#define FOREACH_POINTWISE_SCALARLIST_IMPL(name, inner_op) \
+C10_EXPORT std::vector<Tensor> foreach_tensor_##name##_scalarlist_cuda( \
+    TensorList input, TensorList t1, TensorList t2, at::ArrayRef<Scalar> scalars) { \
+  std::vector<Tensor> r; r.reserve(input.size()); \
+  for (size_t i = 0; i < input.size(); i++) { \
+    auto tmp = at::empty_like(input[i]); \
+    auto t1d = make_tensor_desc(t1[i]), t2d = make_tensor_desc(t2[i]), td = make_tensor_desc(tmp); \
+    inner_op(&t1d, &t2d, &td); \
+    auto v = at::scalar_tensor(scalars[i], input[i].options()); \
+    auto vd = make_tensor_desc(v); \
+    auto scaled = at::empty_like(input[i]); \
+    auto scd = make_tensor_desc(scaled); \
+    haganeOpsMul(&td, &vd, &scd); \
+    auto out = at::empty_like(input[i]); \
+    auto ind = make_tensor_desc(input[i]), od = make_tensor_desc(out); \
+    haganeOpsAdd(&ind, &scd, &od, 1.0f); \
+    r.push_back(std::move(out)); \
+  } \
+  return r; \
+} \
+C10_EXPORT void foreach_tensor_##name##_scalarlist_cuda_( \
+    TensorList input, TensorList t1, TensorList t2, at::ArrayRef<Scalar> scalars) { \
+  for (size_t i = 0; i < input.size(); i++) { \
+    auto tmp = at::empty_like(input[i]); \
+    auto t1d = make_tensor_desc(t1[i]), t2d = make_tensor_desc(t2[i]), td = make_tensor_desc(tmp); \
+    inner_op(&t1d, &t2d, &td); \
+    auto v = at::scalar_tensor(scalars[i], input[i].options()); \
+    auto vd = make_tensor_desc(v); \
+    auto scaled = at::empty_like(input[i]); \
+    auto scd = make_tensor_desc(scaled); \
+    haganeOpsMul(&td, &vd, &scd); \
+    auto ind = make_tensor_desc(input[i]); \
+    auto od = ind; od.data = const_cast<void*>(input[i].const_data_ptr()); \
+    haganeOpsAdd(&ind, &scd, &od, 1.0f); \
+  } \
+}
+
+FOREACH_POINTWISE_SCALARLIST_IMPL(addcmul, haganeOpsMul)
+FOREACH_POINTWISE_SCALARLIST_IMPL(addcdiv, haganeOpsDiv)
+
+#undef FOREACH_POINTWISE_SCALARLIST_IMPL
+
+// --- Foreach reduce ops ---
+
+C10_EXPORT std::vector<Tensor> foreach_tensor_max_cuda(TensorList tensors) {
+  std::vector<Tensor> r; r.reserve(tensors.size());
+  for (const auto& t : tensors) {
+    auto out = at::empty({}, t.options());
+    auto id = make_tensor_desc(t), od = make_tensor_desc(out);
+    haganeOpsMaxValues(&id, &od);
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+
+C10_EXPORT std::vector<Tensor> foreach_tensor_norm_cuda(
+    TensorList tensors, const Scalar& ord, std::optional<ScalarType> /*dtype*/) {
+  std::vector<Tensor> r; r.reserve(tensors.size());
+  double p = ord.toDouble();
+  for (const auto& t : tensors) {
+    auto flat = t.contiguous().view({-1});
+    auto out = at::empty({}, t.options());
+    auto id = make_tensor_desc(flat), od = make_tensor_desc(out);
+    haganeOpsNormVal(&id, &od, p, 0);
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+
+C10_EXPORT std::vector<Tensor> foreach_tensor_powsum_cuda(
+    TensorList tensors, const Scalar& ord, std::optional<ScalarType> /*dtype*/) {
+  std::vector<Tensor> r; r.reserve(tensors.size());
+  double p = ord.toDouble();
+  for (const auto& t : tensors) {
+    auto flat = t.contiguous().view({-1});
+    auto out = at::empty({}, t.options());
+    auto id = make_tensor_desc(flat), od = make_tensor_desc(out);
+    haganeOpsPowsum(&id, &od, p, 0);
+    r.push_back(std::move(out));
+  }
+  return r;
+}
+
+// --- AMP: check for non-finite and unscale ---
+
+C10_EXPORT void _amp_foreach_non_finite_check_and_unscale_cuda_(
+    TensorList scaled_grads, Tensor& found_inf, const Tensor& inv_scale) {
+  float* found_inf_ptr = found_inf.data_ptr<float>();
+  float inv_scale_val = inv_scale.item<float>();
+  for (const auto& t : scaled_grads) {
+    // Check for inf/nan
+    auto td = make_tensor_desc(t);
+    // Simple check: multiply by inv_scale, check for non-finite
+    int64_t n = t.numel();
+    float* data = static_cast<float*>(const_cast<void*>(t.const_data_ptr()));
+    for (int64_t j = 0; j < n; j++) {
+      if (!std::isfinite(data[j])) {
+        *found_inf_ptr = 1.0f;
+        return;
+      }
+      data[j] *= inv_scale_val;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 5: Non-foreach ops — Random, Creation, Dropout
+// ---------------------------------------------------------------------------
+
+// randperm: generate random permutation
+C10_EXPORT Tensor& randperm_out_cuda(
+    int64_t n, std::optional<Generator> generator, Tensor& result) {
+  result.resize_({n});
+  if (n == 0) return result;
+  // Generate random keys and argsort for permutation
+  auto keys = at::empty({n}, result.options().dtype(kFloat));
+  auto kd = make_tensor_desc(keys);
+  haganeOpsUniform(&kd, 0.0, 1.0);
+  // Argsort the random keys to get permutation
+  auto rd = make_tensor_desc(result);
+  auto sorted_keys = at::empty_like(keys);
+  auto skd = make_tensor_desc(sorted_keys);
+  // Copy keys for sorting
+  std::memcpy(sorted_keys.data_ptr(), keys.data_ptr(), n * sizeof(float));
+  haganeOpsSort(&skd, &rd, 0, 0);
+  return result;
+}
+
+// logspace_out
+C10_EXPORT Tensor& logspace_cuda_out(
+    const Scalar& start, const Scalar& end, int64_t steps, double base, Tensor& result) {
+  result.resize_({steps});
+  if (steps == 0) return result;
+  if (steps == 1) {
+    result.fill_(std::pow(base, start.toDouble()));
+    return result;
+  }
+  // linspace in log domain, then pow
+  auto lin = at::linspace(start, end, steps, result.options());
+  auto ld = make_tensor_desc(lin), rd = make_tensor_desc(result);
+  // result = base^lin
+  if (base == 10.0) {
+    // 10^x = exp(x * ln(10))
+    auto scale = at::scalar_tensor(std::log(10.0), result.options());
+    auto tmp = at::empty_like(result);
+    auto sd = make_tensor_desc(scale), td = make_tensor_desc(tmp);
+    haganeOpsMul(&ld, &sd, &td);
+    haganeOpsExp(&td, &rd);
+  } else if (base == 2.0) {
+    haganeOpsExp2(&ld, &rd);
+  } else {
+    auto scale = at::scalar_tensor(std::log(base), result.options());
+    auto tmp = at::empty_like(result);
+    auto sd = make_tensor_desc(scale), td = make_tensor_desc(tmp);
+    haganeOpsMul(&ld, &sd, &td);
+    haganeOpsExp(&td, &rd);
+  }
+  return result;
+}
+
+// range_out
+C10_EXPORT Tensor& range_cuda_out(
+    const Scalar& start, const Scalar& end, const Scalar& step, Tensor& result) {
+  // Compute size
+  double s = start.toDouble(), e = end.toDouble(), st = step.toDouble();
+  int64_t size = static_cast<int64_t>(std::floor((e - s) / st)) + 1;
+  result.resize_({size});
+  auto rd = make_tensor_desc(result);
+  haganeOpsArange(&rd, s, st);
+  return result;
+}
+
+// _chunk_cat: concatenate chunks of tensors
+C10_EXPORT Tensor _chunk_cat_cuda(TensorList tensors, int64_t dim, int64_t num_chunks) {
+  // Collect the relevant chunks and concatenate
+  std::vector<Tensor> chunks;
+  chunks.reserve(tensors.size());
+  for (const auto& t : tensors) {
+    chunks.push_back(t);
+  }
+  return at::cat(chunks, dim);
+}
+
+C10_EXPORT Tensor& _chunk_cat_out_cuda(
+    TensorList tensors, int64_t dim, int64_t num_chunks, Tensor& out) {
+  auto result = _chunk_cat_cuda(tensors, dim, num_chunks);
+  out.resize_(result.sizes());
+  out.copy_(result);
+  return out;
+}
+
+// split_with_sizes_copy_out
+C10_EXPORT void split_with_sizes_copy_out_cuda(
+    const Tensor& self, c10::ArrayRef<int64_t> split_sizes, int64_t dim,
+    TensorList out) {
+  auto splits = self.split_with_sizes(split_sizes, dim);
+  for (size_t i = 0; i < out.size(); i++) {
+    const_cast<Tensor&>(out[i]).copy_(splits[i]);
+  }
+}
+
+// rrelu_with_noise
+C10_EXPORT Tensor rrelu_with_noise_cuda(
+    const Tensor& self, Tensor& noise, const Scalar& lower,
+    const Scalar& upper, bool training, std::optional<Generator> generator) {
+  auto output = at::empty_like(self);
+  if (training) {
+    // Fill noise with uniform random in [lower, upper]
+    auto noise_d = make_tensor_desc(noise);
+    haganeOpsUniform(&noise_d, lower.toDouble(), upper.toDouble());
+    // output = self * noise where self < 0, else self
+    auto mask = self.lt(0);
+    auto scaled = at::mul(self, noise);
+    output = at::where(mask, scaled, self);
+  } else {
+    double neg_slope = (lower.toDouble() + upper.toDouble()) / 2.0;
+    auto neg_scaled = at::mul(self, at::scalar_tensor(neg_slope, self.options()));
+    auto pos_mask = self.ge(at::scalar_tensor(0, self.options()));
+    output = at::where(pos_mask, self, neg_scaled);
+  }
+  return output;
+}
+
+C10_EXPORT Tensor& rrelu_with_noise_cuda_(
+    Tensor& self, Tensor& noise, const Scalar& lower,
+    const Scalar& upper, bool training, std::optional<Generator> generator) {
+  auto result = rrelu_with_noise_cuda(self, noise, lower, upper, training, generator);
+  self.copy_(result);
+  return self;
+}
+
+C10_EXPORT Tensor& rrelu_with_noise_out_cuda(
+    const Tensor& self, Tensor& noise, const Scalar& lower,
+    const Scalar& upper, bool training, std::optional<Generator> generator,
+    Tensor& output) {
+  auto result = rrelu_with_noise_cuda(self, noise, lower, upper, training, generator);
+  output.resize_(result.sizes());
+  output.copy_(result);
+  return output;
+}
+
+// Philox RNG ops (thin wrappers — MLX manages its own RNG state)
+C10_EXPORT Tensor& _philox_normal_cuda_(
+    Tensor& self, const Tensor& /*philox_key*/, double mean, double std) {
+  auto d = make_tensor_desc(self);
+  haganeOpsNormal(&d, mean, std);
+  return self;
+}
+
+C10_EXPORT Tensor& _philox_uniform_cuda_(
+    Tensor& self, const Tensor& /*philox_key*/, double low, double high) {
+  auto d = make_tensor_desc(self);
+  haganeOpsUniform(&d, low, high);
+  return self;
+}
+
+C10_EXPORT Tensor _philox_key_split_cuda(const Tensor& key, int64_t /*n*/) {
+  // MLX manages RNG internally; return dummy key tensor
+  return at::zeros_like(key);
+}
+
+C10_EXPORT Tensor _philox_key_fold_in_cuda(const Tensor& key, int64_t /*data*/) {
+  return at::zeros_like(key);
+}
+
+// Dropout ops
+C10_EXPORT std::tuple<Tensor, Tensor> native_dropout_cuda(
+    const Tensor& input, double p, std::optional<bool> train) {
+  bool is_train = train.value_or(true);
+  if (!is_train || p == 0.0) {
+    return {input.clone(), at::ones_like(input, input.options().dtype(kBool))};
+  }
+  if (p == 1.0) {
+    return {at::zeros_like(input), at::zeros_like(input, input.options().dtype(kBool))};
+  }
+  auto mask = at::empty_like(input, input.options().dtype(kBool));
+  auto md = make_tensor_desc(mask);
+  haganeOpsBernoulliScalar(&md, 1.0 - p);
+  double scale = 1.0 / (1.0 - p);
+  auto mask_f = mask.to(input.dtype());
+  auto scaled_mask = at::mul(mask_f, at::scalar_tensor(scale, input.options()));
+  auto output = at::mul(input, scaled_mask);
+  return {output, mask};
+}
+
+C10_EXPORT Tensor native_dropout_backward_cuda(
+    const Tensor& grad_output, const Tensor& mask, double scale) {
+  auto mask_f = mask.to(grad_output.dtype());
+  auto scaled_mask = at::mul(mask_f, at::scalar_tensor(scale, grad_output.options()));
+  return at::mul(grad_output, scaled_mask);
+}
+
+C10_EXPORT std::tuple<Tensor, Tensor> fused_dropout_cuda(
+    const Tensor& self, double p, std::optional<Generator> /*gen*/) {
+  return native_dropout_cuda(self, 1.0 - p, true);
+}
+
+C10_EXPORT void _fill_mem_eff_dropout_mask_(
+    Tensor& mask, double dropout_p, int64_t /*seed*/, int64_t /*offset*/) {
+  auto md = make_tensor_desc(mask);
+  haganeOpsBernoulliScalar(&md, 1.0 - dropout_p);
+}
+
 } // namespace at::native
 
 // ---------------------------------------------------------------------------

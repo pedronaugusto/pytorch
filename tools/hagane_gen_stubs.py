@@ -104,6 +104,30 @@ def get_undefined_native_symbols(
         "at::native::launch_apply_mode_kernel(",
         "at::native::launch_kthvalue_kernel(",
         "at::native::launch_median_kernel(",
+        # Batch 5: foreach ops (all patterns)
+        "at::native::foreach_tensor_",
+        "at::native::foreach_scalar_pow_list_kernel_cuda(",
+        "at::native::_amp_foreach_non_finite_check_and_unscale_cuda_(",
+        # Batch 5: random/distribution
+        "at::native::randperm_out_cuda(",
+        "at::native::_philox_normal_cuda_(",
+        "at::native::_philox_uniform_cuda_(",
+        "at::native::_philox_key_split_cuda(",
+        "at::native::_philox_key_fold_in_cuda(",
+        "at::native::rrelu_with_noise_cuda(",
+        "at::native::rrelu_with_noise_cuda_(",
+        "at::native::rrelu_with_noise_out_cuda(",
+        # Batch 5: creation/manipulation
+        "at::native::logspace_cuda_out(",
+        "at::native::range_cuda_out(",
+        "at::native::_chunk_cat_cuda(",
+        "at::native::_chunk_cat_out_cuda(",
+        "at::native::split_with_sizes_copy_out_cuda(",
+        # Batch 5: dropout
+        "at::native::native_dropout_cuda(",
+        "at::native::native_dropout_backward_cuda(",
+        "at::native::fused_dropout_cuda(",
+        "at::native::_fill_mem_eff_dropout_mask_(",
     )
 
     if cpu_defined is None:
