@@ -64,6 +64,7 @@ def get_undefined_native_symbols(
 
     # Symbols with real implementations in HaganeOps.cpp — do not stub these.
     HAGANE_IMPLEMENTED = (
+        # Batch 0: core
         "at::native::empty_cuda(",
         "at::native::empty_strided_cuda(",
         "at::native::structured_ufunc_add_CUDA::impl(",
@@ -71,6 +72,38 @@ def get_undefined_native_symbols(
         "at::native::GeluBackwardCUDAKernelImpl(",
         "at::native::max_all_launch_kernel(",
         "at::native::min_all_launch_kernel(",
+        # Batch 2: sort/topk/scan
+        "at::native::sortKeyValueInplace(",
+        "at::native::launch_stable_sort_kernel(",
+        "at::native::launch_gather_topk_kernel(",
+        "at::native::launch_cumsum_cuda_kernel(",
+        "at::native::launch_cumprod_cuda_kernel(",
+        "at::native::launch_cummax_cuda_kernel(",
+        "at::native::launch_cummin_cuda_kernel(",
+        "at::native::launch_logcumsumexp_cuda_kernel(",
+        # Batch 2: tensor creation
+        "at::native::arange_cuda_out(",
+        "at::native::linspace_cuda_out(",
+        "at::native::eye_out_cuda(",
+        # Batch 2: index/manipulation
+        "at::native::index_select_cuda(",
+        "at::native::masked_fill__cuda(",
+        "at::native::roll_cuda(",
+        "at::native::repeat_interleave_cuda(",
+        "at::native::nonzero_out_cuda(",
+        "at::native::nonzero_cuda(",
+        # Batch 3: reduce-dim
+        "at::native::max_launch_kernel(",
+        "at::native::min_launch_kernel(",
+        "at::native::aminmax_launch_kernel(",
+        "at::native::aminmax_allreduce_launch_kernel(",
+        "at::native::powsum_launch_kernel(",
+        "at::native::norm_launch_kernel(",
+        # Batch 3: mode/kthvalue/median
+        "at::native::launch_fused_mode_kernel(",
+        "at::native::launch_apply_mode_kernel(",
+        "at::native::launch_kthvalue_kernel(",
+        "at::native::launch_median_kernel(",
     )
 
     if cpu_defined is None:

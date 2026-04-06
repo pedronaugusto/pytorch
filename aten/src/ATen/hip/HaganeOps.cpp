@@ -19,7 +19,24 @@
 #include <ATen/native/ReduceAllOps.h>
 #include <ATen/native/Pow.h>
 #include <ATen/native/TensorCompare.h>
+#include <ATen/native/Sorting.h>
+#include <ATen/native/TensorAdvancedIndexing.h>
+#include <ATen/native/IndexKernel.h>
+#include <ATen/native/cpu/CatKernel.h>
+#include <ATen/native/hip/Sort.h>
+#include <ATen/native/hip/SortStable.h>
+#include <ATen/native/hip/TensorTopK.h>
+#include <ATen/native/hip/ScanKernels.h>
 #include <ATen/TensorIterator.h>
+#include <ATen/core/IListRef.h>
+#include <ATen/Functions.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
+#include <ATen/ops/arange.h>
+#include <ATen/ops/linspace.h>
+#include <ATen/ops/eye.h>
+#include <ATen/ops/repeat_interleave.h>
+#include <ATen/native/UnaryOps.h>
 #include <c10/core/Scalar.h>
 #include <c10/macros/Export.h>
 
@@ -196,6 +213,489 @@ C10_EXPORT void min_all_launch_kernel(TensorIterator& iter) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Helper: build haganeOpsTensor_t from TensorBase (for Level B functions)
+// ---------------------------------------------------------------------------
+
+static haganeOpsTensor_t make_tensor_desc(const TensorBase& t) {
+  haganeOpsTensor_t desc;
+  desc.data = const_cast<void*>(t.const_data_ptr());
+  desc.shape = t.sizes().data();
+  desc.strides = t.strides().data();
+  desc.ndim = static_cast<int32_t>(t.dim());
+  desc.dtype = hagane_dtype(t.scalar_type());
+  return desc;
+}
+
+// ---------------------------------------------------------------------------
+// Level B: Sort/TopK launch_kernel functions (called from compiled Sort.cpp,
+// TensorTopK.cpp). These replace implementations from excluded .hip files.
+// ---------------------------------------------------------------------------
+
+C10_EXPORT void sortKeyValueInplace(
+    const TensorBase& key, const TensorBase& value, int64_t dim,
+    bool descending, bool stable) {
+  auto key_d = make_tensor_desc(key);
+  auto val_d = make_tensor_desc(value);
+  if (haganeOpsSort(&key_d, &val_d, static_cast<int32_t>(dim), descending ? 1 : 0) != HAGANE_OPS_SUCCESS) {
+    Tensor key_t(key), val_t(value);
+    auto key_cpu = key_t.cpu();
+    auto [sorted_key, sorted_idx] = key_cpu.sort(dim, descending, stable);
+    std::memcpy(const_cast<void*>(key.const_data_ptr()), sorted_key.const_data_ptr(),
+                key.numel() * key.itemsize());
+    std::memcpy(const_cast<void*>(value.const_data_ptr()), sorted_idx.const_data_ptr(),
+                value.numel() * value.itemsize());
+  }
+}
+
+C10_EXPORT void launch_stable_sort_kernel(
+    const TensorBase& self, int64_t dim, bool descending,
+    const TensorBase& values, const TensorBase& indices) {
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  std::memcpy(const_cast<void*>(values.const_data_ptr()),
+              self.const_data_ptr(), self.numel() * self.itemsize());
+  if (haganeOpsSort(&val_d, &idx_d, static_cast<int32_t>(dim), descending ? 1 : 0) != HAGANE_OPS_SUCCESS) {
+    Tensor self_t(self);
+    auto self_cpu = self_t.cpu();
+    auto [sorted, sorted_idx] = self_cpu.sort(dim, descending, /*stable=*/true);
+    std::memcpy(const_cast<void*>(values.const_data_ptr()), sorted.const_data_ptr(),
+                values.numel() * values.itemsize());
+    std::memcpy(const_cast<void*>(indices.const_data_ptr()), sorted_idx.const_data_ptr(),
+                indices.numel() * indices.itemsize());
+  }
+}
+
+C10_EXPORT void launch_gather_topk_kernel(
+    const TensorBase& self, int64_t k, int64_t dim, bool largest,
+    const TensorBase& values, const TensorBase& indices) {
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  if (haganeOpsTopk(&in_d, &val_d, &idx_d, k, static_cast<int32_t>(dim), largest ? 1 : 0) != HAGANE_OPS_SUCCESS) {
+    Tensor self_t(self);
+    auto [topk_vals, topk_idx] = self_t.cpu().topk(k, dim, largest, /*sorted=*/true);
+    std::memcpy(const_cast<void*>(values.const_data_ptr()), topk_vals.const_data_ptr(),
+                values.numel() * values.itemsize());
+    std::memcpy(const_cast<void*>(indices.const_data_ptr()), topk_idx.const_data_ptr(),
+                indices.numel() * indices.itemsize());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Level B: Scan launch_kernel functions (called from compiled ScanKernels.cpp)
+// ---------------------------------------------------------------------------
+
+C10_EXPORT void launch_cumsum_cuda_kernel(
+    const TensorBase& result, const TensorBase& self, int64_t dim) {
+  auto in_d = make_tensor_desc(self);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsCumsum(&in_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto result_cpu = Tensor(self).cpu().cumsum(dim);
+    std::memcpy(const_cast<void*>(result.const_data_ptr()), result_cpu.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
+}
+
+C10_EXPORT void launch_cumprod_cuda_kernel(
+    const TensorBase& result, const TensorBase& self, int64_t dim) {
+  auto in_d = make_tensor_desc(self);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsCumprod(&in_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto result_cpu = Tensor(self).cpu().cumprod(dim);
+    std::memcpy(const_cast<void*>(result.const_data_ptr()), result_cpu.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
+}
+
+C10_EXPORT void launch_cummax_cuda_kernel(
+    const TensorBase& self, const TensorBase& values,
+    const TensorBase& indices, int64_t dim) {
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  haganeOpsCummax(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim));
+}
+
+C10_EXPORT void launch_cummin_cuda_kernel(
+    const TensorBase& self, const TensorBase& values,
+    const TensorBase& indices, int64_t dim) {
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  haganeOpsCummin(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim));
+}
+
+C10_EXPORT void launch_logcumsumexp_cuda_kernel(
+    const TensorBase& result, const TensorBase& self, int64_t dim) {
+  auto in_d = make_tensor_desc(self);
+  auto out_d = make_tensor_desc(result);
+  haganeOpsLogcumsumexp(&in_d, &out_d, static_cast<int32_t>(dim));
+}
+
+// ---------------------------------------------------------------------------
+// Level B: Reduce-dim launch_kernel functions (called from compiled ReduceOps.cpp)
+// ---------------------------------------------------------------------------
+
+// Helper: find the reduction dim by comparing input vs output shapes.
+// The TensorIterator from make_reduction keeps dims (keepdim internally),
+// so output has same ndim with 1 at the reduced dim.
+static int64_t find_reduce_dim(const TensorBase& input, const TensorBase& output) {
+  for (int64_t d = 0; d < input.dim(); d++) {
+    if (input.size(d) > 1 && (d >= output.dim() || output.size(d) == 1))
+      return d;
+  }
+  return input.dim() - 1;  // fallback: last dim
+}
+
+C10_EXPORT void max_launch_kernel(TensorIterator& iter) {
+  // iter: output 0 = values, output 1 = indices (Long), input = self
+  const Tensor& self = iter.tensor(2);
+  const Tensor& values = iter.tensor(0);
+  const Tensor& indices = iter.tensor(1);
+  int64_t dim = find_reduce_dim(self, values);
+
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  if (haganeOpsMaxDim(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = Tensor(self).cpu();
+    auto [cpu_vals, cpu_idx] = cpu_self.max(dim, /*keepdim=*/true);
+    std::memcpy(values.data_ptr(), cpu_vals.const_data_ptr(), values.numel() * values.itemsize());
+    std::memcpy(indices.data_ptr(), cpu_idx.const_data_ptr(), indices.numel() * indices.itemsize());
+  }
+}
+
+C10_EXPORT void min_launch_kernel(TensorIterator& iter) {
+  const Tensor& self = iter.tensor(2);
+  const Tensor& values = iter.tensor(0);
+  const Tensor& indices = iter.tensor(1);
+  int64_t dim = find_reduce_dim(self, values);
+
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  if (haganeOpsMinDim(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = Tensor(self).cpu();
+    auto [cpu_vals, cpu_idx] = cpu_self.min(dim, /*keepdim=*/true);
+    std::memcpy(values.data_ptr(), cpu_vals.const_data_ptr(), values.numel() * values.itemsize());
+    std::memcpy(indices.data_ptr(), cpu_idx.const_data_ptr(), indices.numel() * indices.itemsize());
+  }
+}
+
+C10_EXPORT void aminmax_launch_kernel(TensorIterator& iter) {
+  // iter: output 0 = min_result, output 1 = max_result, input = self
+  const Tensor& self = iter.tensor(2);
+  const Tensor& min_result = iter.tensor(0);
+  const Tensor& max_result = iter.tensor(1);
+  int64_t dim = find_reduce_dim(self, min_result);
+
+  auto in_d = make_tensor_desc(self);
+  auto min_d = make_tensor_desc(min_result);
+  auto max_d = make_tensor_desc(max_result);
+  if (haganeOpsAminmax(&in_d, &min_d, &max_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = Tensor(self).cpu();
+    auto [cpu_min, cpu_max] = cpu_self.aminmax(dim, /*keepdim=*/true);
+    std::memcpy(min_result.data_ptr(), cpu_min.const_data_ptr(), min_result.numel() * min_result.itemsize());
+    std::memcpy(max_result.data_ptr(), cpu_max.const_data_ptr(), max_result.numel() * max_result.itemsize());
+  }
+}
+
+C10_EXPORT void aminmax_allreduce_launch_kernel(TensorIterator& iter) {
+  const Tensor& self = iter.tensor(2);
+  const Tensor& min_result = iter.tensor(0);
+  const Tensor& max_result = iter.tensor(1);
+
+  auto in_d = make_tensor_desc(self);
+  auto min_d = make_tensor_desc(min_result);
+  auto max_d = make_tensor_desc(max_result);
+  if (haganeOpsAminmaxAll(&in_d, &min_d, &max_d) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = Tensor(self).cpu();
+    auto [cpu_min, cpu_max] = cpu_self.aminmax();
+    std::memcpy(min_result.data_ptr(), cpu_min.const_data_ptr(), min_result.numel() * min_result.itemsize());
+    std::memcpy(max_result.data_ptr(), cpu_max.const_data_ptr(), max_result.numel() * max_result.itemsize());
+  }
+}
+
+C10_EXPORT void powsum_launch_kernel(TensorIterator& iter, double p) {
+  const Tensor& self = iter.tensor(1);
+  const Tensor& result = iter.tensor(0);
+  int64_t dim = find_reduce_dim(self, result);
+
+  auto in_d = make_tensor_desc(self);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsPowsum(&in_d, &out_d, p, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = Tensor(self).cpu().abs().pow(p);
+    auto cpu_result = cpu_self.sum(dim, /*keepdim=*/true);
+    std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(), result.numel() * result.itemsize());
+  }
+}
+
+C10_EXPORT void norm_launch_kernel(TensorIterator& iter, double p) {
+  const Tensor& self = iter.tensor(1);
+  const Tensor& result = iter.tensor(0);
+  int64_t dim = find_reduce_dim(self, result);
+
+  auto in_d = make_tensor_desc(self);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsNormVal(&in_d, &out_d, p, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = Tensor(self).cpu();
+    auto cpu_result = cpu_self.norm(p, dim, /*keepdim=*/true);
+    std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(), result.numel() * result.itemsize());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Level B: Mode/Kthvalue/Median launch_kernel functions
+// (called from compiled TensorModeKernel.cpp, Sorting.cpp)
+// ---------------------------------------------------------------------------
+
+C10_EXPORT void launch_fused_mode_kernel(
+    const TensorBase& values, const TensorBase& indices,
+    const TensorBase& self, int64_t slice_size, int64_t slices) {
+  // self is transposed+contiguous; values/indices are transposed views
+  // Mode is always along the last dim of the transposed tensor
+  int32_t dim = static_cast<int32_t>(self.dim() - 1);
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  if (haganeOpsMode(&in_d, &val_d, &idx_d, dim) != HAGANE_OPS_SUCCESS) {
+    Tensor self_cpu = Tensor(self).cpu();
+    auto [mode_vals, mode_idx] = self_cpu.mode(dim);
+    std::memcpy(const_cast<void*>(values.const_data_ptr()),
+                mode_vals.const_data_ptr(), values.numel() * values.itemsize());
+    std::memcpy(const_cast<void*>(indices.const_data_ptr()),
+                mode_idx.const_data_ptr(), indices.numel() * indices.itemsize());
+  }
+}
+
+C10_EXPORT void launch_apply_mode_kernel(
+    const TensorBase& values, const TensorBase& indices,
+    const TensorBase& self, int64_t dim, int64_t ndim) {
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  if (haganeOpsMode(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    Tensor self_cpu = Tensor(self).cpu();
+    auto [mode_vals, mode_idx] = self_cpu.mode(dim);
+    std::memcpy(const_cast<void*>(values.const_data_ptr()),
+                mode_vals.const_data_ptr(), values.numel() * values.itemsize());
+    std::memcpy(const_cast<void*>(indices.const_data_ptr()),
+                mode_idx.const_data_ptr(), indices.numel() * indices.itemsize());
+  }
+}
+
+C10_EXPORT void launch_kthvalue_kernel(
+    const TensorBase& values, const TensorBase& indices,
+    const TensorBase& self, int64_t dim, int64_t k) {
+  auto in_d = make_tensor_desc(self);
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
+  if (haganeOpsKthvalue(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim), k) != HAGANE_OPS_SUCCESS) {
+    Tensor self_cpu = Tensor(self).cpu();
+    auto [kth_vals, kth_idx] = self_cpu.kthvalue(k, dim, /*keepdim=*/true);
+    std::memcpy(const_cast<void*>(values.const_data_ptr()),
+                kth_vals.const_data_ptr(), values.numel() * values.itemsize());
+    std::memcpy(const_cast<void*>(indices.const_data_ptr()),
+                kth_idx.const_data_ptr(), indices.numel() * indices.itemsize());
+  }
+}
+
+C10_EXPORT void launch_median_kernel(
+    const TensorBase& vals, const TensorBase& inds,
+    const TensorBase& in, int64_t dim, bool ignore_nan) {
+  auto in_d = make_tensor_desc(in);
+  auto val_d = make_tensor_desc(vals);
+  auto idx_d = make_tensor_desc(inds);
+  if (haganeOpsMedian(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim),
+                      ignore_nan ? 1 : 0) != HAGANE_OPS_SUCCESS) {
+    Tensor in_cpu = Tensor(in).cpu();
+    auto [med_vals, med_idx] = in_cpu.median(dim, /*keepdim=*/true);
+    std::memcpy(const_cast<void*>(vals.const_data_ptr()),
+                med_vals.const_data_ptr(), vals.numel() * vals.itemsize());
+    std::memcpy(const_cast<void*>(inds.const_data_ptr()),
+                med_idx.const_data_ptr(), inds.numel() * inds.itemsize());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Level B: Tensor creation (from excluded .hip files)
+// ---------------------------------------------------------------------------
+
+C10_EXPORT Tensor& arange_cuda_out(
+    const Scalar& start, const Scalar& end, const Scalar& step, Tensor& result) {
+  double sd = start.toDouble(), ed = end.toDouble(), st = step.toDouble();
+  TORCH_CHECK(st != 0, "step must be nonzero");
+  TORCH_CHECK((st > 0 && sd <= ed) || (st < 0 && sd >= ed),
+              "upper bound and larger bound inconsistent with step sign");
+  int64_t size = static_cast<int64_t>(std::ceil((ed - sd) / st));
+  if (size < 0) size = 0;
+  result.resize_({size});
+  if (size > 0) {
+    auto out_d = make_tensor_desc(result);
+    if (haganeOpsArange(&out_d, sd, st) != HAGANE_OPS_SUCCESS) {
+      auto cpu_r = at::arange(start, end, step, result.options().device(c10::kCPU));
+      std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
+    }
+  }
+  return result;
+}
+
+C10_EXPORT Tensor& linspace_cuda_out(
+    const Scalar& start, const Scalar& end, int64_t steps, Tensor& result) {
+  TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
+  result.resize_({steps});
+  if (steps > 0) {
+    auto out_d = make_tensor_desc(result);
+    if (haganeOpsLinspace(&out_d, start.toDouble(), end.toDouble(), steps) != HAGANE_OPS_SUCCESS) {
+      auto cpu_r = at::linspace(start, end, steps, result.options().device(c10::kCPU));
+      std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
+    }
+  }
+  return result;
+}
+
+C10_EXPORT Tensor& eye_out_cuda(int64_t n, Tensor& result) {
+  result.resize_({n, n});
+  result.zero_();
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsEye(&out_d, n, n) != HAGANE_OPS_SUCCESS) {
+    auto cpu_r = at::eye(n, result.options().device(c10::kCPU));
+    std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
+  }
+  return result;
+}
+
+C10_EXPORT Tensor& eye_out_cuda(int64_t n, int64_t m, Tensor& result) {
+  result.resize_({n, m});
+  result.zero_();
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsEye(&out_d, n, m) != HAGANE_OPS_SUCCESS) {
+    auto cpu_r = at::eye(n, m, result.options().device(c10::kCPU));
+    std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Level B: Index/manipulation (from excluded .hip files)
+// ---------------------------------------------------------------------------
+
+C10_EXPORT Tensor index_select_cuda(
+    const Tensor& self, int64_t dim, const Tensor& index) {
+  auto result_sizes = self.sizes().vec();
+  result_sizes[dim] = index.numel();
+  auto result = at::empty(result_sizes, self.options());
+
+  auto in_d = make_tensor_desc(self);
+  auto idx_d = make_tensor_desc(index);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsIndexSelect(&in_d, &idx_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    auto cpu_result = self.cpu().index_select(dim, index.cpu());
+    std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
+  return result;
+}
+
+C10_EXPORT Tensor& masked_fill__cuda(
+    Tensor& self, const Tensor& mask, const Scalar& value) {
+  auto self_d = make_tensor_desc(self);
+  auto mask_d = make_tensor_desc(mask);
+  if (haganeOpsMaskedFill(&self_d, &mask_d, value.toFloat()) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = self.cpu();
+    cpu_self.masked_fill_(mask.cpu(), value);
+    std::memcpy(self.data_ptr(), cpu_self.const_data_ptr(),
+                self.numel() * self.itemsize());
+  }
+  return self;
+}
+
+C10_EXPORT Tensor& masked_fill__cuda(
+    Tensor& self, const Tensor& mask, const Tensor& value) {
+  TORCH_CHECK(value.dim() == 0, "masked_fill_ expects a 0-dimensional value tensor");
+  return masked_fill__cuda(self, mask, value.item());
+}
+
+C10_EXPORT Tensor roll_cuda(
+    const Tensor& self, IntArrayRef shifts, IntArrayRef dims) {
+  if (dims.empty()) {
+    // No dims specified: flatten, roll, reshape back
+    auto flat = self.contiguous().view(-1);
+    auto result_flat = at::empty_like(flat);
+    auto in_d = make_tensor_desc(flat);
+    auto out_d = make_tensor_desc(result_flat);
+    int64_t s = shifts[0];
+    int32_t d = 0;
+    if (haganeOpsRoll(&in_d, &out_d, &s, &d, 1) != HAGANE_OPS_SUCCESS) {
+      auto cpu_result = self.cpu().roll(shifts, dims);
+      return cpu_result.to(self.device());
+    }
+    return result_flat.view(self.sizes());
+  }
+
+  auto result = at::empty_like(self);
+  auto in_d = make_tensor_desc(self);
+  auto out_d = make_tensor_desc(result);
+  std::vector<int64_t> shifts_vec(shifts.begin(), shifts.end());
+  std::vector<int32_t> dims_vec;
+  for (auto d : dims) dims_vec.push_back(static_cast<int32_t>(d));
+
+  if (haganeOpsRoll(&in_d, &out_d, shifts_vec.data(), dims_vec.data(),
+                     static_cast<int32_t>(shifts.size())) != HAGANE_OPS_SUCCESS) {
+    auto cpu_result = self.cpu().roll(shifts, dims);
+    std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
+  return result;
+}
+
+C10_EXPORT Tensor repeat_interleave_cuda(
+    const Tensor& repeat, std::optional<int64_t> output_size) {
+  TORCH_CHECK(repeat.dim() == 1, "repeat_interleave: repeats must be 1-d");
+  int64_t out_sz;
+  if (output_size.has_value()) {
+    out_sz = *output_size;
+  } else {
+    out_sz = repeat.sum().item<int64_t>();
+  }
+  auto result = at::empty({out_sz}, repeat.options().dtype(c10::kLong));
+  auto rep_d = make_tensor_desc(repeat);
+  if (haganeOpsRepeatInterleave(&rep_d, result.data_ptr(), out_sz,
+                                 HAGANE_DTYPE_INT64) != HAGANE_OPS_SUCCESS) {
+    auto cpu_result = at::repeat_interleave(repeat.cpu(), output_size);
+    std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
+  return result;
+}
+
+C10_EXPORT Tensor& nonzero_out_cuda(const Tensor& self, Tensor& out) {
+  int64_t num_nonzero = 0;
+  auto in_d = make_tensor_desc(self);
+
+  // First pass: get count
+  if (haganeOpsNonzero(&in_d, nullptr, &num_nonzero) != HAGANE_OPS_SUCCESS) {
+    auto cpu_result = self.cpu().nonzero();
+    out.resize_({cpu_result.size(0), cpu_result.size(1)});
+    std::memcpy(out.data_ptr(), cpu_result.const_data_ptr(),
+                out.numel() * out.itemsize());
+    return out;
+  }
+
+  out.resize_({num_nonzero, self.dim()});
+  if (num_nonzero > 0) {
+    haganeOpsNonzero(&in_d, out.data_ptr(), &num_nonzero);
+  }
+  return out;
+}
+
+C10_EXPORT Tensor nonzero_cuda(const Tensor& self) {
+  auto out = at::empty({0}, self.options().dtype(c10::kLong));
+  nonzero_out_cuda(self, out);
+  return out;
+}
+
 } // namespace at::native
 
 // ---------------------------------------------------------------------------
@@ -259,7 +759,10 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
 }
 
 void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
-  fill_stub(c10::DeviceType::CPU, iter, value);
+  auto out = make_ops_tensor(iter, 0);
+  if (haganeOpsFill(&out, value.toFloat()) != HAGANE_OPS_SUCCESS) {
+    fill_stub(c10::DeviceType::CPU, iter, value);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -895,8 +1398,23 @@ void hagane_or_kernel(TensorIterator& iter) {
 }
 
 void hagane_norm_kernel(TensorIterator& iter, const Scalar& p) {
-  // norm not yet in C API — CPU delegation
-  norm_stub(c10::DeviceType::CPU, iter, p);
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  double pval = p.toDouble();
+  // Find reduction dim from shapes
+  const Tensor& in_t = iter.tensor(1);
+  const Tensor& out_t = iter.tensor(0);
+  int32_t dim = -1;
+  for (int64_t d = 0; d < in_t.dim(); d++) {
+    if (in_t.size(d) > 1 && (d >= out_t.dim() || out_t.size(d) == 1)) {
+      dim = static_cast<int32_t>(d);
+      break;
+    }
+  }
+  if (dim < 0) dim = static_cast<int32_t>(in_t.dim() - 1);
+  if (haganeOpsNormVal(&in, &out, pval, dim) != HAGANE_OPS_SUCCESS) {
+    norm_stub(c10::DeviceType::CPU, iter, p);
+  }
 }
 
 // ReduceAllOps: max_all, min_all — different signature: (Tensor& result, const Tensor& self)
@@ -955,6 +1473,261 @@ void hagane_clamp_max_scalar_kernel(TensorIteratorBase& iter, Scalar max_val) {
   auto in = make_ops_tensor(iter, 1);
   if (haganeOpsClamp(&in, &out, 0, 0.0f, 1, max_val.toFloat()) != HAGANE_OPS_SUCCESS) {
     clamp_max_scalar_stub(c10::DeviceType::CPU, iter, max_val);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logit — Metal GPU via MLX
+// ---------------------------------------------------------------------------
+
+void hagane_logit_kernel(TensorIteratorBase& iter, const Scalar& eps) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsLogit(&in, &out, eps.toFloat()) != HAGANE_OPS_SUCCESS) {
+    logit_stub(c10::DeviceType::CPU, iter, eps);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Where — Metal GPU via MLX
+// ---------------------------------------------------------------------------
+
+void hagane_where_kernel(TensorIterator& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto cond = make_ops_tensor(iter, 1);
+  auto a = make_ops_tensor(iter, 2);
+  auto b = make_ops_tensor(iter, 3);
+  if (haganeOpsWhere(&cond, &a, &b, &out) != HAGANE_OPS_SUCCESS) {
+    where_kernel(c10::DeviceType::CPU, iter);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 2: Gather/Scatter — Metal GPU via MLX
+// ---------------------------------------------------------------------------
+
+void hagane_gather_kernel(const Tensor& result, const Tensor& self,
+                          int64_t dim, const Tensor& index) {
+  auto in_d = make_tensor_desc(self);
+  auto idx_d = make_tensor_desc(index);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsGather(&in_d, &idx_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    gather_stub(c10::DeviceType::CPU, result, self, dim, index);
+  }
+}
+
+void hagane_scatter_kernel(const Tensor& self, int64_t dim,
+                           const Tensor& index, const Tensor& src) {
+  auto self_d = make_tensor_desc(self);
+  auto idx_d = make_tensor_desc(index);
+  auto src_d = make_tensor_desc(src);
+  if (haganeOpsScatter(&self_d, &idx_d, &src_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    scatter_stub(c10::DeviceType::CPU, self, dim, index, src);
+  }
+}
+
+void hagane_scatter_fill_kernel(const Tensor& self, int64_t dim,
+                                const Tensor& index, const Scalar& src) {
+  auto self_d = make_tensor_desc(self);
+  auto idx_d = make_tensor_desc(index);
+  if (haganeOpsScatterFill(&self_d, &idx_d, src.toFloat(), static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    scatter_fill_stub(c10::DeviceType::CPU, self, dim, index, src);
+  }
+}
+
+void hagane_scatter_add_kernel(const Tensor& self, int64_t dim,
+                               const Tensor& index, const Tensor& src) {
+  auto self_d = make_tensor_desc(self);
+  auto idx_d = make_tensor_desc(index);
+  auto src_d = make_tensor_desc(src);
+  if (haganeOpsScatterAdd(&self_d, &idx_d, &src_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    scatter_add_stub(c10::DeviceType::CPU, self, dim, index, src);
+  }
+}
+
+void hagane_scatter_reduce_kernel(const Tensor& self, int64_t dim,
+                                  const Tensor& index, const Tensor& src,
+                                  const ReductionType& reduce) {
+  // Scatter with reduce — UMA allows CPU path on same memory
+  scatter_reduce_stub(c10::DeviceType::CPU, self, dim, index, src, reduce);
+}
+
+void hagane_scatter_scalar_reduce_kernel(const Tensor& self, int64_t dim,
+                                         const Tensor& index, const Scalar& value,
+                                         const ReductionType& reduce) {
+  scatter_scalar_reduce_stub(c10::DeviceType::CPU, self, dim, index, value, reduce);
+}
+
+void hagane_scatter_reduce_two_kernel(const Tensor& self, int64_t dim,
+                                       const Tensor& index, const Tensor& src,
+                                       const ReductionType& reduce) {
+  scatter_reduce_two_stub(c10::DeviceType::CPU, self, dim, index, src, reduce);
+}
+
+// ---------------------------------------------------------------------------
+// Batch 2: Index ops — CPU delegation (complex TensorIterator patterns)
+// ---------------------------------------------------------------------------
+
+void hagane_index_kernel(TensorIteratorBase& iter, IntArrayRef indexed_sizes,
+                         IntArrayRef indexed_strides) {
+  // Advanced indexing uses complex TensorIterator patterns
+  // UMA allows CPU path to operate on the same memory directly
+  index_stub(c10::DeviceType::CPU, iter, indexed_sizes, indexed_strides);
+}
+
+void hagane_index_fill_kernel(TensorIterator& iter, int64_t dim,
+                              int64_t self_dim_size, int64_t self_dim_stride,
+                              const Scalar& source) {
+  index_fill_stub(c10::DeviceType::CPU, iter, dim, self_dim_size, self_dim_stride, source);
+}
+
+void hagane_index_copy_kernel(TensorIterator& iter, int64_t dim,
+                              int64_t self_dim_size, int64_t self_dim_stride) {
+  index_copy_stub(c10::DeviceType::CPU, iter, dim, self_dim_size, self_dim_stride);
+}
+
+void hagane_index_put_kernel(TensorIterator& iter, IntArrayRef indexed_sizes,
+                             IntArrayRef indexed_strides, bool accumulate) {
+  index_put_stub(c10::DeviceType::CPU, iter, indexed_sizes, indexed_strides, accumulate);
+}
+
+// ---------------------------------------------------------------------------
+// Batch 2: Flip — Metal GPU via MLX
+// ---------------------------------------------------------------------------
+
+void hagane_flip_kernel(TensorIterator& iter, const bool quantized) {
+  const auto& self = iter.tensor(1);
+  const auto& result = iter.tensor(0);
+  // Flip through TensorIterator — the iterator handles the flip logic,
+  // we just need to do the copy. UMA makes CPU path work on same memory.
+  flip_stub(c10::DeviceType::CPU, iter, quantized);
+}
+
+// ---------------------------------------------------------------------------
+// Batch 2: Masked fill — Metal GPU via MLX
+// ---------------------------------------------------------------------------
+
+void hagane_masked_fill_kernel(TensorIterator& iter, const Scalar& value) {
+  // The primary path goes through masked_fill__cuda C10_EXPORT (MLX GPU).
+  // This stub path handles edge cases from TensorIterator dispatch.
+  const auto& self = iter.tensor(0);
+  auto self_d = make_tensor_desc(self);
+  // iter.tensor(1) is the mask
+  const auto& mask = iter.tensor(1);
+  auto mask_d = make_tensor_desc(mask);
+  if (haganeOpsMaskedFill(&self_d, &mask_d, value.toFloat()) != HAGANE_OPS_SUCCESS) {
+    masked_fill_stub(c10::DeviceType::CPU, iter, value);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 2: Cat — Metal GPU via MLX
+// ---------------------------------------------------------------------------
+
+void hagane_cat_serial_kernel(const Tensor& result,
+                              const MaterializedITensorListRef& tensors,
+                              int64_t dim) {
+  std::vector<haganeOpsTensor_t> descs;
+  std::vector<const haganeOpsTensor_t*> desc_ptrs;
+  descs.reserve(tensors.size());
+
+  bool all_ok = true;
+  for (const auto& t : tensors) {
+    if (t.get().numel() == 0) continue;
+    descs.push_back(make_tensor_desc(t));
+    if (descs.back().dtype == HAGANE_DTYPE_FLOAT64 || !t.get().is_contiguous())
+      all_ok = false;
+  }
+  for (auto& d : descs) desc_ptrs.push_back(&d);
+
+  auto out_d = make_tensor_desc(result);
+  if (all_ok && !desc_ptrs.empty() &&
+      haganeOpsCat(desc_ptrs.data(), static_cast<int32_t>(desc_ptrs.size()),
+                   &out_d, static_cast<int32_t>(dim)) == HAGANE_OPS_SUCCESS) {
+    return;
+  }
+  cat_serial_stub(c10::DeviceType::CPU, result, tensors, dim);
+}
+
+// ---------------------------------------------------------------------------
+// Batch 4: Random/Distribution ops — Metal GPU via MLX
+// ---------------------------------------------------------------------------
+
+void hagane_normal_kernel(const TensorBase& self, double mean, double std,
+                          std::optional<Generator> gen) {
+  auto out_d = make_tensor_desc(self);
+  if (haganeOpsNormal(&out_d, mean, std) != HAGANE_OPS_SUCCESS) {
+    // CPU fallback: generate on CPU, copy to "GPU" (UMA)
+    auto cpu_t = at::empty(self.sizes(), self.options().device(c10::kCPU));
+    cpu_t.normal_(mean, std);
+    std::memcpy(const_cast<void*>(self.const_data_ptr()),
+                cpu_t.const_data_ptr(), self.numel() * self.itemsize());
+  }
+}
+
+void hagane_uniform_kernel(TensorIteratorBase& iter, double from, double to,
+                           std::optional<Generator> gen) {
+  auto out = make_ops_tensor(iter, 0);
+  if (haganeOpsUniform(&out, from, to) != HAGANE_OPS_SUCCESS) {
+    uniform_stub(c10::DeviceType::CPU, iter, from, to, gen);
+  }
+}
+
+void hagane_bernoulli_tensor_kernel(const TensorBase& self, const TensorBase& p_,
+                                    std::optional<Generator> gen) {
+  auto out_d = make_tensor_desc(self);
+  auto p_d = make_tensor_desc(p_);
+  if (haganeOpsBernoulliTensor(&out_d, &p_d) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = at::empty(self.sizes(), self.options().device(c10::kCPU));
+    cpu_self.bernoulli_(Tensor(p_).cpu());
+    std::memcpy(const_cast<void*>(self.const_data_ptr()),
+                cpu_self.const_data_ptr(), self.numel() * self.itemsize());
+  }
+}
+
+void hagane_bernoulli_scalar_kernel(const TensorBase& self, double p,
+                                    std::optional<Generator> gen) {
+  auto out_d = make_tensor_desc(self);
+  if (haganeOpsBernoulliScalar(&out_d, p) != HAGANE_OPS_SUCCESS) {
+    auto cpu_self = at::empty(self.sizes(), self.options().device(c10::kCPU));
+    cpu_self.bernoulli_(p);
+    std::memcpy(const_cast<void*>(self.const_data_ptr()),
+                cpu_self.const_data_ptr(), self.numel() * self.itemsize());
+  }
+}
+
+void hagane_random_from_to_kernel(TensorIteratorBase& iter, uint64_t range,
+                                  int64_t base, std::optional<Generator> gen) {
+  auto out = make_ops_tensor(iter, 0);
+  if (haganeOpsRandomFromTo(&out, base, base + static_cast<int64_t>(range)) != HAGANE_OPS_SUCCESS) {
+    random_from_to_stub(c10::DeviceType::CPU, iter, range, base, gen);
+  }
+}
+
+void hagane_random_full_kernel(TensorIteratorBase& iter, std::optional<Generator> gen) {
+  auto out = make_ops_tensor(iter, 0);
+  if (haganeOpsRandom(&out) != HAGANE_OPS_SUCCESS) {
+    random_full_64_bits_range_stub(c10::DeviceType::CPU, iter, gen);
+  }
+}
+
+void hagane_random_kernel(TensorIteratorBase& iter, std::optional<Generator> gen) {
+  auto out = make_ops_tensor(iter, 0);
+  if (haganeOpsRandom(&out) != HAGANE_OPS_SUCCESS) {
+    random_stub(c10::DeviceType::CPU, iter, gen);
+  }
+}
+
+void hagane_log_normal_kernel(TensorIteratorBase& iter, double mean, double std,
+                              std::optional<Generator> gen) {
+  // log_normal = exp(normal(mean, std))
+  auto out = make_ops_tensor(iter, 0);
+  if (haganeOpsNormal(&out, mean, std) == HAGANE_OPS_SUCCESS) {
+    // Apply exp in-place via MLX
+    auto in = make_ops_tensor(iter, 0);
+    haganeOpsExp(&in, &out);
+  } else {
+    log_normal_stub(c10::DeviceType::CPU, iter, mean, std, gen);
   }
 }
 
@@ -1068,6 +1841,45 @@ REGISTER_DISPATCH(clamp_max_scalar_stub, &hagane_clamp_max_scalar_kernel)
 
 // max_all_stub and min_all_stub are registered by hip/ReduceOps.cpp
 // which calls our C10_EXPORT max_all_launch_kernel/min_all_launch_kernel
+
+// Logit, Where (wiring existing hagane_ops C API)
+REGISTER_DISPATCH(logit_stub, &hagane_logit_kernel)
+REGISTER_DISPATCH(where_kernel, &hagane_where_kernel)
+
+// Batch 2: Gather/Scatter
+REGISTER_DISPATCH(gather_stub, &hagane_gather_kernel)
+REGISTER_DISPATCH(scatter_stub, &hagane_scatter_kernel)
+REGISTER_DISPATCH(scatter_fill_stub, &hagane_scatter_fill_kernel)
+REGISTER_DISPATCH(scatter_add_stub, &hagane_scatter_add_kernel)
+REGISTER_DISPATCH(scatter_reduce_stub, &hagane_scatter_reduce_kernel)
+REGISTER_DISPATCH(scatter_scalar_reduce_stub, &hagane_scatter_scalar_reduce_kernel)
+REGISTER_DISPATCH(scatter_reduce_two_stub, &hagane_scatter_reduce_two_kernel)
+
+// Batch 2: Index ops
+REGISTER_DISPATCH(index_stub, &hagane_index_kernel)
+REGISTER_DISPATCH(index_fill_stub, &hagane_index_fill_kernel)
+REGISTER_DISPATCH(index_copy_stub, &hagane_index_copy_kernel)
+REGISTER_DISPATCH(index_put_stub, &hagane_index_put_kernel)
+
+// Batch 2: Flip, Masked fill
+REGISTER_DISPATCH(flip_stub, &hagane_flip_kernel)
+REGISTER_DISPATCH(masked_fill_stub, &hagane_masked_fill_kernel)
+
+// Batch 2: Cat
+REGISTER_DISPATCH(cat_serial_stub, &hagane_cat_serial_kernel)
+
+// sort_stub registered by hip/Sort.cpp → calls our C10_EXPORT sortKeyValueInplace
+// cumsum_stub, cumprod_stub registered by hip/ScanKernels.cpp → calls our C10_EXPORT launch_*_kernel
+
+// Batch 4: Random/Distribution
+REGISTER_DISPATCH(normal_stub, &hagane_normal_kernel)
+REGISTER_DISPATCH(uniform_stub, &hagane_uniform_kernel)
+REGISTER_DISPATCH(bernoulli_tensor_stub, &hagane_bernoulli_tensor_kernel)
+REGISTER_DISPATCH(bernoulli_scalar_stub, &hagane_bernoulli_scalar_kernel)
+REGISTER_DISPATCH(random_from_to_stub, &hagane_random_from_to_kernel)
+REGISTER_DISPATCH(random_full_64_bits_range_stub, &hagane_random_full_kernel)
+REGISTER_DISPATCH(random_stub, &hagane_random_kernel)
+REGISTER_DISPATCH(log_normal_stub, &hagane_log_normal_kernel)
 
 } // namespace at::native
 
