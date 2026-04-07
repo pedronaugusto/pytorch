@@ -118,10 +118,15 @@
 #include <ATen/ops/addmm.h>
 #include <ATen/ops/cat.h>
 #include <ATen/ops/stack.h>
+#include <ATen/OpMathType.h>
 
 #include <hagane_ops.h>
+#include <cstdlib>
 
 #include <cstring>
+
+// GroupNorm dispatches through DispatchStub (unlike LayerNorm which uses C10_EXPORT)
+#include <ATen/native/group_norm.h>
 
 // ---------------------------------------------------------------------------
 // Misc CUDA API stubs (defined in .cu files excluded by hipify)
@@ -1623,21 +1628,40 @@ static haganeOpsTensor_t make_ops_tensor(TensorIteratorBase& iter, int arg) {
 static haganeOpsTensor_t make_ops_tensor_or_scalar(
     TensorIteratorBase& iter, int arg, at::Tensor& storage) {
   if (iter.is_cpu_scalar(arg)) {
-    auto dtype = iter.dtype(arg);
-    storage = at::empty({}, iter.tensor(0).options().dtype(dtype));
-    AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, dtype, "fill_scalar", [&] {
-      *storage.mutable_data_ptr<scalar_t>() = iter.scalar_value<scalar_t>(arg);
+    // Use output dtype (not scalar's dtype) to avoid float64 promotion
+    // Python float → float64 scalar, but we want float32 on Metal/MLX
+    auto out_dtype = iter.dtype(0);
+    auto scalar_dtype = iter.dtype(arg);
+    auto target_dtype = (scalar_dtype == c10::ScalarType::Double) ? out_dtype : scalar_dtype;
+    storage = at::empty({}, iter.tensor(0).options().dtype(target_dtype));
+    AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, target_dtype, "fill_scalar", [&] {
+      if constexpr (std::is_same_v<scalar_t, bool>) {
+        *storage.mutable_data_ptr<bool>() = iter.scalar_value<int64_t>(arg) != 0;
+      } else {
+        *storage.mutable_data_ptr<scalar_t>() = static_cast<scalar_t>(
+            iter.scalar_value<double>(arg));
+      }
     });
     haganeOpsTensor_t desc;
     desc.data = storage.data_ptr();
     desc.shape = storage.sizes().data();
     desc.strides = storage.strides().data();
     desc.ndim = 0;
-    desc.dtype = to_hagane_dtype(dtype);
+    desc.dtype = to_hagane_dtype(target_dtype);
     return desc;
   }
   return make_ops_tensor(iter, arg);
 }
+
+// Scalar-safe helpers: avoid at::rsub/at::add with Scalar args which hit
+// CPU scalar dispatch assertion on Hagane. Use tensor-tensor ops instead.
+static Tensor hagane_rsub_scalar(const Tensor& t, double val) {
+  return at::sub(at::full_like(t, static_cast<float>(val)), t);
+}
+static Tensor hagane_add_scalar(const Tensor& t, double val) {
+  return at::add(t, at::full_like(t, static_cast<float>(val)));
+}
+
 
 // ---------------------------------------------------------------------------
 // Copy + Fill (memcpy is optimal on UMA for copy)
@@ -1670,6 +1694,14 @@ void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
 // ---------------------------------------------------------------------------
 
 void hagane_add_kernel(TensorIteratorBase& iter, const Scalar& alpha) {
+  // Handle float64 promotion from Python scalars: downcast to float32 for MLX
+  if (iter.common_dtype() == c10::ScalarType::Double) {
+    auto a = iter.tensor(1).to(c10::ScalarType::Float);
+    auto b = iter.tensor(2).to(c10::ScalarType::Float);
+    auto result = (alpha.toFloat() == 1.0f) ? at::add(a, b) : at::add(a, at::mul(b, at::full_like(b, alpha.toFloat())));
+    iter.tensor(0).copy_(result.to(c10::ScalarType::Double));
+    return;
+  }
   auto out = make_ops_tensor(iter, 0);
   at::Tensor sa, sb;
   auto a = make_ops_tensor_or_scalar(iter, 1, sa);
@@ -1680,6 +1712,12 @@ void hagane_add_kernel(TensorIteratorBase& iter, const Scalar& alpha) {
 }
 
 void hagane_mul_kernel(TensorIteratorBase& iter) {
+  if (iter.common_dtype() == c10::ScalarType::Double) {
+    auto a = iter.tensor(1).to(c10::ScalarType::Float);
+    auto b = iter.tensor(2).to(c10::ScalarType::Float);
+    iter.tensor(0).copy_(at::mul(a, b).to(c10::ScalarType::Double));
+    return;
+  }
   auto out = make_ops_tensor(iter, 0);
   at::Tensor sa, sb;
   auto a = make_ops_tensor_or_scalar(iter, 1, sa);
@@ -1690,6 +1728,12 @@ void hagane_mul_kernel(TensorIteratorBase& iter) {
 }
 
 void hagane_div_true_kernel(TensorIteratorBase& iter) {
+  if (iter.common_dtype() == c10::ScalarType::Double) {
+    auto a = iter.tensor(1).to(c10::ScalarType::Float);
+    auto b = iter.tensor(2).to(c10::ScalarType::Float);
+    iter.tensor(0).copy_(at::div(a, b).to(c10::ScalarType::Double));
+    return;
+  }
   auto out = make_ops_tensor(iter, 0);
   at::Tensor sa, sb;
   auto a = make_ops_tensor_or_scalar(iter, 1, sa);
@@ -1724,6 +1768,12 @@ void hagane_div_floor_kernel(TensorIteratorBase& iter) {
 // ---------------------------------------------------------------------------
 
 void hagane_eq_kernel(TensorIteratorBase& iter) {
+  if (iter.common_dtype() == c10::ScalarType::Double) {
+    auto a = iter.tensor(1).to(c10::ScalarType::Float);
+    auto b = iter.tensor(2).to(c10::ScalarType::Float);
+    iter.tensor(0).copy_(at::eq(a, b));
+    return;
+  }
   auto out = make_ops_tensor(iter, 0);
   at::Tensor sa, sb;
   auto a = make_ops_tensor_or_scalar(iter, 1, sa);
@@ -1734,6 +1784,12 @@ void hagane_eq_kernel(TensorIteratorBase& iter) {
 }
 
 void hagane_ne_kernel(TensorIteratorBase& iter) {
+  if (iter.common_dtype() == c10::ScalarType::Double) {
+    auto a = iter.tensor(1).to(c10::ScalarType::Float);
+    auto b = iter.tensor(2).to(c10::ScalarType::Float);
+    iter.tensor(0).copy_(at::ne(a, b));
+    return;
+  }
   auto out = make_ops_tensor(iter, 0);
   at::Tensor sa, sb;
   auto a = make_ops_tensor_or_scalar(iter, 1, sa);
@@ -1743,51 +1799,42 @@ void hagane_ne_kernel(TensorIteratorBase& iter) {
   }
 }
 
-void hagane_lt_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsLt(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    lt_stub(c10::DeviceType::CPU, iter);
-  }
+#define HAGANE_CMP_F64(name, at_fn, ops_fn, stub_name) \
+void name(TensorIteratorBase& iter) { \
+  if (iter.common_dtype() == c10::ScalarType::Double) { \
+    auto a = iter.tensor(1).to(c10::ScalarType::Float); \
+    auto b = iter.tensor(2).to(c10::ScalarType::Float); \
+    iter.tensor(0).copy_(at_fn(a, b)); \
+    return; \
+  } \
+  auto out = make_ops_tensor(iter, 0); \
+  at::Tensor sa, sb; \
+  auto a = make_ops_tensor_or_scalar(iter, 1, sa); \
+  auto b = make_ops_tensor_or_scalar(iter, 2, sb); \
+  if (ops_fn(&a, &b, &out) != HAGANE_OPS_SUCCESS) { \
+    stub_name(c10::DeviceType::CPU, iter); \
+  } \
 }
-
-void hagane_gt_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsGt(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    gt_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_le_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsLe(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    le_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_ge_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsGe(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    ge_stub(c10::DeviceType::CPU, iter);
-  }
-}
+HAGANE_CMP_F64(hagane_lt_kernel, at::lt, haganeOpsLt, lt_stub)
+HAGANE_CMP_F64(hagane_gt_kernel, at::gt, haganeOpsGt, gt_stub)
+HAGANE_CMP_F64(hagane_le_kernel, at::le, haganeOpsLe, le_stub)
+HAGANE_CMP_F64(hagane_ge_kernel, at::ge, haganeOpsGe, ge_stub)
+#undef HAGANE_CMP_F64
 
 // ---------------------------------------------------------------------------
 // Unary ops — Metal GPU via MLX, CPU fallback
 // ---------------------------------------------------------------------------
 
+// Unary float64 handler helper
+#define HAGANE_UNARY_F64(name, at_fn) \
+  if (iter.common_dtype() == c10::ScalarType::Double) { \
+    auto in = iter.tensor(1).to(c10::ScalarType::Float); \
+    iter.tensor(0).copy_(at_fn(in).to(c10::ScalarType::Double)); \
+    return; \
+  }
+
 void hagane_neg_kernel(TensorIteratorBase& iter) {
+  HAGANE_UNARY_F64(hagane_neg_kernel, at::neg)
   auto out = make_ops_tensor(iter, 0);
   auto in = make_ops_tensor(iter, 1);
   if (haganeOpsNeg(&in, &out) != HAGANE_OPS_SUCCESS) {
@@ -1796,6 +1843,7 @@ void hagane_neg_kernel(TensorIteratorBase& iter) {
 }
 
 void hagane_abs_kernel(TensorIteratorBase& iter) {
+  HAGANE_UNARY_F64(hagane_abs_kernel, at::abs)
   auto out = make_ops_tensor(iter, 0);
   auto in = make_ops_tensor(iter, 1);
   if (haganeOpsAbs(&in, &out) != HAGANE_OPS_SUCCESS) {
@@ -2009,6 +2057,13 @@ void hagane_logical_not_kernel(TensorIteratorBase& iter) {
 // ---------------------------------------------------------------------------
 
 void hagane_sub_kernel(TensorIteratorBase& iter, const Scalar& alpha) {
+  if (iter.common_dtype() == c10::ScalarType::Double) {
+    auto a = iter.tensor(1).to(c10::ScalarType::Float);
+    auto b = iter.tensor(2).to(c10::ScalarType::Float);
+    auto result = (alpha.toFloat() == 1.0f) ? at::sub(a, b) : at::sub(a, at::mul(b, at::full_like(b, alpha.toFloat())));
+    iter.tensor(0).copy_(result.to(c10::ScalarType::Double));
+    return;
+  }
   auto out = make_ops_tensor(iter, 0);
   at::Tensor sa, sb;
   auto a = make_ops_tensor_or_scalar(iter, 1, sa);
@@ -2656,6 +2711,328 @@ void hagane_log_normal_kernel(TensorIteratorBase& iter, double mean, double std,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Batch 10: Missing DispatchStub kernels (critical for model inference)
+// ---------------------------------------------------------------------------
+
+// std_var_stub: variance/std reduction via haganeOps C API (Metal GPU)
+void hagane_std_var_kernel(TensorIterator& iter, double correction, bool take_sqrt) {
+  int nout = iter.noutputs();
+  const Tensor& input_t = iter.tensor(nout);
+  const Tensor& out_t = iter.tensor(0);
+  int64_t out_numel = out_t.numel();
+  int64_t N = (out_numel > 0) ? input_t.numel() / out_numel : 0;
+  if (N <= 0) return;
+
+  // Work with own tensors to avoid iter.data_ptr vs tensor.data_ptr mismatch
+  // Use at::empty (not empty_like) to avoid copying zero strides from broadcast output
+  Tensor input_c = input_t.contiguous();
+  Tensor sum_x = at::empty(out_t.sizes(), out_t.options());
+  Tensor sum_x2 = at::empty(out_t.sizes(), out_t.options());
+
+  // Build descriptors for our own contiguous tensors
+  auto mk = [](const Tensor& t) -> haganeOpsTensor_t {
+    haganeOpsTensor_t d;
+    d.data = const_cast<void*>(t.data_ptr());
+    d.shape = t.sizes().data();
+    d.strides = t.strides().data();
+    d.ndim = static_cast<int32_t>(t.dim());
+    d.dtype = to_hagane_dtype(t.scalar_type());
+    return d;
+  };
+
+  auto in_d = mk(input_c);
+  auto sx_d = mk(sum_x);
+  auto sx2_d = mk(sum_x2);
+
+  // sum(x) via MLX
+  haganeOpsSum(&in_d, &sx_d);
+
+  // sum(x^2) via MLX
+  Tensor x_sq = at::mul(input_c, input_c);
+  auto xsq_d = mk(x_sq);
+  haganeOpsSum(&xsq_d, &sx2_d);
+
+  // var = (sum(x^2) - sum(x)^2 / N) / (N - correction)
+  // All element-wise via haganeOps to avoid scalar dispatch
+  Tensor n_t = at::full_like(sum_x, static_cast<float>(N));
+  Tensor denom_t = at::full_like(sum_x, static_cast<float>(static_cast<double>(N) - correction));
+  Tensor sx_sq = at::mul(sum_x, sum_x);      // sum(x)^2
+  Tensor mean_sq_n = at::div(sx_sq, n_t);    // sum(x)^2 / N
+  Tensor var_num = at::sub(sum_x2, mean_sq_n);
+  Tensor var_result = at::div(var_num, denom_t);
+  if (take_sqrt) {
+    Tensor zero_t = at::zeros_like(var_result);
+    var_result = at::sqrt(at::maximum(var_result, zero_t));
+  }
+
+  // Write result to iterator's output
+  out_t.copy_(var_result);
+
+  // If 2 outputs (var_mean), compute mean → output 1
+  if (nout == 2) {
+    Tensor mean_result = at::div(sum_x, n_t);
+    iter.tensor(1).copy_(mean_result);
+  }
+}
+
+// GroupNormKernel (dispatched via DispatchStub from native_group_norm)
+void hagane_group_norm_kernel(
+    const Tensor& X, const Tensor& gamma, const Tensor& beta,
+    int64_t N, int64_t C, int64_t HxW, int64_t group, double eps,
+    Tensor& Y, Tensor& mean, Tensor& rstd) {
+  int64_t D = C / group;
+  auto x_r = X.contiguous().reshape({N, group, D * HxW});
+  auto m = x_r.mean(2, true);
+  auto v = at::sub(x_r, m);
+  auto var = at::mul(v, v).mean(2, true);
+  auto rs = at::reciprocal(at::sqrt(at::add(var, at::full_like(var, static_cast<float>(eps)))));
+  auto output = at::mul(v, rs).reshape(X.sizes());
+  if (gamma.defined()) {
+    auto shape = std::vector<int64_t>(X.dim(), 1);
+    shape[1] = C;
+    output = at::mul(output, gamma.reshape(shape));
+  }
+  if (beta.defined()) {
+    auto shape = std::vector<int64_t>(X.dim(), 1);
+    shape[1] = C;
+    output = at::add(output, beta.reshape(shape));
+  }
+  Y.copy_(output);
+  mean.copy_(m.reshape({N, group}));
+  rstd.copy_(rs.reshape({N, group}));
+}
+
+// GroupNormBackwardKernel
+void hagane_group_norm_backward_kernel(
+    const Tensor& dY, const Tensor& X, const Tensor& mean, const Tensor& rstd,
+    const Tensor& gamma, int64_t N, int64_t C, int64_t HxW, int64_t group,
+    Tensor& dX, Tensor& dgamma, Tensor& dbeta) {
+  int64_t D = C / group;
+  auto x_r = X.reshape({N, group, D * HxW});
+  auto dy_r = dY.reshape({N, group, D * HxW});
+  auto mean_r = mean.reshape({N, group, 1});
+  auto rstd_r = rstd.reshape({N, group, 1});
+  auto x_hat = at::mul(at::sub(x_r, mean_r), rstd_r);
+  if (dX.defined()) {
+    Tensor w_r;
+    if (gamma.defined()) {
+      w_r = gamma.reshape({1, group, D}).expand({N, group, D});
+      w_r = w_r.reshape({N, group, D}).repeat({1, 1, HxW}).reshape({N, group, D * HxW});
+    }
+    auto dxhat = gamma.defined() ? at::mul(dy_r, w_r) : dy_r;
+    int64_t count = D * HxW;
+    auto dx = at::mul(rstd_r, at::sub(at::sub(dxhat, dxhat.mean(2, true)),
+                at::mul(x_hat, at::mul(dxhat, x_hat).mean(2, true))));
+    dX.copy_(dx.reshape(X.sizes()));
+  }
+  if (dgamma.defined() && gamma.defined()) {
+    auto x_r2 = X.reshape({N, C, HxW});
+    auto dy_r2 = dY.reshape({N, C, HxW});
+    auto m2 = mean.reshape({N, group, 1}).expand({N, group, D}).reshape({N, C, 1});
+    auto r2 = rstd.reshape({N, group, 1}).expand({N, group, D}).reshape({N, C, 1});
+    auto xh = at::mul(at::sub(x_r2, m2), r2);
+    dgamma.copy_(at::mul(dy_r2, xh).sum(IntArrayRef({0, 2})));
+  }
+  if (dbeta.defined())
+    dbeta.copy_(dY.reshape({N, C, -1}).sum(IntArrayRef({0, 2})));
+}
+
+// Backward activation stubs — all use ATen ops on UMA (Metal GPU)
+void hagane_sigmoid_backward_kernel(TensorIteratorBase& iter) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& s = iter.tensor(2);
+  iter.tensor(0).copy_(at::mul(g, at::mul(s, at::sub(at::ones_like(s), s))));
+}
+
+void hagane_tanh_backward_kernel(TensorIteratorBase& iter) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& t = iter.tensor(2);
+  iter.tensor(0).copy_(at::mul(g, hagane_rsub_scalar(at::mul(t, t), 1.0)));
+}
+
+void hagane_elu_backward_kernel(TensorIteratorBase& iter,
+                                 const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, bool is_result) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& out_or_in = iter.tensor(2);
+  float a = alpha.toFloat();
+  float s = scale.toFloat();
+  float is_val = input_scale.toFloat();
+  if (is_result) {
+    // grad * (out >= 0 ? scale*input_scale : (out + alpha*scale)*input_scale)
+    auto pos_mask = at::ge(out_or_in, 0.0);
+    auto neg_grad = at::mul(at::add(out_or_in, a * s), is_val);
+    auto pos_grad = at::full_like(g, s * is_val);
+    iter.tensor(0).copy_(at::mul(g, at::where(pos_mask, pos_grad, neg_grad)));
+  } else {
+    auto pos_mask = at::ge(out_or_in, 0.0);
+    auto neg_grad = at::mul(at::mul(at::exp(at::mul(out_or_in, is_val)), a * s), is_val);
+    auto pos_grad = at::full_like(g, s * is_val);
+    iter.tensor(0).copy_(at::mul(g, at::where(pos_mask, pos_grad, neg_grad)));
+  }
+}
+
+void hagane_leaky_relu_backward_kernel(TensorIteratorBase& iter, const Scalar& negval) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& in = iter.tensor(2);
+  float neg = negval.toFloat();
+  auto mask = at::gt(in, 0.0);
+  iter.tensor(0).copy_(at::mul(g, at::where(mask, at::ones_like(g), at::full_like(g, neg))));
+}
+
+void hagane_hardswish_backward_kernel(TensorIterator& iter) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& in = iter.tensor(2);
+  // hardswish'(x) = 0 if x<=-3, 1 if x>=3, x/3 + 0.5 otherwise
+  auto lo = at::le(in, at::full_like(in, -3.0f));
+  auto hi = at::ge(in, at::full_like(in, 3.0f));
+  auto mid_grad = hagane_add_scalar(at::div(in, at::full_like(in, 3.0f)), 0.5);
+  auto grad_factor = at::where(lo, at::zeros_like(g), at::where(hi, at::ones_like(g), mid_grad));
+  iter.tensor(0).copy_(at::mul(g, grad_factor));
+}
+
+void hagane_hardsigmoid_backward_kernel(TensorIteratorBase& iter) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& in = iter.tensor(2);
+  // hardsigmoid'(x) = 1/6 if -3<x<3, 0 otherwise
+  auto mask = at::logical_and(at::gt(in, at::full_like(in, -3.0f)), at::lt(in, at::full_like(in, 3.0f)));
+  iter.tensor(0).copy_(at::mul(g, at::where(mask, at::full_like(g, 1.0f/6.0f), at::zeros_like(g))));
+}
+
+void hagane_softplus_backward_kernel(TensorIteratorBase& iter, const Scalar& beta, const Scalar& threshold) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& in = iter.tensor(2);
+  float b = beta.toFloat();
+  float t = threshold.toFloat();
+  // softplus'(x) = sigmoid(beta*x) if beta*x < threshold, else 1
+  auto bx = at::mul(in, b);
+  auto sig = at::sigmoid(bx);
+  auto mask = at::ge(bx, t);
+  iter.tensor(0).copy_(at::mul(g, at::where(mask, at::ones_like(g), sig)));
+}
+
+void hagane_mish_backward_kernel(TensorIterator& iter) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& in = iter.tensor(2);
+  // mish = x * tanh(softplus(x))
+  // mish' = tanh(sp) + x * sigmoid(x) * sech^2(sp) where sp = softplus(x)
+  auto sp = at::log1p(at::exp(in));
+  auto tanh_sp = at::tanh(sp);
+  auto sig = at::sigmoid(in);
+  auto sech2 = hagane_rsub_scalar(at::mul(tanh_sp, tanh_sp), 1.0);
+  auto grad_factor = at::add(tanh_sp, at::mul(at::mul(in, sig), sech2));
+  iter.tensor(0).copy_(at::mul(g, grad_factor));
+}
+
+void hagane_logit_backward_kernel(TensorIteratorBase& iter, const Scalar& eps_scalar) {
+  const Tensor& g = iter.tensor(1);
+  const Tensor& in = iter.tensor(2);
+  // logit'(x) = 1 / (x * (1 - x)) clamped by eps
+  float eps = eps_scalar.toFloat();
+  Tensor x = in;
+  if (eps > 0) x = at::clamp(x, eps, 1.0f - eps);
+  auto grad_factor = at::reciprocal(at::mul(x, hagane_rsub_scalar(x, 1.0)));
+  iter.tensor(0).copy_(at::mul(g, grad_factor));
+}
+
+// Unary math stubs — Metal GPU via MLX
+void hagane_tan_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsTan(&in, &out) != HAGANE_OPS_SUCCESS)
+    tan_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_acos_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsAcos(&in, &out) != HAGANE_OPS_SUCCESS)
+    acos_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_asin_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsAsin(&in, &out) != HAGANE_OPS_SUCCESS)
+    asin_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_atan_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsAtan(&in, &out) != HAGANE_OPS_SUCCESS)
+    atan_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_cosh_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsCosh(&in, &out) != HAGANE_OPS_SUCCESS)
+    cosh_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_sinh_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsSinh(&in, &out) != HAGANE_OPS_SUCCESS)
+    sinh_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_erfc_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsErfc(&in, &out) != HAGANE_OPS_SUCCESS)
+    erfc_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_lgamma_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsLgamma(&in, &out) != HAGANE_OPS_SUCCESS)
+    lgamma_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_frac_kernel(TensorIteratorBase& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsFrac(&in, &out) != HAGANE_OPS_SUCCESS)
+    frac_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_sinc_kernel(TensorIteratorBase& iter) {
+  // sinc(x) = sin(pi*x)/(pi*x), sinc(0) = 1
+  const Tensor& in = iter.tensor(1);
+  auto pix = at::mul(in, M_PI);
+  auto result = at::where(at::eq(in, 0.0), at::ones_like(in), at::div(at::sin(pix), pix));
+  iter.tensor(0).copy_(result);
+}
+
+void hagane_nan_to_num_kernel(TensorIteratorBase& iter,
+                               std::optional<double> nan_val,
+                               std::optional<double> pos_inf_val,
+                               std::optional<double> neg_inf_val) {
+  const Tensor& in = iter.tensor(1);
+  auto result = in.clone();
+  auto nan_mask = at::isnan(result);
+  if (nan_mask.any().item<bool>())
+    result.masked_fill_(nan_mask, nan_val.value_or(0.0));
+  auto inf_mask = at::isinf(result);
+  if (inf_mask.any().item<bool>()) {
+    auto pos = at::logical_and(inf_mask, at::gt(result, 0.0));
+    auto neg = at::logical_and(inf_mask, at::lt(result, 0.0));
+    double pval = pos_inf_val.value_or(std::numeric_limits<double>::max());
+    double nval = neg_inf_val.value_or(std::numeric_limits<double>::lowest());
+    result.masked_fill_(pos, pval);
+    result.masked_fill_(neg, nval);
+  }
+  iter.tensor(0).copy_(result);
+}
+
+void hagane_signbit_kernel(TensorIteratorBase& iter) {
+  const Tensor& in = iter.tensor(1);
+  iter.tensor(0).copy_(at::lt(in, 0.0));
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -2805,6 +3182,37 @@ REGISTER_DISPATCH(random_from_to_stub, &hagane_random_from_to_kernel)
 REGISTER_DISPATCH(random_full_64_bits_range_stub, &hagane_random_full_kernel)
 REGISTER_DISPATCH(random_stub, &hagane_random_kernel)
 REGISTER_DISPATCH(log_normal_stub, &hagane_log_normal_kernel)
+
+// Batch 10: Critical missing stubs
+REGISTER_DISPATCH(std_var_stub, &hagane_std_var_kernel)
+// LayerNormKernel not needed — PyTorch dispatches to layer_norm_cuda (C10_EXPORT) for CUDA
+REGISTER_DISPATCH(GroupNormKernel, &hagane_group_norm_kernel)
+REGISTER_DISPATCH(GroupNormBackwardKernel, &hagane_group_norm_backward_kernel)
+
+// Batch 10: Backward activation stubs
+REGISTER_DISPATCH(sigmoid_backward_stub, &hagane_sigmoid_backward_kernel)
+REGISTER_DISPATCH(tanh_backward_stub, &hagane_tanh_backward_kernel)
+REGISTER_DISPATCH(elu_backward_stub, &hagane_elu_backward_kernel)
+REGISTER_DISPATCH(leaky_relu_backward_stub, &hagane_leaky_relu_backward_kernel)
+REGISTER_DISPATCH(hardswish_backward_stub, &hagane_hardswish_backward_kernel)
+REGISTER_DISPATCH(hardsigmoid_backward_stub, &hagane_hardsigmoid_backward_kernel)
+REGISTER_DISPATCH(softplus_backward_stub, &hagane_softplus_backward_kernel)
+REGISTER_DISPATCH(mish_backward_stub, &hagane_mish_backward_kernel)
+REGISTER_DISPATCH(logit_backward_stub, &hagane_logit_backward_kernel)
+
+// Batch 10: Unary math stubs
+REGISTER_DISPATCH(tan_stub, &hagane_tan_kernel)
+REGISTER_DISPATCH(acos_stub, &hagane_acos_kernel)
+REGISTER_DISPATCH(asin_stub, &hagane_asin_kernel)
+REGISTER_DISPATCH(atan_stub, &hagane_atan_kernel)
+REGISTER_DISPATCH(cosh_stub, &hagane_cosh_kernel)
+REGISTER_DISPATCH(sinh_stub, &hagane_sinh_kernel)
+REGISTER_DISPATCH(erfc_stub, &hagane_erfc_kernel)
+REGISTER_DISPATCH(lgamma_stub, &hagane_lgamma_kernel)
+REGISTER_DISPATCH(frac_stub, &hagane_frac_kernel)
+REGISTER_DISPATCH(sinc_stub, &hagane_sinc_kernel)
+REGISTER_DISPATCH(nan_to_num_stub, &hagane_nan_to_num_kernel)
+REGISTER_DISPATCH(signbit_stub, &hagane_signbit_kernel)
 
 // =========================================================================
 // Batch 6: Structured Kernels — Softmax, Pooling, Upsample, Conv, Padding
@@ -4060,8 +4468,8 @@ TORCH_IMPL_FUNC(_convert_indices_from_csr_to_coo_structured_cuda)
 C10_EXPORT Tensor binary_cross_entropy_cuda(
     const Tensor& input, const Tensor& target,
     const std::optional<Tensor>& weight, int64_t reduction) {
-  auto loss = -(target * at::log(input) + (1 - target) * at::log(1 - input));
-  if (weight.has_value()) loss = loss * *weight;
+  auto loss = at::neg(at::add(at::mul(target, at::log(input)), at::mul(hagane_rsub_scalar(target, 1.0), at::log(hagane_rsub_scalar(input, 1.0)))));
+  if (weight.has_value()) loss = at::mul(loss, *weight);
   if (reduction == 1) return loss.mean();
   if (reduction == 2) return loss.sum();
   return loss;
@@ -4078,9 +4486,9 @@ C10_EXPORT Tensor& binary_cross_entropy_out_cuda(
 C10_EXPORT Tensor binary_cross_entropy_backward_cuda(
     const Tensor& grad, const Tensor& input, const Tensor& target,
     const std::optional<Tensor>& weight, int64_t reduction) {
-  auto grad_input = grad * (input - target) / (input * (1 - input));
-  if (weight.has_value()) grad_input = grad_input * *weight;
-  if (reduction == 1) grad_input = grad_input / input.numel();
+  auto grad_input = at::div(at::mul(grad, at::sub(input, target)), at::mul(input, hagane_rsub_scalar(input, 1.0)));
+  if (weight.has_value()) grad_input = at::mul(grad_input, *weight);
+  if (reduction == 1) grad_input = at::div(grad_input, input.numel());
   return grad_input;
 }
 
@@ -4330,9 +4738,9 @@ C10_EXPORT std::tuple<Tensor, Tensor> multilabel_margin_loss_forward_cuda(
     }
     sum /= C;
     if (reduction == 0) output[i] = sum;
-    else output = output + sum;
+    else output = at::add(output, sum);
   }
-  if (reduction == 1) output = output / N;
+  if (reduction == 1) output = at::div(output, N);
   return std::make_tuple(output, is_target);
 }
 
@@ -4457,13 +4865,13 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> batch_norm_cuda(
   shape[1] = C;
   auto mean_r = mean.reshape(shape);
   auto var_r = var.reshape(shape);
-  auto output = (input_c - mean_r) / at::sqrt(var_r + eps);
-  if (weight.has_value()) output = output * weight->reshape(shape);
-  if (bias.has_value()) output = output + bias->reshape(shape);
+  auto output = at::div(at::sub(input_c, mean_r), at::sqrt(hagane_add_scalar(var_r, eps)));
+  if (weight.has_value()) output = at::mul(output, weight->reshape(shape));
+  if (bias.has_value()) output = at::add(output, bias->reshape(shape));
 
   if (training && running_mean.has_value()) {
-    running_mean->mul_(1 - momentum).add_(mean, momentum);
-    running_var->mul_(1 - momentum).add_(var * input_c.size(0) / (input_c.size(0) - 1), momentum);
+    running_mean->mul_(1.0 - momentum).add_(mean, momentum);
+    running_var->mul_(1.0 - momentum).add_(at::mul(var, (double)input_c.size(0) / (double)(input_c.size(0) - 1)), momentum);
   }
 
   auto save_mean = training ? mean : at::empty({0}, input.options());
@@ -4500,22 +4908,22 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
   auto shape = std::vector<int64_t>(input_c.dim(), 1);
   shape[1] = C;
   auto mean_r = mean.reshape(shape);
-  auto invstd = (1.0 / at::sqrt(var + eps)).reshape(shape);
-  auto x_hat = (input_c - mean_r) * invstd;
+  auto invstd = at::reciprocal(at::sqrt(hagane_add_scalar(var, eps))).reshape(shape);
+  auto x_hat = at::mul(at::sub(input_c, mean_r), invstd);
   int64_t n = input_c.numel() / C;
 
   Tensor grad_input, grad_weight, grad_bias;
   if (output_mask[0]) {
     auto w = weight.has_value() ? weight->reshape(shape) : at::ones(shape, input.options());
     if (training) {
-      auto dxhat = grad_out * w;
-      grad_input = (1.0 / n) * invstd * (n * dxhat - dxhat.sum(reduce_dims).reshape(shape) - x_hat * (dxhat * x_hat).sum(reduce_dims).reshape(shape));
+      auto dxhat = at::mul(grad_out, w);
+      grad_input = at::mul(at::mul(at::scalar_tensor(1.0 / n, input.options()), invstd), at::sub(at::sub(at::mul(dxhat, n), dxhat.sum(reduce_dims).reshape(shape)), at::mul(x_hat, at::mul(dxhat, x_hat).sum(reduce_dims).reshape(shape))));
     } else {
-      grad_input = grad_out * w * invstd;
+      grad_input = at::mul(at::mul(grad_out, w), invstd);
     }
   }
   if (output_mask[1] && weight.has_value())
-    grad_weight = (grad_out * x_hat).sum(reduce_dims);
+    grad_weight = at::mul(grad_out, x_hat).sum(reduce_dims);
   if (output_mask[2])
     grad_bias = grad_out.sum(reduce_dims);
   return std::make_tuple(
@@ -4581,18 +4989,20 @@ C10_EXPORT std::tuple<Tensor&, Tensor&, Tensor&, Tensor&> _batch_norm_with_updat
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _new_batch_norm_backward_cuda(
     const Tensor& grad_out, const Tensor& input,
-    const std::optional<Tensor>& weight, const std::optional<Tensor>& running_mean,
+    const Tensor& weight, const std::optional<Tensor>& running_mean,
     const std::optional<Tensor>& running_var, const std::optional<Tensor>& save_mean,
-    const std::optional<Tensor>& save_var, bool training, double eps,
+    const std::optional<Tensor>& save_var, bool update, double eps,
     std::array<bool, 3> output_mask, const Tensor& /*reserve*/) {
-  return batch_norm_backward_cuda(grad_out, input, weight, running_mean, running_var, save_mean, save_var, training, eps, output_mask);
+  return batch_norm_backward_cuda(grad_out, input, std::optional<Tensor>(weight), running_mean, running_var, save_mean, save_var, update, eps, output_mask);
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor> batch_norm_stats_cuda(const Tensor& input, double eps) {
   std::vector<int64_t> reduce_dims;
   reduce_dims.push_back(0);
   for (int64_t i = 2; i < input.dim(); i++) reduce_dims.push_back(i);
-  return std::make_tuple(input.mean(reduce_dims), 1.0 / at::sqrt(input.var(reduce_dims, false) + eps));
+  auto mn = input.mean(reduce_dims);
+  auto vr = input.var(reduce_dims, false);
+  return std::make_tuple(mn, at::reciprocal(at::sqrt(hagane_add_scalar(vr, eps))));
 }
 
 C10_EXPORT Tensor batch_norm_elemt_cuda(
@@ -4601,9 +5011,9 @@ C10_EXPORT Tensor batch_norm_elemt_cuda(
   int64_t C = input.size(1);
   auto shape = std::vector<int64_t>(input.dim(), 1);
   shape[1] = C;
-  auto output = (input - mean.reshape(shape)) * invstd.reshape(shape);
-  if (weight.has_value()) output = output * weight->reshape(shape);
-  if (bias.has_value()) output = output + bias->reshape(shape);
+  auto output = at::mul(at::sub(input, mean.reshape(shape)), invstd.reshape(shape));
+  if (weight.has_value()) output = at::mul(output, weight->reshape(shape));
+  if (bias.has_value()) output = at::add(output, bias->reshape(shape));
   return output;
 }
 
@@ -4652,11 +5062,11 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor> batch_norm_backward_reduce
   std::vector<int64_t> reduce_dims;
   reduce_dims.push_back(0);
   for (int64_t i = 2; i < input.dim(); i++) reduce_dims.push_back(i);
-  auto x_hat = (input - mean.reshape(shape)) * invstd.reshape(shape);
+  auto x_hat = at::mul(at::sub(input, mean.reshape(shape)), invstd.reshape(shape));
   return std::make_tuple(
-      (grad_out * invstd.reshape(shape)).sum(reduce_dims),
-      (grad_out * x_hat).sum(reduce_dims),
-      weight_g ? (grad_out * x_hat).sum(reduce_dims) : Tensor(),
+      at::mul(grad_out, invstd.reshape(shape)).sum(reduce_dims),
+      at::mul(grad_out, x_hat).sum(reduce_dims),
+      weight_g ? at::mul(grad_out, x_hat).sum(reduce_dims) : Tensor(),
       bias_g ? grad_out.sum(reduce_dims) : Tensor());
 }
 
@@ -4669,8 +5079,8 @@ C10_EXPORT Tensor batch_norm_backward_elemt_cuda(
   shape[1] = C;
   int64_t n = input.numel() / C;
   auto w = weight.has_value() ? weight->reshape(shape) : at::ones(shape, input.options());
-  auto x_hat = (input - mean.reshape(shape)) * invstd.reshape(shape);
-  return w * invstd.reshape(shape) * (grad_out - sum_dy.reshape(shape) / n - x_hat * sum_dy_xmu.reshape(shape) / n);
+  auto x_hat = at::mul(at::sub(input, mean.reshape(shape)), invstd.reshape(shape));
+  return at::mul(at::mul(w, invstd.reshape(shape)), at::sub(at::sub(grad_out, at::div(sum_dy.reshape(shape), n)), at::mul(x_hat, at::div(sum_dy_xmu.reshape(shape), n))));
 }
 
 // ---------------------------------------------------------------------------
@@ -4687,11 +5097,12 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> layer_norm_cuda(
   auto input_r = input.contiguous().reshape({M, N});
   auto mean = input_r.mean(1, true);
   auto var = input_r.var(1, false, true);
-  auto rstd = 1.0 / at::sqrt(var + eps);
-  auto output = (input_r - mean) * rstd;
+  auto eps_t = at::full_like(var, static_cast<float>(eps));
+  auto rstd = at::reciprocal(at::sqrt(at::add(var, eps_t)));
+  auto output = at::mul(at::sub(input_r, mean), rstd);
   output = output.reshape(input.sizes());
-  if (weight.has_value()) output = output * *weight;
-  if (bias.has_value()) output = output + *bias;
+  if (weight.has_value()) output = at::mul(output, *weight);
+  if (bias.has_value()) output = at::add(output, *bias);
   return std::make_tuple(output, mean.reshape({M}), rstd.reshape({M}));
 }
 
@@ -4706,16 +5117,16 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cuda(
   auto grad_r = grad_out.reshape({M, N});
   auto mean_r = mean.reshape({M, 1});
   auto rstd_r = rstd.reshape({M, 1});
-  auto x_hat = (input_r - mean_r) * rstd_r;
+  auto x_hat = at::mul(at::sub(input_r, mean_r), rstd_r);
 
   Tensor grad_input, grad_weight, grad_bias;
   if (output_mask[0]) {
-    auto dxhat = weight.has_value() ? grad_r * weight->reshape({1, N}) : grad_r;
-    grad_input = rstd_r * (dxhat - dxhat.mean(1, true) - x_hat * (dxhat * x_hat).mean(1, true));
+    auto dxhat = weight.has_value() ? at::mul(grad_r, weight->reshape({1, N})) : grad_r;
+    grad_input = at::mul(rstd_r, at::sub(at::sub(dxhat, dxhat.mean(1, true)), at::mul(x_hat, at::mul(dxhat, x_hat).mean(1, true))));
     grad_input = grad_input.reshape(input.sizes());
   }
   if (output_mask[1] && weight.has_value())
-    grad_weight = (grad_r * x_hat).sum(0).reshape(normalized_shape);
+    grad_weight = at::mul(grad_r, x_hat).sum(0).reshape(normalized_shape);
   if (output_mask[2])
     grad_bias = grad_r.sum(0).reshape(normalized_shape);
   return std::make_tuple(
@@ -4731,17 +5142,17 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cuda(
 C10_EXPORT std::tuple<Tensor, Tensor> weight_norm_cuda(
     const Tensor& v, const Tensor& g, int64_t dim) {
   auto norm = v.norm(2, dim, true);
-  auto w = v * (g.reshape(norm.sizes()) / norm);
+  auto w = at::mul(v, at::div(g.reshape(norm.sizes()), norm));
   return std::make_tuple(w, norm);
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor> weight_norm_backward_cuda(
     const Tensor& grad_w, const Tensor& v, const Tensor& g, const Tensor& norm, int64_t dim) {
-  auto v_normalized = v / norm;
-  auto grad_v = grad_w * g.reshape(norm.sizes()) / norm;
-  auto grad_g = (grad_w * v_normalized).sum(dim, true).reshape(g.sizes());
-  auto dot = (grad_w * v).sum(dim, true);
-  grad_v = grad_v - v_normalized * dot * g.reshape(norm.sizes()) / (norm * norm);
+  auto v_normalized = at::div(v, norm);
+  auto grad_v = at::div(at::mul(grad_w, g.reshape(norm.sizes())), norm);
+  auto grad_g = at::mul(grad_w, v_normalized).sum(dim, true).reshape(g.sizes());
+  auto dot = at::mul(grad_w, v).sum(dim, true);
+  grad_v = at::sub(grad_v, at::div(at::mul(at::mul(v_normalized, dot), g.reshape(norm.sizes())), at::mul(norm, norm)));
   return std::make_tuple(grad_v, grad_g);
 }
 
@@ -4758,10 +5169,10 @@ C10_EXPORT std::tuple<Tensor, Tensor> _fused_rms_norm_cuda(
   int64_t N = 1;
   for (auto s : normalized_shape) N *= s;
   auto input_r = input.contiguous().reshape({M, N});
-  auto rms = at::sqrt((input_r * input_r).mean(1, true) + e);
-  auto rrms = 1.0 / rms;
-  auto output = (input_r * rrms).reshape(input.sizes());
-  if (weight.has_value()) output = output * *weight;
+  auto rms = at::sqrt(at::add(at::mul(input_r, input_r).mean(1, true), e));
+  auto rrms = at::reciprocal(rms);
+  auto output = at::mul(input_r, rrms).reshape(input.sizes());
+  if (weight.has_value()) output = at::mul(output, *weight);
   return std::make_tuple(output, rrms.reshape({M}));
 }
 
@@ -4776,13 +5187,13 @@ C10_EXPORT std::tuple<Tensor, Tensor> _fused_rms_norm_backward_cuda(
   auto rrms_r = rrms.reshape({M, 1});
   Tensor grad_input, grad_weight;
   if (output_mask[0]) {
-    auto dxhat = weight.has_value() ? grad_r * weight->reshape({1, N}) : grad_r;
-    auto x_hat = input_r * rrms_r;
-    grad_input = rrms_r * (dxhat - x_hat * (dxhat * x_hat).mean(1, true));
+    auto dxhat = weight.has_value() ? at::mul(grad_r, weight->reshape({1, N})) : grad_r;
+    auto x_hat = at::mul(input_r, rrms_r);
+    grad_input = at::mul(rrms_r, at::sub(dxhat, at::mul(x_hat, at::mul(dxhat, x_hat).mean(1, true))));
     grad_input = grad_input.reshape(input.sizes());
   }
   if (output_mask[1] && weight.has_value())
-    grad_weight = (grad_r * input_r * rrms_r).sum(0).reshape(normalized_shape);
+    grad_weight = at::mul(at::mul(grad_r, input_r), rrms_r).sum(0).reshape(normalized_shape);
   return std::make_tuple(
       output_mask[0] ? grad_input : Tensor(),
       output_mask[1] ? grad_weight : Tensor());
@@ -4875,7 +5286,7 @@ C10_EXPORT Tensor _embedding_bag_per_sample_weights_backward_cuda(
     int64_t idx = idx_data[i];
     if (idx == padding_idx) continue;
     int64_t bag = offset2bag.const_data_ptr<int64_t>()[i];
-    output[i] = (grad[bag] * weight[idx]).sum();
+    output[i] = at::mul(grad[bag], weight[idx]).sum();
   }
   return output;
 }
@@ -4915,16 +5326,16 @@ C10_EXPORT Tensor& embedding_renorm_cuda_(Tensor& self, const Tensor& indices, d
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _thnn_fused_lstm_cell_cuda(
     const Tensor& input_gates, const Tensor& hidden_gates, const Tensor& cx,
     const std::optional<Tensor>& input_bias, const std::optional<Tensor>& hidden_bias) {
-  auto gates = input_gates + hidden_gates;
-  if (input_bias.has_value()) gates = gates + *input_bias;
-  if (hidden_bias.has_value()) gates = gates + *hidden_bias;
+  auto gates = at::add(input_gates, hidden_gates);
+  if (input_bias.has_value()) gates = at::add(gates, *input_bias);
+  if (hidden_bias.has_value()) gates = at::add(gates, *hidden_bias);
   auto chunks = gates.chunk(4, 1);
   auto i = at::sigmoid(chunks[0]);
   auto f = at::sigmoid(chunks[1]);
   auto g = at::tanh(chunks[2]);
   auto o = at::sigmoid(chunks[3]);
-  auto cy = f * cx + i * g;
-  auto hy = o * at::tanh(cy);
+  auto cy = at::add(at::mul(f, cx), at::mul(i, g));
+  auto hy = at::mul(o, at::tanh(cy));
   return std::make_tuple(hy, cy, gates);
 }
 
@@ -4939,28 +5350,28 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _thnn_fused_lstm_c
   auto g = at::tanh(chunks[2]);
   auto o = at::sigmoid(chunks[3]);
   auto tanh_cy = at::tanh(cy);
-  auto dcy = grad_cy + grad_hy * o * (1 - tanh_cy * tanh_cy);
-  auto di = dcy * g * i * (1 - i);
-  auto df = dcy * cx * f * (1 - f);
-  auto dg = dcy * i * (1 - g * g);
-  auto do_ = grad_hy * tanh_cy * o * (1 - o);
+  auto dcy = at::add(grad_cy, at::mul(at::mul(grad_hy, o), hagane_rsub_scalar(at::mul(tanh_cy, tanh_cy), 1.0)));
+  auto di = at::mul(at::mul(at::mul(dcy, g), i), hagane_rsub_scalar(i, 1.0));
+  auto df = at::mul(at::mul(at::mul(dcy, cx), f), hagane_rsub_scalar(f, 1.0));
+  auto dg = at::mul(at::mul(dcy, i), hagane_rsub_scalar(at::mul(g, g), 1.0));
+  auto do_ = at::mul(at::mul(at::mul(grad_hy, tanh_cy), o), hagane_rsub_scalar(o, 1.0));
   auto d_gates = at::cat({di, df, dg, do_}, 1);
-  auto dcx = dcy * f;
+  auto dcx = at::mul(dcy, f);
   return std::make_tuple(d_gates, d_gates, dcx, Tensor(), Tensor());
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _thnn_fused_gru_cell_cuda(
     const Tensor& input_gates, const Tensor& hidden_gates, const Tensor& hx,
     const std::optional<Tensor>& input_bias, const std::optional<Tensor>& hidden_bias) {
-  auto ig = input_bias.has_value() ? input_gates + *input_bias : input_gates;
-  auto hg = hidden_bias.has_value() ? hidden_gates + *hidden_bias : hidden_gates;
+  auto ig = input_bias.has_value() ? at::add(input_gates, *input_bias) : input_gates;
+  auto hg = hidden_bias.has_value() ? at::add(hidden_gates, *hidden_bias) : hidden_gates;
   auto i_chunks = ig.chunk(3, 1);
   auto h_chunks = hg.chunk(3, 1);
-  auto r = at::sigmoid(i_chunks[0] + h_chunks[0]);
-  auto z = at::sigmoid(i_chunks[1] + h_chunks[1]);
-  auto n = at::tanh(i_chunks[2] + r * h_chunks[2]);
-  auto hy = (1 - z) * n + z * hx;
-  return std::make_tuple(hy, at::cat({r, z, n}, 1), at::cat({i_chunks[0] + h_chunks[0], i_chunks[1] + h_chunks[1], h_chunks[2]}, 1));
+  auto r = at::sigmoid(at::add(i_chunks[0], h_chunks[0]));
+  auto z = at::sigmoid(at::add(i_chunks[1], h_chunks[1]));
+  auto n = at::tanh(at::add(i_chunks[2], at::mul(r, h_chunks[2])));
+  auto hy = at::add(at::mul(hagane_rsub_scalar(z, 1.0), n), at::mul(z, hx));
+  return std::make_tuple(hy, at::cat({r, z, n}, 1), at::cat({at::add(i_chunks[0], h_chunks[0]), at::add(i_chunks[1], h_chunks[1]), h_chunks[2]}, 1));
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _thnn_fused_gru_cell_backward_cuda(
@@ -4969,12 +5380,12 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _thnn_fused_gru_ce
   auto r = at::sigmoid(chunks[0]);
   auto z = at::sigmoid(chunks[1]);
   auto n = at::tanh(chunks[2]);
-  auto dz = grad_hy * (r - n) * z * (1 - z);  // simplified
-  auto dn = grad_hy * (1 - z) * (1 - n * n);
-  auto dr = dn * chunks[2] * r * (1 - r);  // simplified
+  auto dz = at::mul(at::mul(at::mul(grad_hy, at::sub(r, n)), z), hagane_rsub_scalar(z, 1.0));  // simplified
+  auto dn = at::mul(at::mul(grad_hy, hagane_rsub_scalar(z, 1.0)), hagane_rsub_scalar(at::mul(n, n), 1.0));
+  auto dr = at::mul(at::mul(at::mul(dn, chunks[2]), r), hagane_rsub_scalar(r, 1.0));  // simplified
   auto d_input_gates = at::cat({dr, dz, dn}, 1);
-  auto d_hidden_gates = at::cat({dr, dz, dn * r}, 1);
-  return std::make_tuple(d_input_gates, d_hidden_gates, grad_hy * z, Tensor(), Tensor());
+  auto d_hidden_gates = at::cat({dr, dz, at::mul(dn, r)}, 1);
+  return std::make_tuple(d_input_gates, d_hidden_gates, at::mul(grad_hy, z), Tensor(), Tensor());
 }
 
 // ---------------------------------------------------------------------------
@@ -5116,13 +5527,13 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
     std::optional<double> scale) {
   double s = scale.value_or(1.0 / std::sqrt((double)query.size(-1)));
-  auto attn_weight = at::bmm(query, key.transpose(-2, -1)) * s;
+  auto attn_weight = at::mul(at::bmm(query, key.transpose(-2, -1)), s);
   if (is_causal) {
     int64_t L = query.size(-2), S = key.size(-2);
     auto mask = at::ones({L, S}, query.options().dtype(kBool)).tril();
     attn_weight = attn_weight.masked_fill(~mask, -std::numeric_limits<float>::infinity());
   }
-  if (attn_mask.has_value()) attn_weight = attn_weight + *attn_mask;
+  if (attn_mask.has_value()) attn_weight = at::add(attn_weight, *attn_mask);
   auto attn_probs = at::softmax(attn_weight, -1);
   auto output = at::bmm(attn_probs, value);
   auto logsumexp = attn_weight.logsumexp(-1);
@@ -5187,13 +5598,13 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
     std::optional<double> scale, std::optional<int64_t> /*window_left*/,
     std::optional<int64_t> /*window_right*/) {
   double s = scale.value_or(1.0 / std::sqrt((double)query.size(-1)));
-  auto attn_weight = at::bmm(query, key.transpose(-2, -1)) * s;
+  auto attn_weight = at::mul(at::bmm(query, key.transpose(-2, -1)), s);
   auto attn_probs = at::softmax(attn_weight, -1);
   auto grad_v = at::bmm(attn_probs.transpose(-2, -1), grad_out);
   auto grad_attn = at::bmm(grad_out, value.transpose(-2, -1));
-  auto grad_softmax = attn_probs * (grad_attn - (grad_attn * attn_probs).sum(-1, true));
-  auto grad_q = at::bmm(grad_softmax, key) * s;
-  auto grad_k = at::bmm(grad_softmax.transpose(-2, -1), query) * s;
+  auto grad_softmax = at::mul(attn_probs, at::sub(grad_attn, at::mul(grad_attn, attn_probs).sum(-1, true)));
+  auto grad_q = at::mul(at::bmm(grad_softmax, key), s);
+  auto grad_k = at::mul(at::bmm(grad_softmax.transpose(-2, -1), query), s);
   return std::make_tuple(grad_q, grad_k, grad_v);
 }
 
@@ -5214,7 +5625,7 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _cudnn_attention_backward(
     const Tensor& /*attn_bias*/, const Tensor& /*cum_seq_q*/, const Tensor& /*cum_seq_k*/,
     int64_t max_q, int64_t max_k, double dropout_p, bool /*is_causal*/,
     std::optional<double> scale) {
-  return _flash_attention_backward(grad_out, query, key, value, output, logsumexp,
+  return at::native::_flash_attention_backward(grad_out, query, key, value, output, logsumexp,
       Tensor(), Tensor(), max_q, max_k, dropout_p, false, Tensor(), Tensor(), scale, std::nullopt, std::nullopt);
 }
 
@@ -5239,7 +5650,7 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor> _efficient_attention_backw
     int64_t /*custom_mask_type*/, bool /*bias_requires_grad*/,
     std::optional<double> scale, std::optional<int64_t> /*num_splits_key*/,
     std::optional<int64_t> /*window_size*/, bool /*shared_storage_dqdkdv*/) {
-  auto [gq, gk, gv] = _flash_attention_backward(grad_out, query, key, value, output, logsumexp,
+  auto [gq, gk, gv] = at::native::_flash_attention_backward(grad_out, query, key, value, output, logsumexp,
       Tensor(), Tensor(), max_q, max_k, dropout_p, false, Tensor(), Tensor(), scale, std::nullopt, std::nullopt);
   return std::make_tuple(gq, gk, gv, Tensor());
 }
@@ -5261,7 +5672,7 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _scaled_dot_product_cudnn_attentio
     const Tensor& /*attn_bias*/,
     int64_t max_q, int64_t max_k, double dropout_p, bool /*is_causal*/,
     std::optional<double> scale) {
-  return _flash_attention_backward(grad_out, query, key, value, output, logsumexp,
+  return at::native::_flash_attention_backward(grad_out, query, key, value, output, logsumexp,
       Tensor(), Tensor(), max_q, max_k, dropout_p, false, Tensor(), Tensor(), scale, std::nullopt, std::nullopt);
 }
 
@@ -5280,7 +5691,7 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _scaled_dot_product_flash_attentio
     int64_t max_q, int64_t max_k, double dropout_p, bool /*is_causal*/,
     const Tensor& /*philox_seed*/, const Tensor& /*philox_offset*/,
     std::optional<double> scale) {
-  return _flash_attention_backward(grad_out, query, key, value, output, logsumexp,
+  return at::native::_flash_attention_backward(grad_out, query, key, value, output, logsumexp,
       Tensor(), Tensor(), max_q, max_k, dropout_p, false, Tensor(), Tensor(), scale, std::nullopt, std::nullopt);
 }
 
@@ -5307,7 +5718,7 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor> _scaled_dot_product_effici
     const Tensor& /*philox_seed*/, const Tensor& /*philox_offset*/,
     double dropout_p, std::array<bool, 4> /*grad_input_mask*/, bool /*is_causal*/,
     std::optional<double> scale) {
-  auto [gq, gk, gv] = _flash_attention_backward(grad_out, query, key, value, output, logsumexp,
+  auto [gq, gk, gv] = at::native::_flash_attention_backward(grad_out, query, key, value, output, logsumexp,
       Tensor(), Tensor(), 0, 0, dropout_p, false, Tensor(), Tensor(), scale, std::nullopt, std::nullopt);
   return std::make_tuple(gq, gk, gv, Tensor());
 }
@@ -5331,7 +5742,7 @@ C10_EXPORT std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
   auto k = qkv[1].view({key.size(0), -1, num_heads, head_dim}).transpose(1, 2);
   auto v = qkv[2].view({value.size(0), -1, num_heads, head_dim}).transpose(1, 2);
   double scale = 1.0 / std::sqrt((double)head_dim);
-  auto attn = at::softmax(at::matmul(q, k.transpose(-2, -1)) * scale, -1);
+  auto attn = at::softmax(at::mul(at::matmul(q, k.transpose(-2, -1)), scale), -1);
   auto out = at::matmul(attn, v).transpose(1, 2).contiguous().view({query.size(0), -1, embed_dim});
   auto proj_out = at::addmm(proj_bias, out.view({-1, embed_dim}), proj_weight.t()).view(out.sizes());
   return std::make_tuple(proj_out, need_weights ? attn.mean(1) : Tensor());
@@ -5339,7 +5750,7 @@ C10_EXPORT std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cuda(
     const Tensor& qkv, const Tensor& qkv_bias, int64_t num_heads) {
-  auto qkv_with_bias = qkv + qkv_bias;
+  auto qkv_with_bias = at::add(qkv, qkv_bias);
   auto chunks = qkv_with_bias.chunk(3, -1);
   return std::make_tuple(chunks[0], chunks[1], chunks[2]);
 }
@@ -5363,13 +5774,13 @@ C10_EXPORT void _fused_sgd_kernel_cuda_(
   float lr = lr_tensor.item<float>();
   for (int64_t i = 0; i < (int64_t)params.size(); i++) {
     auto& p = params[i];
-    auto g = maximize ? -grads[i] : grads[i];
-    if (weight_decay != 0) g = g + p * weight_decay;
+    auto g = maximize ? at::neg(grads[i]) : grads[i];
+    if (weight_decay != 0) g = at::add(g, at::mul(p, weight_decay));
     if (momentum != 0) {
       auto& buf = momentum_buffer_list[i];
       if (!is_first_step) { buf.mul_(momentum).add_(g, 1-dampening); }
       else { buf.copy_(g); }
-      g = nesterov ? g + buf * momentum : buf;
+      g = nesterov ? at::add(g, at::mul(buf, momentum)) : buf;
     }
     p.add_(g, -lr);
   }
@@ -5384,19 +5795,19 @@ C10_EXPORT void _fused_sgd_kernel_cuda_(
   _fused_sgd_kernel_cuda_(params, grads, momentum_buffer_list, weight_decay, momentum, lr_t, dampening, nesterov, maximize, is_first_step, std::nullopt, std::nullopt);
 }
 
-static void _adam_step(Tensor& p, const Tensor& g, Tensor& exp_avg, Tensor& exp_avg_sq,
+static void _adam_step(const Tensor& p, const Tensor& g, const Tensor& exp_avg, const Tensor& exp_avg_sq,
     double lr, double beta1, double beta2, double eps, double weight_decay,
-    bool amsgrad, Tensor* max_exp_avg_sq, int64_t step, bool adamw) {
+    bool amsgrad, const Tensor* max_exp_avg_sq, int64_t step, bool adamw) {
   auto grad = g;
   if (adamw && weight_decay != 0) p.mul_(1 - lr * weight_decay);
-  else if (!adamw && weight_decay != 0) grad = grad + p * weight_decay;
+  else if (!adamw && weight_decay != 0) grad = at::add(grad, at::mul(p, weight_decay));
   exp_avg.mul_(beta1).add_(grad, 1-beta1);
   exp_avg_sq.mul_(beta2).addcmul_(grad, grad, 1-beta2);
   double bc1 = 1.0 - std::pow(beta1, step);
   double bc2 = 1.0 - std::pow(beta2, step);
   auto denom = amsgrad && max_exp_avg_sq ?
-      at::max(*max_exp_avg_sq, exp_avg_sq).sqrt() / std::sqrt(bc2) + eps :
-      exp_avg_sq.sqrt() / std::sqrt(bc2) + eps;
+      hagane_add_scalar(at::div(at::max(*max_exp_avg_sq, exp_avg_sq).sqrt(), std::sqrt(bc2)), eps) :
+      hagane_add_scalar(at::div(exp_avg_sq.sqrt(), std::sqrt(bc2)), eps);
   if (amsgrad && max_exp_avg_sq) max_exp_avg_sq->copy_(at::max(*max_exp_avg_sq, exp_avg_sq));
   p.addcdiv_(exp_avg, denom, -lr / bc1);
 }
@@ -5505,10 +5916,10 @@ C10_EXPORT void _fused_adagrad_cuda_impl_(
   for (int64_t i = 0; i < (int64_t)params.size(); i++) {
     int64_t step = state_steps[i].item<int64_t>();
     float clr = lr / (1.0 + (step - 1) * lr_decay);
-    auto g = maximize ? -grads[i] : grads[i];
-    if (weight_decay != 0) g = g + params[i] * weight_decay;
+    auto g = maximize ? at::neg(grads[i]) : grads[i];
+    if (weight_decay != 0) g = at::add(g, at::mul(params[i], weight_decay));
     state_sums[i].addcmul_(g, g, 1);
-    params[i].addcdiv_(g, state_sums[i].sqrt() + eps, -clr);
+    params[i].addcdiv_(g, hagane_add_scalar(state_sums[i].sqrt(), eps), -clr);
   }
 }
 
@@ -5534,15 +5945,15 @@ C10_EXPORT void launch_gamma_kernel(const TensorBase& ret, const TensorBase& alp
     if (a >= 1.0f) {
       float d = a - 1.0f/3.0f, c = 1.0f/std::sqrt(9.0f*d);
       while (true) {
-        float x = ((float)rand()/RAND_MAX - 0.5f) * 6.0f; // approximate normal
+        float x = ((float)::rand()/RAND_MAX - 0.5f) * 6.0f; // approximate normal
         float v = (1.0f + c*x); v = v*v*v;
-        if (v > 0 && std::log((float)rand()/RAND_MAX) < 0.5f*x*x + d - d*v + d*std::log(v)) {
+        if (v > 0 && std::log((float)::rand()/RAND_MAX) < 0.5f*x*x + d - d*v + d*std::log(v)) {
           ret_ptr[i] = d * v; break;
         }
       }
     } else {
       // a < 1: use boost
-      float u = (float)rand()/RAND_MAX;
+      float u = (float)::rand()/RAND_MAX;
       ret_ptr[i] = 1.0f; // simplified
     }
   }
@@ -5578,7 +5989,7 @@ C10_EXPORT void launch_binomial_cuda_kernel(TensorIteratorBase& iter, CUDAGenera
     float p = prob_f[i];
     int successes = 0;
     for (int j = 0; j < n; j++) {
-      if ((float)rand()/RAND_MAX < p) successes++;
+      if ((float)::rand()/RAND_MAX < p) successes++;
     }
     out_f[i] = (float)successes;
   }
@@ -5590,7 +6001,7 @@ C10_EXPORT void launch_poisson_cuda_kernel(const TensorBase& ret, const TensorBa
   for (int64_t i = 0; i < ret.numel(); i++) {
     float L = std::exp(-lambda_ptr[i]);
     int k = 0; float p = 1.0f;
-    do { k++; p *= (float)rand()/RAND_MAX; } while (p > L);
+    do { k++; p *= (float)::rand()/RAND_MAX; } while (p > L);
     ret_ptr[i] = (float)(k - 1);
   }
 }
@@ -5709,7 +6120,7 @@ C10_EXPORT void launch_log_sigmoid_forward_kernel(TensorIteratorBase& iter) {
 }
 
 C10_EXPORT Tensor masked_scale_cuda(const Tensor& self, const Tensor& mask, double scale) {
-  return self * mask.to(self.dtype()) * scale;
+  return at::mul(at::mul(self, mask.to(self.dtype())), scale);
 }
 
 C10_EXPORT Tensor nonzero_static_cuda(const Tensor& self, int64_t size, int64_t fill_value) {
@@ -5864,19 +6275,19 @@ C10_EXPORT Tensor sparse_sparse_matmul_cuda(const Tensor& self, const Tensor& ot
 }
 
 C10_EXPORT Tensor& add_out_sparse_cuda(const Tensor& self, const Tensor& other, const Scalar& alpha, Tensor& result) {
-  auto dense_result = self.to_dense() + other.to_dense() * alpha;
+  auto dense_result = at::add(self.to_dense(), at::mul(other.to_dense(), alpha));
   result = dense_result.to_sparse();
   return result;
 }
 
 C10_EXPORT Tensor& add_out_sparse_compressed_cuda(const Tensor& self, const Tensor& other, const Scalar& alpha, Tensor& result) {
-  auto dense_result = self.to_dense() + other.to_dense() * alpha;
+  auto dense_result = at::add(self.to_dense(), at::mul(other.to_dense(), alpha));
   result.copy_(dense_result.to_sparse_csr());
   return result;
 }
 
 C10_EXPORT Tensor& mul_out_sparse_cuda(const Tensor& self, const Tensor& other, Tensor& result) {
-  auto dense_result = self.to_dense() * other.to_dense();
+  auto dense_result = at::mul(self.to_dense(), other.to_dense());
   result = dense_result.to_sparse();
   return result;
 }
