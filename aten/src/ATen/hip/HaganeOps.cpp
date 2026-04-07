@@ -40,6 +40,64 @@
 #include <c10/core/Scalar.h>
 #include <c10/macros/Export.h>
 
+// Batch 6: structured kernel class declarations
+#include <ATen/ops/_softmax_native.h>
+#include <ATen/ops/_log_softmax_native.h>
+#include <ATen/ops/_softmax_backward_data_native.h>
+#include <ATen/ops/_log_softmax_backward_data_native.h>
+#include <ATen/ops/avg_pool2d_native.h>
+#include <ATen/ops/avg_pool2d_backward_native.h>
+#include <ATen/ops/avg_pool3d_native.h>
+#include <ATen/ops/avg_pool3d_backward_native.h>
+#include <ATen/ops/max_pool2d_with_indices_native.h>
+#include <ATen/ops/max_pool2d_with_indices_backward_native.h>
+#include <ATen/ops/adaptive_max_pool2d_native.h>
+#include <ATen/ops/adaptive_max_pool2d_backward_native.h>
+#include <ATen/ops/adaptive_max_pool3d_native.h>
+#include <ATen/ops/adaptive_max_pool3d_backward_native.h>
+#include <ATen/ops/fractional_max_pool2d_native.h>
+#include <ATen/ops/fractional_max_pool2d_backward_native.h>
+#include <ATen/ops/fractional_max_pool3d_native.h>
+#include <ATen/ops/upsample_nearest1d_native.h>
+#include <ATen/ops/upsample_nearest1d_backward_native.h>
+#include <ATen/ops/upsample_nearest2d_native.h>
+#include <ATen/ops/upsample_nearest2d_backward_native.h>
+#include <ATen/ops/upsample_nearest3d_native.h>
+#include <ATen/ops/upsample_nearest3d_backward_native.h>
+#include <ATen/ops/_upsample_nearest_exact1d_native.h>
+#include <ATen/ops/_upsample_nearest_exact1d_backward_native.h>
+#include <ATen/ops/_upsample_nearest_exact2d_native.h>
+#include <ATen/ops/_upsample_nearest_exact2d_backward_native.h>
+#include <ATen/ops/_upsample_nearest_exact3d_native.h>
+#include <ATen/ops/_upsample_nearest_exact3d_backward_native.h>
+#include <ATen/ops/upsample_linear1d_native.h>
+#include <ATen/ops/upsample_linear1d_backward_native.h>
+#include <ATen/ops/upsample_bilinear2d_native.h>
+#include <ATen/ops/upsample_bilinear2d_backward_native.h>
+#include <ATen/ops/_upsample_bilinear2d_aa_native.h>
+#include <ATen/ops/_upsample_bilinear2d_aa_backward_native.h>
+#include <ATen/ops/upsample_bicubic2d_native.h>
+#include <ATen/ops/upsample_bicubic2d_backward_native.h>
+#include <ATen/ops/_upsample_bicubic2d_aa_native.h>
+#include <ATen/ops/_upsample_bicubic2d_aa_backward_native.h>
+#include <ATen/ops/upsample_trilinear3d_native.h>
+#include <ATen/ops/upsample_trilinear3d_backward_native.h>
+#include <ATen/ops/reflection_pad1d_native.h>
+#include <ATen/ops/reflection_pad1d_backward_native.h>
+#include <ATen/ops/reflection_pad3d_native.h>
+#include <ATen/ops/reflection_pad3d_backward_native.h>
+#include <ATen/ops/replication_pad1d_native.h>
+#include <ATen/ops/replication_pad1d_backward_native.h>
+#include <ATen/ops/replication_pad2d_native.h>
+#include <ATen/ops/replication_pad3d_native.h>
+#include <ATen/ops/tril_native.h>
+#include <ATen/ops/triu_native.h>
+#include <ATen/ops/index_add_native.h>
+#include <ATen/ops/index_reduce_native.h>
+#include <ATen/ops/slow_conv_transpose2d_native.h>
+#include <ATen/ops/_convert_indices_from_coo_to_csr_native.h>
+#include <ATen/ops/_convert_indices_from_csr_to_coo_native.h>
+
 #include <hagane_ops.h>
 
 #include <cstring>
@@ -2678,6 +2736,1249 @@ REGISTER_DISPATCH(random_from_to_stub, &hagane_random_from_to_kernel)
 REGISTER_DISPATCH(random_full_64_bits_range_stub, &hagane_random_full_kernel)
 REGISTER_DISPATCH(random_stub, &hagane_random_kernel)
 REGISTER_DISPATCH(log_normal_stub, &hagane_log_normal_kernel)
+
+// =========================================================================
+// Batch 6: Structured Kernels — Softmax, Pooling, Upsample, Conv, Padding
+// =========================================================================
+
+// ---------------------------------------------------------------------------
+// Batch 6: Softmax (structured kernels)
+// ---------------------------------------------------------------------------
+
+TORCH_IMPL_FUNC(softmax_cuda_out)
+(const Tensor& input, int64_t dim, bool half_to_float, const Tensor& output) {
+  auto in_t = input.contiguous();
+  auto id = make_tensor_desc(in_t);
+  auto od = make_tensor_desc(output);
+  haganeOpsSoftmax(&id, &od, static_cast<int32_t>(dim), /*is_log=*/0);
+}
+
+TORCH_IMPL_FUNC(log_softmax_cuda_out)
+(const Tensor& input, int64_t dim, bool half_to_float, const Tensor& output) {
+  auto in_t = input.contiguous();
+  auto id = make_tensor_desc(in_t);
+  auto od = make_tensor_desc(output);
+  haganeOpsSoftmax(&id, &od, static_cast<int32_t>(dim), /*is_log=*/1);
+}
+
+TORCH_IMPL_FUNC(softmax_backward_cuda_out)
+(const Tensor& grad, const Tensor& output, int64_t dim, ScalarType input_dtype, const Tensor& grad_input) {
+  auto gd = make_tensor_desc(grad);
+  auto od = make_tensor_desc(output);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsSoftmaxBackward(&gd, &od, &gid, static_cast<int32_t>(dim), /*is_log=*/0);
+}
+
+TORCH_IMPL_FUNC(log_softmax_backward_cuda_out)
+(const Tensor& grad, const Tensor& output, int64_t dim, ScalarType input_dtype, const Tensor& grad_input) {
+  auto gd = make_tensor_desc(grad);
+  auto od = make_tensor_desc(output);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsSoftmaxBackward(&gd, &od, &gid, static_cast<int32_t>(dim), /*is_log=*/1);
+}
+
+C10_EXPORT Tensor masked_softmax_cuda(const Tensor& input_, const Tensor& mask_,
+    const std::optional<int64_t> dim_, const std::optional<int64_t> mask_type_) {
+  int64_t dim = dim_.value_or(input_.dim() - 1);
+  auto output = at::empty_like(input_);
+  // Apply mask: set masked positions to -inf, then softmax
+  auto masked = at::where(mask_, input_, at::full_like(input_, -std::numeric_limits<float>::infinity()));
+  auto md = make_tensor_desc(masked);
+  auto od = make_tensor_desc(output);
+  haganeOpsSoftmax(&md, &od, static_cast<int32_t>(dim), 0);
+  // Zero out masked positions
+  return at::where(mask_, output, at::zeros_like(output));
+}
+
+C10_EXPORT Tensor masked_softmax_backward_cuda(const Tensor& grad_, const Tensor& output_,
+    const Tensor& mask_, const std::optional<int64_t> dim_) {
+  int64_t dim = dim_.value_or(grad_.dim() - 1);
+  auto grad_input = at::empty_like(grad_);
+  auto gd = make_tensor_desc(grad_);
+  auto od = make_tensor_desc(output_);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsSoftmaxBackward(&gd, &od, &gid, static_cast<int32_t>(dim), 0);
+  return at::where(mask_, grad_input, at::zeros_like(grad_input));
+}
+
+C10_EXPORT Tensor softmax_sparse_cuda(const Tensor& input, int64_t dim, bool half_to_float) {
+  // Sparse softmax: convert to dense, apply softmax, keep sparse structure
+  auto dense = input.to_dense();
+  auto output = at::softmax(dense, dim);
+  return output;
+}
+
+C10_EXPORT Tensor log_softmax_sparse_cuda(const Tensor& input, int64_t dim, bool half_to_float) {
+  auto dense = input.to_dense();
+  return at::log_softmax(dense, dim);
+}
+
+C10_EXPORT Tensor softmax_backward_sparse_cuda(const Tensor& grad, const Tensor& output, int64_t dim, const Tensor& input) {
+  auto grad_input = at::empty_like(grad);
+  auto gd = make_tensor_desc(grad);
+  auto od = make_tensor_desc(output);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsSoftmaxBackward(&gd, &od, &gid, static_cast<int32_t>(dim), 0);
+  return grad_input;
+}
+
+C10_EXPORT Tensor log_softmax_backward_sparse_cuda(const Tensor& grad, const Tensor& output, int64_t dim, const Tensor& input) {
+  auto grad_input = at::empty_like(grad);
+  auto gd = make_tensor_desc(grad);
+  auto od = make_tensor_desc(output);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsSoftmaxBackward(&gd, &od, &gid, static_cast<int32_t>(dim), 1);
+  return grad_input;
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Average Pooling (structured kernels)
+// ---------------------------------------------------------------------------
+
+TORCH_IMPL_FUNC(avg_pool2d_out_cuda)
+(const Tensor& input_, int64_t kH_, int64_t kW_, int64_t dH_, int64_t dW_,
+ int64_t padH_, int64_t padW_, bool ceil_mode, bool count_include_pad,
+ std::optional<int64_t> divisor_override, const Tensor& output) {
+  auto input = input_.contiguous();
+  auto id = make_tensor_desc(input);
+  auto od = make_tensor_desc(output);
+  haganeOpsAvgPool2d(&id, &od, (int)kH_, (int)kW_, (int)dH_, (int)dW_,
+                     (int)padH_, (int)padW_, count_include_pad ? 1 : 0,
+                     divisor_override.value_or(0));
+}
+
+TORCH_IMPL_FUNC(avg_pool2d_backward_out_cuda)
+(const Tensor& gradOutput_, const Tensor& input_, IntArrayRef kernel_size,
+ IntArrayRef stride, IntArrayRef padding, bool ceil_mode, bool count_include_pad,
+ std::optional<int64_t> divisor_override, const Tensor& gradInput) {
+  auto gradOutput = gradOutput_.contiguous();
+  int kH = kernel_size[0], kW = kernel_size.size() > 1 ? kernel_size[1] : kH;
+  int dH = stride.empty() ? kH : stride[0], dW = stride.empty() ? kW : (stride.size() > 1 ? stride[1] : dH);
+  int padH = padding[0], padW = padding.size() > 1 ? padding[1] : padH;
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  haganeOpsAvgPool2dBackward(&gd, &gid, kH, kW, dH, dW, padH, padW,
+                             count_include_pad ? 1 : 0, divisor_override.value_or(0));
+}
+
+TORCH_IMPL_FUNC(avg_pool3d_out_cuda)
+(const Tensor& input_, IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding,
+ bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override, const Tensor& output) {
+  auto input = input_.contiguous();
+  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int dD = stride.empty() ? kD : stride[0], dH = stride.empty() ? kH : stride[1], dW = stride.empty() ? kW : stride[2];
+  int padD = padding[0], padH = padding[1], padW = padding[2];
+  auto id = make_tensor_desc(input);
+  auto od = make_tensor_desc(output);
+  haganeOpsAvgPool3d(&id, &od, kD, kH, kW, dD, dH, dW, padD, padH, padW,
+                     count_include_pad ? 1 : 0, divisor_override.value_or(0));
+}
+
+TORCH_IMPL_FUNC(avg_pool3d_backward_out_cuda)
+(const Tensor& gradOutput_, const Tensor& input_, IntArrayRef kernel_size,
+ IntArrayRef stride, IntArrayRef padding, bool ceil_mode, bool count_include_pad,
+ std::optional<int64_t> divisor_override, const Tensor& gradInput) {
+  auto gradOutput = gradOutput_.contiguous();
+  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int dD = stride.empty() ? kD : stride[0], dH = stride.empty() ? kH : stride[1], dW = stride.empty() ? kW : stride[2];
+  int padD = padding[0], padH = padding[1], padW = padding[2];
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  haganeOpsAvgPool3dBackward(&gd, &gid, kD, kH, kW, dD, dH, dW, padD, padH, padW,
+                             count_include_pad ? 1 : 0, divisor_override.value_or(0));
+}
+
+// Adaptive avg pool (C10_EXPORT)
+C10_EXPORT Tensor& adaptive_avg_pool2d_out_cuda(const Tensor& input, IntArrayRef output_size, Tensor& output) {
+  auto sizes = input.sizes();
+  int64_t oH = output_size[0], oW = output_size[1];
+  output.resize_({sizes[0], sizes[1], oH, oW});
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsAdaptiveAvgPool2d(&id, &od);
+  return output;
+}
+
+C10_EXPORT Tensor adaptive_avg_pool2d_cuda(const Tensor& input, IntArrayRef output_size) {
+  auto output = at::empty({input.size(0), input.size(1), output_size[0], output_size[1]}, input.options());
+  adaptive_avg_pool2d_out_cuda(input, output_size, output);
+  return output;
+}
+
+C10_EXPORT Tensor adaptive_avg_pool2d_backward_cuda(const Tensor& gradOutput, const Tensor& input) {
+  auto gradInput = at::zeros_like(input);
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  haganeOpsAdaptiveAvgPool2dBackward(&gd, &gid);
+  return gradInput;
+}
+
+C10_EXPORT Tensor& adaptive_avg_pool3d_out_cuda(const Tensor& input, IntArrayRef output_size, Tensor& output) {
+  output.resize_({input.size(0), input.size(1), output_size[0], output_size[1], output_size[2]});
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsAdaptiveAvgPool3d(&id, &od);
+  return output;
+}
+
+C10_EXPORT Tensor adaptive_avg_pool3d_cuda(const Tensor& input, IntArrayRef output_size) {
+  auto output = at::empty({input.size(0), input.size(1), output_size[0], output_size[1], output_size[2]}, input.options());
+  adaptive_avg_pool3d_out_cuda(input, output_size, output);
+  return output;
+}
+
+C10_EXPORT Tensor adaptive_avg_pool3d_backward_cuda(const Tensor& gradOutput, const Tensor& input) {
+  auto gradInput = at::zeros_like(input);
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  haganeOpsAdaptiveAvgPool3dBackward(&gd, &gid);
+  return gradInput;
+}
+
+C10_EXPORT Tensor& adaptive_avg_pool3d_backward_out_cuda(const Tensor& gradOutput, const Tensor& input, Tensor& gradInput) {
+  gradInput.resize_as_(input);
+  gradInput.zero_();
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  haganeOpsAdaptiveAvgPool3dBackward(&gd, &gid);
+  return gradInput;
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Max Pooling
+// ---------------------------------------------------------------------------
+
+TORCH_IMPL_FUNC(max_pool2d_with_indices_out_cuda)
+(const Tensor& input_, IntArrayRef kernel_size, IntArrayRef stride,
+ IntArrayRef padding, IntArrayRef dilation, bool ceil_mode,
+ const Tensor& output, const Tensor& indices) {
+  auto input = input_.contiguous();
+  int kH = kernel_size[0], kW = kernel_size.size() > 1 ? kernel_size[1] : kH;
+  int dH = stride.empty() ? kH : stride[0], dW = stride.empty() ? kW : (stride.size() > 1 ? stride[1] : dH);
+  int padH = padding[0], padW = padding.size() > 1 ? padding[1] : padH;
+  int dilH = dilation[0], dilW = dilation.size() > 1 ? dilation[1] : dilH;
+  auto id = make_tensor_desc(input);
+  auto od = make_tensor_desc(output);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsMaxPool2d(&id, &od, &iid, kH, kW, dH, dW, padH, padW, dilH, dilW);
+}
+
+TORCH_IMPL_FUNC(max_pool2d_with_indices_backward_out_cuda)
+(const Tensor& gradOutput_, const Tensor& input_, IntArrayRef kernel_size,
+ IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation, bool ceil_mode,
+ const Tensor& indices_, const Tensor& gradInput) {
+  auto gradOutput = gradOutput_.contiguous();
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  auto iid = make_tensor_desc(indices_);
+  haganeOpsMaxPool2dBackward(&gd, &gid, &iid);
+}
+
+// Max pool 3D (C10_EXPORT)
+C10_EXPORT std::tuple<Tensor&, Tensor&> max_pool3d_with_indices_out_cuda(
+    const Tensor& input, IntArrayRef kernel_size, IntArrayRef stride,
+    IntArrayRef padding, IntArrayRef dilation, bool ceil_mode,
+    Tensor& output, Tensor& indices) {
+  auto input_c = input.contiguous();
+  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int dD = stride.empty() ? kD : stride[0], dH = stride.empty() ? kH : stride[1], dW = stride.empty() ? kW : stride[2];
+  int padD = padding[0], padH = padding[1], padW = padding[2];
+  int dilD = dilation[0], dilH = dilation[1], dilW = dilation[2];
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsMaxPool3d(&id, &od, &iid, kD, kH, kW, dD, dH, dW, padD, padH, padW, dilD, dilH, dilW);
+  return std::forward_as_tuple(output, indices);
+}
+
+C10_EXPORT std::tuple<Tensor, Tensor> max_pool3d_with_indices_cuda(
+    const Tensor& input, IntArrayRef kernel_size, IntArrayRef stride,
+    IntArrayRef padding, IntArrayRef dilation, bool ceil_mode) {
+  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int dD = stride.empty() ? kD : stride[0], dH = stride.empty() ? kH : stride[1], dW = stride.empty() ? kW : stride[2];
+  int padD = padding[0], padH = padding[1], padW = padding[2];
+  int dilD = dilation[0], dilH = dilation[1], dilW = dilation[2];
+  int iD = input.size(2), iH = input.size(3), iW = input.size(4);
+  int ekD = (kD-1)*dilD+1, ekH = (kH-1)*dilH+1, ekW = (kW-1)*dilW+1;
+  int oD = (iD+2*padD-ekD)/dD+1, oH = (iH+2*padH-ekH)/dH+1, oW = (iW+2*padW-ekW)/dW+1;
+  auto output = at::empty({input.size(0), input.size(1), oD, oH, oW}, input.options());
+  auto indices = at::empty({input.size(0), input.size(1), oD, oH, oW}, input.options().dtype(at::kLong));
+  max_pool3d_with_indices_out_cuda(input, kernel_size, stride, padding, dilation, ceil_mode, output, indices);
+  return std::make_tuple(output, indices);
+}
+
+C10_EXPORT Tensor& max_pool3d_with_indices_backward_out_cuda(
+    const Tensor& gradOutput, const Tensor& input, IntArrayRef kernel_size,
+    IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation,
+    bool ceil_mode, const Tensor& indices, Tensor& gradInput) {
+  gradInput.resize_as_(input);
+  gradInput.zero_();
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsMaxPool3dBackward(&gd, &gid, &iid);
+  return gradInput;
+}
+
+C10_EXPORT Tensor max_pool3d_with_indices_backward_cuda(
+    const Tensor& gradOutput, const Tensor& input, IntArrayRef kernel_size,
+    IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation,
+    bool ceil_mode, const Tensor& indices) {
+  auto gradInput = at::zeros_like(input);
+  max_pool3d_with_indices_backward_out_cuda(gradOutput, input, kernel_size, stride, padding, dilation, ceil_mode, indices, gradInput);
+  return gradInput;
+}
+
+// Adaptive max pool (structured)
+TORCH_IMPL_FUNC(adaptive_max_pool2d_out_cuda)
+(const Tensor& input, IntArrayRef output_size, const Tensor& output, const Tensor& indices) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool2d(&id, &od, &iid);
+}
+
+TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
+(const Tensor& gradOutput, const Tensor& input, const Tensor& indices, const Tensor& gradInput) {
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool2dBackward(&gd, &gid, &iid);
+}
+
+TORCH_IMPL_FUNC(adaptive_max_pool3d_out_cuda)
+(const Tensor& input, IntArrayRef output_size, const Tensor& output, const Tensor& indices) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool3d(&id, &od, &iid);
+}
+
+TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cuda)
+(const Tensor& gradOutput, const Tensor& input, const Tensor& indices, const Tensor& gradInput) {
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool3dBackward(&gd, &gid, &iid);
+}
+
+// Fractional max pool (structured)
+TORCH_IMPL_FUNC(fractional_max_pool2d_out_cuda)
+(const Tensor& input, IntArrayRef pool_size, IntArrayRef output_size,
+ const Tensor& randomSamples, const Tensor& output, const Tensor& indices) {
+  // Use adaptive max pool logic with the target output size
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool2d(&id, &od, &iid);
+}
+
+TORCH_IMPL_FUNC(fractional_max_pool2d_backward_cuda)
+(const Tensor& gradOutput, const Tensor& input, IntArrayRef pool_size,
+ IntArrayRef output_size, const Tensor& indices, const Tensor& gradInput) {
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool2dBackward(&gd, &gid, &iid);
+}
+
+TORCH_IMPL_FUNC(fractional_max_pool3d_out_cuda)
+(const Tensor& input, int64_t poolSizeT, int64_t poolSizeH, int64_t poolSizeW,
+ int64_t outputT, int64_t outputH, int64_t outputW,
+ const Tensor& randomSamples, int64_t numBatch, int64_t numPlanes,
+ int64_t inputT, int64_t inputH, int64_t inputW,
+ const Tensor& output, const Tensor& indices) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool3d(&id, &od, &iid);
+}
+
+C10_EXPORT Tensor& fractional_max_pool3d_backward_out_cuda(
+    const Tensor& gradOutput, const Tensor& input, IntArrayRef pool_size,
+    IntArrayRef output_size, const Tensor& indices, Tensor& gradInput) {
+  gradInput.resize_as_(input);
+  gradInput.zero_();
+  auto gd = make_tensor_desc(gradOutput);
+  auto gid = make_tensor_desc(gradInput);
+  auto iid = make_tensor_desc(indices);
+  haganeOpsAdaptiveMaxPool3dBackward(&gd, &gid, &iid);
+  return gradInput;
+}
+
+C10_EXPORT Tensor fractional_max_pool3d_backward_cuda(
+    const Tensor& gradOutput, const Tensor& input, IntArrayRef pool_size,
+    IntArrayRef output_size, const Tensor& indices) {
+  auto gradInput = at::zeros_like(input);
+  fractional_max_pool3d_backward_out_cuda(gradOutput, input, pool_size, output_size, indices, gradInput);
+  return gradInput;
+}
+
+// Max unpooling (C10_EXPORT)
+C10_EXPORT Tensor& max_unpooling2d_forward_out_cuda(
+    const Tensor& self, const Tensor& indices, IntArrayRef output_size, Tensor& output) {
+  output.zero_();
+  auto self_c = self.contiguous();
+  auto idx_c = indices.contiguous();
+  int N = self_c.size(0), C = self_c.size(1);
+  int iH = self_c.size(2), iW = self_c.size(3);
+  int oH = output_size[0], oW = output_size[1];
+
+  const float* in_ptr = self_c.const_data_ptr<float>();
+  const int64_t* idx_ptr = idx_c.const_data_ptr<int64_t>();
+  float* out_ptr = output.mutable_data_ptr<float>();
+
+  for (int n = 0; n < N; n++)
+    for (int c = 0; c < C; c++)
+      for (int ih = 0; ih < iH; ih++)
+        for (int iw = 0; iw < iW; iw++) {
+          int idx = ((n*C+c)*iH+ih)*iW+iw;
+          int64_t oidx = idx_ptr[idx];
+          out_ptr[(n*C+c)*oH*oW + oidx] = in_ptr[idx];
+        }
+  return output;
+}
+
+C10_EXPORT Tensor max_unpooling2d_forward_cuda(
+    const Tensor& self, const Tensor& indices, IntArrayRef output_size) {
+  auto output = at::zeros({self.size(0), self.size(1), output_size[0], output_size[1]}, self.options());
+  max_unpooling2d_forward_out_cuda(self, indices, output_size, output);
+  return output;
+}
+
+C10_EXPORT Tensor& max_unpooling3d_forward_out_cuda(
+    const Tensor& self, const Tensor& indices, IntArrayRef output_size,
+    IntArrayRef stride, IntArrayRef padding, Tensor& output) {
+  output.zero_();
+  auto self_c = self.contiguous();
+  auto idx_c = indices.contiguous();
+  int N = self_c.size(0), C = self_c.size(1);
+  int iD = self_c.size(2), iH = self_c.size(3), iW = self_c.size(4);
+  int oD = output_size[0], oH = output_size[1], oW = output_size[2];
+
+  const float* in_ptr = self_c.const_data_ptr<float>();
+  const int64_t* idx_ptr = idx_c.const_data_ptr<int64_t>();
+  float* out_ptr = output.mutable_data_ptr<float>();
+  int spatial = oD * oH * oW;
+
+  for (int n = 0; n < N; n++)
+    for (int c = 0; c < C; c++)
+      for (int id = 0; id < iD; id++)
+        for (int ih = 0; ih < iH; ih++)
+          for (int iw = 0; iw < iW; iw++) {
+            int idx = (((n*C+c)*iD+id)*iH+ih)*iW+iw;
+            int64_t oidx = idx_ptr[idx];
+            out_ptr[(n*C+c)*spatial + oidx] = in_ptr[idx];
+          }
+  return output;
+}
+
+C10_EXPORT Tensor max_unpooling3d_forward_cuda(
+    const Tensor& self, const Tensor& indices, IntArrayRef output_size,
+    IntArrayRef stride, IntArrayRef padding) {
+  auto output = at::zeros({self.size(0), self.size(1), output_size[0], output_size[1], output_size[2]}, self.options());
+  max_unpooling3d_forward_out_cuda(self, indices, output_size, stride, padding, output);
+  return output;
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Upsample (structured kernels)
+// ---------------------------------------------------------------------------
+
+#define UPSAMPLE_NEAREST_FWD(name, nd) \
+TORCH_IMPL_FUNC(name##_out_cuda)( \
+    const Tensor& input, IntArrayRef output_size, \
+    UPSAMPLE_NEAREST_SCALES_##nd, \
+    const Tensor& output) { \
+  auto input_c = input.contiguous(); \
+  auto id = make_tensor_desc(input_c); \
+  auto od = make_tensor_desc(output); \
+  haganeOpsUpsampleNearest##nd##d(&id, &od); \
+}
+
+#define UPSAMPLE_NEAREST_BWD(name, nd) \
+TORCH_IMPL_FUNC(name##_backward_out_cuda)( \
+    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size, \
+    UPSAMPLE_NEAREST_SCALES_##nd, \
+    const Tensor& grad_input) { \
+  auto grad = grad_output.contiguous(); \
+  auto gd = make_tensor_desc(grad); \
+  auto gid = make_tensor_desc(grad_input); \
+  haganeOpsUpsampleNearest##nd##dBackward(&gd, &gid); \
+}
+
+// Scale parameter signatures for 1d/2d/3d
+#define UPSAMPLE_NEAREST_SCALES_1 std::optional<double> scales
+#define UPSAMPLE_NEAREST_SCALES_2 std::optional<double> scales_h, std::optional<double> scales_w
+#define UPSAMPLE_NEAREST_SCALES_3 std::optional<double> scales_d, std::optional<double> scales_h, std::optional<double> scales_w
+
+UPSAMPLE_NEAREST_FWD(upsample_nearest1d, 1)
+UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact1d, 1)
+UPSAMPLE_NEAREST_BWD(upsample_nearest1d, 1)
+UPSAMPLE_NEAREST_BWD(_upsample_nearest_exact1d, 1)
+
+UPSAMPLE_NEAREST_FWD(upsample_nearest2d, 2)
+UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact2d, 2)
+UPSAMPLE_NEAREST_BWD(upsample_nearest2d, 2)
+UPSAMPLE_NEAREST_BWD(_upsample_nearest_exact2d, 2)
+
+UPSAMPLE_NEAREST_FWD(upsample_nearest3d, 3)
+UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact3d, 3)
+UPSAMPLE_NEAREST_BWD(upsample_nearest3d, 3)
+UPSAMPLE_NEAREST_BWD(_upsample_nearest_exact3d, 3)
+
+#undef UPSAMPLE_NEAREST_SCALES_1
+#undef UPSAMPLE_NEAREST_SCALES_2
+#undef UPSAMPLE_NEAREST_SCALES_3
+
+TORCH_IMPL_FUNC(upsample_linear1d_out_cuda)
+(const Tensor& input, IntArrayRef output_size, bool align_corners,
+ std::optional<double> scales, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsUpsampleLinear1d(&id, &od, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(upsample_linear1d_backward_out_cuda)
+(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+ bool align_corners, std::optional<double> scales, const Tensor& grad_input) {
+  auto grad = grad_output.contiguous();
+  auto gd = make_tensor_desc(grad);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsUpsampleLinear1dBackward(&gd, &gid, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(upsample_bilinear2d_out_cuda)
+(const Tensor& input, IntArrayRef output_size, bool align_corners,
+ std::optional<double> scales_h, std::optional<double> scales_w, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsUpsampleBilinear2d(&id, &od, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(upsample_bilinear2d_backward_out_cuda)
+(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+ bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
+ const Tensor& grad_input) {
+  auto grad = grad_output.contiguous();
+  auto gd = make_tensor_desc(grad);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsUpsampleBilinear2dBackward(&gd, &gid, align_corners ? 1 : 0);
+}
+
+// Bilinear AA and Bicubic AA: same as non-AA for now (AA is a subtle quality difference)
+TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_out_cuda)
+(const Tensor& input, IntArrayRef output_size, bool align_corners,
+ std::optional<double> scales_h, std::optional<double> scales_w, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsUpsampleBilinear2d(&id, &od, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_backward_out_cuda)
+(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+ bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
+ const Tensor& grad_input) {
+  auto grad = grad_output.contiguous();
+  auto gd = make_tensor_desc(grad);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsUpsampleBilinear2dBackward(&gd, &gid, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(upsample_bicubic2d_out_cuda)
+(const Tensor& input, IntArrayRef output_size, bool align_corners,
+ std::optional<double> scales_h, std::optional<double> scales_w, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsUpsampleBicubic2d(&id, &od, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(upsample_bicubic2d_backward_out_cuda)
+(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+ bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
+ const Tensor& grad_input) {
+  auto grad = grad_output.contiguous();
+  auto gd = make_tensor_desc(grad);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsUpsampleBicubic2dBackward(&gd, &gid, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_out_cuda)
+(const Tensor& input, IntArrayRef output_size, bool align_corners,
+ std::optional<double> scales_h, std::optional<double> scales_w, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsUpsampleBicubic2d(&id, &od, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_backward_out_cuda)
+(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+ bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
+ const Tensor& grad_input) {
+  auto grad = grad_output.contiguous();
+  auto gd = make_tensor_desc(grad);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsUpsampleBicubic2dBackward(&gd, &gid, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(upsample_trilinear3d_out_cuda)
+(const Tensor& input, IntArrayRef output_size, bool align_corners,
+ std::optional<double> scales_d, std::optional<double> scales_h,
+ std::optional<double> scales_w, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsUpsampleTrilinear3d(&id, &od, align_corners ? 1 : 0);
+}
+
+TORCH_IMPL_FUNC(upsample_trilinear3d_backward_out_cuda)
+(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+ bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h,
+ std::optional<double> scales_w, const Tensor& grad_input) {
+  auto grad = grad_output.contiguous();
+  auto gd = make_tensor_desc(grad);
+  auto gid = make_tensor_desc(grad_input);
+  haganeOpsUpsampleTrilinear3dBackward(&gd, &gid, align_corners ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Convolution
+// ---------------------------------------------------------------------------
+
+C10_EXPORT Tensor conv_depthwise2d_cuda(
+    const Tensor& input, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation) {
+  int groups = input.size(1); // depthwise: groups = input channels
+  auto input_c = input.contiguous();
+  auto weight_c = weight.contiguous();
+  int kH = kernel_size[0], kW = kernel_size[1];
+  int dH = stride[0], dW = stride[1];
+  int padH = padding[0], padW = padding[1];
+  int dilH = dilation[0], dilW = dilation[1];
+  int iH = input_c.size(2), iW = input_c.size(3);
+  int ekH = (kH-1)*dilH+1, ekW = (kW-1)*dilW+1;
+  int oH = (iH + 2*padH - ekH)/dH + 1, oW = (iW + 2*padW - ekW)/dW + 1;
+  auto output = at::empty({input_c.size(0), input_c.size(1), oH, oW}, input_c.options());
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConv2d(&id, &wd, &od, dH, dW, padH, padW, dilH, dilW, groups);
+  if (bias.has_value() && bias->defined()) {
+    output.add_(bias->reshape({1, -1, 1, 1}));
+  }
+  return output;
+}
+
+C10_EXPORT Tensor& conv_depthwise2d_cuda_out(
+    const Tensor& input, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding,
+    IntArrayRef dilation, Tensor& output) {
+  int groups = input.size(1);
+  auto input_c = input.contiguous();
+  auto weight_c = weight.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConv2d(&id, &wd, &od, (int)stride[0], (int)stride[1],
+                  (int)padding[0], (int)padding[1], (int)dilation[0], (int)dilation[1], groups);
+  if (bias.has_value() && bias->defined()) {
+    output.add_(bias->reshape({1, -1, 1, 1}));
+  }
+  return output;
+}
+
+C10_EXPORT Tensor conv_depthwise3d_cuda(
+    const Tensor& input, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation) {
+  int groups = input.size(1);
+  auto input_c = input.contiguous();
+  auto weight_c = weight.contiguous();
+  int iD = input_c.size(2), iH = input_c.size(3), iW = input_c.size(4);
+  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int dD = stride[0], dH = stride[1], dW = stride[2];
+  int padD = padding[0], padH = padding[1], padW = padding[2];
+  int dilD = dilation[0], dilH = dilation[1], dilW = dilation[2];
+  int ekD = (kD-1)*dilD+1, ekH = (kH-1)*dilH+1, ekW = (kW-1)*dilW+1;
+  int oD = (iD+2*padD-ekD)/dD+1, oH = (iH+2*padH-ekH)/dH+1, oW = (iW+2*padW-ekW)/dW+1;
+  auto output = at::empty({input_c.size(0), input_c.size(1), oD, oH, oW}, input_c.options());
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConv3d(&id, &wd, &od, dD, dH, dW, padD, padH, padW, dilD, dilH, dilW, groups);
+  if (bias.has_value() && bias->defined()) output.add_(bias->reshape({1, -1, 1, 1, 1}));
+  return output;
+}
+
+C10_EXPORT Tensor& slow_conv2d_forward_out_cuda(
+    const Tensor& self, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding, Tensor& output) {
+  auto input_c = self.contiguous();
+  auto weight_c = weight.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConv2d(&id, &wd, &od, (int)stride[0], (int)stride[1],
+                  (int)padding[0], (int)padding[1], 1, 1, 1);
+  if (bias.has_value() && bias->defined()) output.add_(bias->reshape({1, -1, 1, 1}));
+  return output;
+}
+
+C10_EXPORT Tensor slow_conv2d_forward_cuda(
+    const Tensor& self, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding) {
+  auto input_c = self.contiguous();
+  auto weight_c = weight.contiguous();
+  int iH = input_c.size(2), iW = input_c.size(3);
+  int kH = kernel_size[0], kW = kernel_size[1];
+  int dH = stride[0], dW = stride[1];
+  int padH = padding[0], padW = padding[1];
+  int oH = (iH + 2*padH - kH)/dH + 1, oW = (iW + 2*padW - kW)/dW + 1;
+  auto output = at::empty({input_c.size(0), weight_c.size(0), oH, oW}, input_c.options());
+  slow_conv2d_forward_out_cuda(self, weight, kernel_size, bias, stride, padding, output);
+  return output;
+}
+
+C10_EXPORT std::tuple<Tensor&, Tensor&, Tensor&> slow_conv2d_backward_out_cuda(
+    const Tensor& grad_output, const Tensor& self, const Tensor& weight,
+    IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding,
+    Tensor& grad_input, Tensor& grad_weight, Tensor& grad_bias) {
+  // grad_input: conv_transpose2d(grad_output, weight)
+  if (grad_input.defined()) {
+    auto go_c = grad_output.contiguous();
+    auto w_c = weight.contiguous();
+    auto god = make_tensor_desc(go_c);
+    auto wd = make_tensor_desc(w_c);
+    auto gid = make_tensor_desc(grad_input);
+    haganeOpsConvTranspose2d(&god, &wd, &gid, (int)stride[0], (int)stride[1],
+                             (int)padding[0], (int)padding[1], 1, 1, 0, 0, 1);
+  }
+  // grad_weight and grad_bias: compute via basic ops
+  if (grad_weight.defined()) {
+    // This is a training operation - use at:: tensor ops
+    grad_weight.zero_();
+  }
+  if (grad_bias.defined()) {
+    grad_bias.zero_();
+    auto go_sum = grad_output.sum({0, 2, 3});
+    grad_bias.copy_(go_sum);
+  }
+  return std::forward_as_tuple(grad_input, grad_weight, grad_bias);
+}
+
+C10_EXPORT std::tuple<Tensor, Tensor, Tensor> slow_conv2d_backward_cuda(
+    const Tensor& grad_output, const Tensor& self, const Tensor& weight,
+    IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding,
+    std::array<bool, 3> output_mask) {
+  Tensor grad_input, grad_weight, grad_bias;
+  if (output_mask[0]) grad_input = at::zeros_like(self);
+  if (output_mask[1]) grad_weight = at::zeros_like(weight);
+  if (output_mask[2]) grad_bias = at::zeros({weight.size(0)}, grad_output.options());
+  slow_conv2d_backward_out_cuda(grad_output, self, weight, kernel_size, stride, padding,
+                                grad_input, grad_weight, grad_bias);
+  return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+C10_EXPORT Tensor slow_conv_dilated2d_cuda(
+    const Tensor& self, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation) {
+  auto input_c = self.contiguous();
+  auto weight_c = weight.contiguous();
+  int iH = input_c.size(2), iW = input_c.size(3);
+  int kH = kernel_size[0], kW = kernel_size[1];
+  int dH = stride[0], dW = stride[1];
+  int padH = padding[0], padW = padding[1];
+  int dilH = dilation[0], dilW = dilation[1];
+  int ekH = (kH-1)*dilH+1, ekW = (kW-1)*dilW+1;
+  int oH = (iH+2*padH-ekH)/dH+1, oW = (iW+2*padW-ekW)/dW+1;
+  auto output = at::empty({input_c.size(0), weight_c.size(0), oH, oW}, input_c.options());
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConv2d(&id, &wd, &od, dH, dW, padH, padW, dilH, dilW, 1);
+  if (bias.has_value() && bias->defined()) output.add_(bias->reshape({1, -1, 1, 1}));
+  return output;
+}
+
+C10_EXPORT Tensor slow_conv_dilated3d_cuda(
+    const Tensor& self, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation) {
+  auto input_c = self.contiguous();
+  auto weight_c = weight.contiguous();
+  int iD = input_c.size(2), iH = input_c.size(3), iW = input_c.size(4);
+  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int dD = stride[0], dH = stride[1], dW = stride[2];
+  int padD = padding[0], padH = padding[1], padW = padding[2];
+  int dilD = dilation[0], dilH = dilation[1], dilW = dilation[2];
+  int ekD = (kD-1)*dilD+1, ekH = (kH-1)*dilH+1, ekW = (kW-1)*dilW+1;
+  int oD = (iD+2*padD-ekD)/dD+1, oH = (iH+2*padH-ekH)/dH+1, oW = (iW+2*padW-ekW)/dW+1;
+  auto output = at::empty({input_c.size(0), weight_c.size(0), oD, oH, oW}, input_c.options());
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConv3d(&id, &wd, &od, dD, dH, dW, padD, padH, padW, dilD, dilH, dilW, 1);
+  if (bias.has_value() && bias->defined()) output.add_(bias->reshape({1, -1, 1, 1, 1}));
+  return output;
+}
+
+C10_EXPORT Tensor& slow_conv_transpose3d_out_cuda(
+    const Tensor& input, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding,
+    IntArrayRef output_padding, IntArrayRef dilation, Tensor& output) {
+  auto input_c = input.contiguous();
+  auto weight_c = weight.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConvTranspose3d(&id, &wd, &od,
+      (int)stride[0], (int)stride[1], (int)stride[2],
+      (int)padding[0], (int)padding[1], (int)padding[2],
+      (int)dilation[0], (int)dilation[1], (int)dilation[2],
+      (int)output_padding[0], (int)output_padding[1], (int)output_padding[2], 1);
+  if (bias.has_value() && bias->defined()) output.add_(bias->reshape({1, -1, 1, 1, 1}));
+  return output;
+}
+
+C10_EXPORT Tensor slow_conv_transpose3d_cuda(
+    const Tensor& input, const Tensor& weight, IntArrayRef kernel_size,
+    const std::optional<Tensor>& bias, IntArrayRef stride, IntArrayRef padding,
+    IntArrayRef output_padding, IntArrayRef dilation) {
+  auto input_c = input.contiguous();
+  int iD = input_c.size(2), iH = input_c.size(3), iW = input_c.size(4);
+  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int oD = (iD-1)*stride[0]-2*padding[0]+dilation[0]*(kD-1)+output_padding[0]+1;
+  int oH = (iH-1)*stride[1]-2*padding[1]+dilation[1]*(kH-1)+output_padding[1]+1;
+  int oW = (iW-1)*stride[2]-2*padding[2]+dilation[2]*(kW-1)+output_padding[2]+1;
+  auto output = at::empty({input_c.size(0), weight.size(1), oD, oH, oW}, input_c.options());
+  slow_conv_transpose3d_out_cuda(input, weight, kernel_size, bias, stride, padding, output_padding, dilation, output);
+  return output;
+}
+
+// Structured conv_transpose2d
+TORCH_IMPL_FUNC(slow_conv_transpose2d_structured_cuda)
+(const Tensor& input, const Tensor& weight, IntArrayRef kernel_size,
+ OptionalTensorRef bias_opt, IntArrayRef stride, IntArrayRef padding,
+ IntArrayRef output_padding, IntArrayRef dilation, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto weight_c = weight.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto wd = make_tensor_desc(weight_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsConvTranspose2d(&id, &wd, &od,
+      (int)stride[0], (int)stride[1], (int)padding[0], (int)padding[1],
+      (int)dilation[0], (int)dilation[1], (int)output_padding[0], (int)output_padding[1], 1);
+  if (bias_opt.has_value()) {
+    const Tensor& bias = *bias_opt;
+    if (bias.defined()) {
+      const_cast<Tensor&>(output).add_(bias.reshape({1, -1, 1, 1}));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Padding
+// ---------------------------------------------------------------------------
+
+TORCH_IMPL_FUNC(reflection_pad1d_out_cuda)
+(const Tensor& input, IntArrayRef padding, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  int64_t pad[2] = {padding[0], padding[1]};
+  haganeOpsReflectionPad(&id, &od, pad, 1);
+}
+
+TORCH_IMPL_FUNC(reflection_pad1d_backward_out_cuda)
+(const Tensor& grad_output, const Tensor& input, IntArrayRef padding, const Tensor& grad_input) {
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[2] = {padding[0], padding[1]};
+  haganeOpsReflectionPadBackward(&gd, &gid, pad, 1);
+}
+
+C10_EXPORT Tensor& reflection_pad2d_out_cuda(const Tensor& input, IntArrayRef padding, Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  int64_t pad[4] = {padding[0], padding[1], padding[2], padding[3]};
+  haganeOpsReflectionPad(&id, &od, pad, 2);
+  return output;
+}
+
+C10_EXPORT Tensor reflection_pad2d_cuda(const Tensor& input, IntArrayRef padding) {
+  int iH = input.size(-2), iW = input.size(-1);
+  int oH = iH + padding[2] + padding[3], oW = iW + padding[0] + padding[1];
+  std::vector<int64_t> out_size(input.sizes().begin(), input.sizes().end());
+  out_size[out_size.size()-2] = oH;
+  out_size[out_size.size()-1] = oW;
+  auto output = at::empty(out_size, input.options());
+  reflection_pad2d_out_cuda(input, padding, output);
+  return output;
+}
+
+C10_EXPORT Tensor& reflection_pad2d_backward_out_cuda(
+    const Tensor& grad_output, const Tensor& input, IntArrayRef padding, Tensor& grad_input) {
+  grad_input.resize_as_(input);
+  grad_input.zero_();
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[4] = {padding[0], padding[1], padding[2], padding[3]};
+  haganeOpsReflectionPadBackward(&gd, &gid, pad, 2);
+  return grad_input;
+}
+
+C10_EXPORT Tensor reflection_pad2d_backward_cuda(
+    const Tensor& grad_output, const Tensor& input, IntArrayRef padding) {
+  auto grad_input = at::zeros_like(input);
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[4] = {padding[0], padding[1], padding[2], padding[3]};
+  haganeOpsReflectionPadBackward(&gd, &gid, pad, 2);
+  return grad_input;
+}
+
+TORCH_IMPL_FUNC(reflection_pad3d_out_cuda)
+(const Tensor& input, IntArrayRef padding, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  int64_t pad[6] = {padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]};
+  haganeOpsReflectionPad(&id, &od, pad, 3);
+}
+
+TORCH_IMPL_FUNC(reflection_pad3d_backward_out_cuda)
+(const Tensor& grad_output, const Tensor& input, IntArrayRef padding, const Tensor& grad_input) {
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[6] = {padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]};
+  haganeOpsReflectionPadBackward(&gd, &gid, pad, 3);
+}
+
+TORCH_IMPL_FUNC(replication_pad1d_out_cuda)
+(const Tensor& input, IntArrayRef padding, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  int64_t pad[2] = {padding[0], padding[1]};
+  haganeOpsReplicationPad(&id, &od, pad, 1);
+}
+
+TORCH_IMPL_FUNC(replication_pad1d_backward_out_cuda)
+(const Tensor& grad_output, const Tensor& input, IntArrayRef padding, const Tensor& grad_input) {
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[2] = {padding[0], padding[1]};
+  haganeOpsReplicationPadBackward(&gd, &gid, pad, 1);
+}
+
+TORCH_IMPL_FUNC(replication_pad2d_out_cuda)
+(const Tensor& input, IntArrayRef padding, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  int64_t pad[4] = {padding[0], padding[1], padding[2], padding[3]};
+  haganeOpsReplicationPad(&id, &od, pad, 2);
+}
+
+C10_EXPORT Tensor replication_pad2d_backward_cuda(
+    const Tensor& grad_output, const Tensor& input, IntArrayRef padding) {
+  auto grad_input = at::zeros_like(input);
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[4] = {padding[0], padding[1], padding[2], padding[3]};
+  haganeOpsReplicationPadBackward(&gd, &gid, pad, 2);
+  return grad_input;
+}
+
+C10_EXPORT Tensor& replication_pad2d_backward_out_cuda(
+    const Tensor& grad_output, const Tensor& input, IntArrayRef padding, Tensor& grad_input) {
+  grad_input.resize_as_(input);
+  grad_input.zero_();
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[4] = {padding[0], padding[1], padding[2], padding[3]};
+  haganeOpsReplicationPadBackward(&gd, &gid, pad, 2);
+  return grad_input;
+}
+
+TORCH_IMPL_FUNC(replication_pad3d_out_cuda)
+(const Tensor& input, IntArrayRef padding, const Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  int64_t pad[6] = {padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]};
+  haganeOpsReplicationPad(&id, &od, pad, 3);
+}
+
+C10_EXPORT Tensor replication_pad3d_backward_cuda(
+    const Tensor& grad_output, const Tensor& input, IntArrayRef padding) {
+  auto grad_input = at::zeros_like(input);
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[6] = {padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]};
+  haganeOpsReplicationPadBackward(&gd, &gid, pad, 3);
+  return grad_input;
+}
+
+C10_EXPORT Tensor& replication_pad3d_backward_out_cuda(
+    const Tensor& grad_output, const Tensor& input, IntArrayRef padding, Tensor& grad_input) {
+  grad_input.resize_as_(input);
+  grad_input.zero_();
+  auto go = grad_output.contiguous();
+  auto gd = make_tensor_desc(go);
+  auto gid = make_tensor_desc(grad_input);
+  int64_t pad[6] = {padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]};
+  haganeOpsReplicationPadBackward(&gd, &gid, pad, 3);
+  return grad_input;
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Tril/Triu
+// ---------------------------------------------------------------------------
+
+TORCH_IMPL_FUNC(tril_cuda)(const Tensor& self, int64_t diagonal, const Tensor& output) {
+  auto self_c = self.contiguous();
+  auto id = make_tensor_desc(self_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsTril(&id, &od, diagonal);
+}
+
+TORCH_IMPL_FUNC(triu_cuda)(const Tensor& self, int64_t diagonal, const Tensor& output) {
+  auto self_c = self.contiguous();
+  auto id = make_tensor_desc(self_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsTriu(&id, &od, diagonal);
+}
+
+C10_EXPORT Tensor tril_indices_cuda(
+    int64_t row, int64_t col, int64_t offset,
+    std::optional<ScalarType> dtype_opt, std::optional<Layout> layout_opt,
+    std::optional<Device> device_opt, std::optional<bool> pin_memory_opt) {
+  // Generate on CPU, then move to device
+  auto result = at::tril_indices(row, col, offset, dtype_opt, layout_opt,
+                                 c10::Device(c10::kCPU), pin_memory_opt);
+  return result.to(device_opt.value_or(c10::Device(c10::kCUDA)));
+}
+
+C10_EXPORT Tensor triu_indices_cuda(
+    int64_t row, int64_t col, int64_t offset,
+    std::optional<ScalarType> dtype_opt, std::optional<Layout> layout_opt,
+    std::optional<Device> device_opt, std::optional<bool> pin_memory_opt) {
+  auto result = at::triu_indices(row, col, offset, dtype_opt, layout_opt,
+                                 c10::Device(c10::kCPU), pin_memory_opt);
+  return result.to(device_opt.value_or(c10::Device(c10::kCUDA)));
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Index add/reduce
+// ---------------------------------------------------------------------------
+
+TORCH_IMPL_FUNC(index_add_cuda_out)
+(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source,
+ const Scalar& alpha, const Tensor& result) {
+  if (!result.is_same(self)) result.copy_(self);
+  auto src_c = source.contiguous();
+  auto idx_c = index.contiguous();
+  auto sd = make_tensor_desc(src_c);
+  auto rd = make_tensor_desc(result);
+  // Use haganeOpsIndexAdd if available, otherwise UMA direct
+  float alpha_val = alpha.toFloat();
+  // UMA: direct memory scatter-add
+  int64_t n = idx_c.numel();
+  for (int64_t i = 0; i < n; i++) {
+    auto idx_val = idx_c[i].item<int64_t>();
+    auto slice = result.select(dim, idx_val);
+    slice.add_(source.select(dim, i), alpha_val);
+  }
+}
+
+TORCH_IMPL_FUNC(index_reduce_cuda_out)
+(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source,
+ const std::string_view reduce, bool include_self, const Tensor& result) {
+  if (!result.is_same(self)) result.copy_(self);
+  auto idx_c = index.contiguous();
+  int64_t n = idx_c.numel();
+  for (int64_t i = 0; i < n; i++) {
+    auto idx_val = idx_c[i].item<int64_t>();
+    auto result_slice = result.select(dim, idx_val);
+    auto source_slice = source.select(dim, i);
+    if (reduce == "prod") {
+      result_slice.mul_(source_slice);
+    } else if (reduce == "mean" || reduce == "amax") {
+      result_slice.add_(source_slice);
+    } else if (reduce == "amin") {
+      at::min_out(const_cast<Tensor&>(result_slice), result_slice, source_slice);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Im2col / Col2im
+// ---------------------------------------------------------------------------
+
+C10_EXPORT Tensor& im2col_out_cuda(const Tensor& input, IntArrayRef kernel_size,
+    IntArrayRef dilation, IntArrayRef padding, IntArrayRef stride, Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsIm2col(&id, &od, (int)kernel_size[0], (int)kernel_size[1],
+                  (int)stride[0], (int)stride[1], (int)padding[0], (int)padding[1],
+                  (int)dilation[0], (int)dilation[1]);
+  return output;
+}
+
+C10_EXPORT Tensor im2col_cuda(const Tensor& input, IntArrayRef kernel_size,
+    IntArrayRef dilation, IntArrayRef padding, IntArrayRef stride) {
+  int C = input.size(1), iH = input.size(2), iW = input.size(3);
+  int kH = kernel_size[0], kW = kernel_size[1];
+  int dH = stride[0], dW = stride[1];
+  int padH = padding[0], padW = padding[1];
+  int dilH = dilation[0], dilW = dilation[1];
+  int ekH = (kH-1)*dilH+1, ekW = (kW-1)*dilW+1;
+  int oH = (iH+2*padH-ekH)/dH+1, oW = (iW+2*padW-ekW)/dW+1;
+  auto output = at::empty({input.size(0), C*kH*kW, oH*oW}, input.options());
+  im2col_out_cuda(input, kernel_size, dilation, padding, stride, output);
+  return output;
+}
+
+C10_EXPORT Tensor& col2im_out_cuda(const Tensor& input, IntArrayRef output_size,
+    IntArrayRef kernel_size, IntArrayRef dilation, IntArrayRef padding,
+    IntArrayRef stride, Tensor& output) {
+  auto input_c = input.contiguous();
+  auto id = make_tensor_desc(input_c);
+  auto od = make_tensor_desc(output);
+  haganeOpsCol2im(&id, &od, (int)output_size[0], (int)output_size[1],
+                  (int)kernel_size[0], (int)kernel_size[1],
+                  (int)stride[0], (int)stride[1],
+                  (int)padding[0], (int)padding[1],
+                  (int)dilation[0], (int)dilation[1]);
+  return output;
+}
+
+C10_EXPORT Tensor col2im_cuda(const Tensor& input, IntArrayRef output_size,
+    IntArrayRef kernel_size, IntArrayRef dilation, IntArrayRef padding,
+    IntArrayRef stride) {
+  int N = input.size(0), C_kk = input.size(1);
+  int kH = kernel_size[0], kW = kernel_size[1];
+  int C = C_kk / (kH * kW);
+  auto output = at::zeros({N, C, output_size[0], output_size[1]}, input.options());
+  col2im_out_cuda(input, output_size, kernel_size, dilation, padding, stride, output);
+  return output;
+}
+
+// ---------------------------------------------------------------------------
+// Batch 6: Padding kernel launchers (for NestedTensor / BERT)
+// ---------------------------------------------------------------------------
+
+template <typename T>
+C10_EXPORT void add_padding_kernelLauncher(
+    T* output, T* input, T padding_value,
+    const int* offsets, const int* input_sizes, int input_dim,
+    const std::vector<int64_t>& output_sizes, int batch_size, int output_batch_size) {
+  // Nested tensor padding: copy input to padded output
+  // UMA direct memory access
+  int64_t output_stride = 1;
+  for (int i = 1; i < (int)output_sizes.size(); i++) output_stride *= output_sizes[i];
+
+  for (int b = 0; b < batch_size && b < output_batch_size; b++) {
+    int offset = offsets[b];
+    int64_t in_size = 1;
+    for (int d = 0; d < input_dim; d++) in_size *= input_sizes[b * input_dim + d];
+    // Copy input to padded output slot
+    std::memcpy(output + (int64_t)b * output_stride, input + offset, in_size * sizeof(T));
+    // Fill remaining with padding_value
+    for (int64_t i = in_size; i < output_stride; i++) {
+      output[(int64_t)b * output_stride + i] = padding_value;
+    }
+  }
+}
+
+template C10_EXPORT void add_padding_kernelLauncher<float>(float*, float*, float, const int*, const int*, int, const std::vector<int64_t>&, int, int);
+template C10_EXPORT void add_padding_kernelLauncher<double>(double*, double*, double, const int*, const int*, int, const std::vector<int64_t>&, int, int);
+template C10_EXPORT void add_padding_kernelLauncher<c10::Half>(c10::Half*, c10::Half*, c10::Half, const int*, const int*, int, const std::vector<int64_t>&, int, int);
+
+template <typename T>
+C10_EXPORT void remove_padding_kernelLauncher(
+    const T* input, T* output,
+    const int* offsets, const int* input_sizes, const int* output_sizes,
+    int64_t output_dim, int64_t batch_size) {
+  for (int64_t b = 0; b < batch_size; b++) {
+    int offset = offsets[b];
+    int64_t size = 1;
+    for (int d = 0; d < (int)output_dim; d++) size *= output_sizes[b * output_dim + d];
+    std::memcpy(output + offset, input + b * size, size * sizeof(T));
+  }
+}
+
+template C10_EXPORT void remove_padding_kernelLauncher<float>(const float*, float*, const int*, const int*, const int*, int64_t, int64_t);
+template C10_EXPORT void remove_padding_kernelLauncher<c10::Half>(const c10::Half*, c10::Half*, const int*, const int*, const int*, int64_t, int64_t);
+
+template <typename T>
+C10_EXPORT void remove_padding_transform0213_kernelLauncher(
+    const T* input, T* output,
+    const int* offsets, const int* input_sizes, const int* output_sizes,
+    int64_t output_dim, int64_t batch_size) {
+  remove_padding_kernelLauncher(input, output, offsets, input_sizes, output_sizes, output_dim, batch_size);
+}
+
+template C10_EXPORT void remove_padding_transform0213_kernelLauncher<float>(const float*, float*, const int*, const int*, const int*, int64_t, int64_t);
+template C10_EXPORT void remove_padding_transform0213_kernelLauncher<c10::Half>(const c10::Half*, c10::Half*, const int*, const int*, const int*, int64_t, int64_t);
+
+// ---------------------------------------------------------------------------
+// Batch 6: Sparse index conversions (structured)
+// ---------------------------------------------------------------------------
+
+TORCH_IMPL_FUNC(_convert_indices_from_coo_to_csr_structured_cuda)
+(const Tensor& input, int64_t size, bool out_int32, const Tensor& result) {
+  // Simple histogram-based conversion
+  result.zero_();
+  auto input_c = input.contiguous();
+  int64_t nnz = input_c.numel();
+  const int64_t* in_ptr = input_c.const_data_ptr<int64_t>();
+  if (out_int32) {
+    int32_t* out_ptr = result.mutable_data_ptr<int32_t>();
+    for (int64_t i = 0; i < nnz; i++) out_ptr[in_ptr[i] + 1]++;
+    for (int64_t i = 1; i <= size; i++) out_ptr[i] += out_ptr[i-1];
+  } else {
+    int64_t* out_ptr = result.mutable_data_ptr<int64_t>();
+    for (int64_t i = 0; i < nnz; i++) out_ptr[in_ptr[i] + 1]++;
+    for (int64_t i = 1; i <= size; i++) out_ptr[i] += out_ptr[i-1];
+  }
+}
+
+TORCH_IMPL_FUNC(_convert_indices_from_csr_to_coo_structured_cuda)
+(const Tensor& crow_indices, const Tensor& col_indices, bool is_csr, bool transpose, const Tensor& result) {
+  auto crow = crow_indices.contiguous();
+  int64_t nrows = crow.numel() - 1;
+  if (is_csr) {
+    const int64_t* crow_ptr = crow.const_data_ptr<int64_t>();
+    int64_t* result_ptr = result.mutable_data_ptr<int64_t>();
+    // row indices
+    for (int64_t i = 0; i < nrows; i++) {
+      for (int64_t j = crow_ptr[i]; j < crow_ptr[i+1]; j++) {
+        result_ptr[j] = i;
+      }
+    }
+  }
+}
 
 } // namespace at::native
 
