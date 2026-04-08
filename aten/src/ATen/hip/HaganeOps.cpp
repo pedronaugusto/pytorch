@@ -19,6 +19,7 @@
 #include <ATen/native/ReduceAllOps.h>
 #include <ATen/native/Pow.h>
 #include <ATen/native/TensorCompare.h>
+#include <ATen/native/PointwiseOps.h>
 #include <ATen/native/Sorting.h>
 #include <ATen/native/TensorAdvancedIndexing.h>
 #include <ATen/native/IndexKernel.h>
@@ -3033,6 +3034,453 @@ void hagane_signbit_kernel(TensorIteratorBase& iter) {
   iter.tensor(0).copy_(at::lt(in, 0.0));
 }
 
+// ---------------------------------------------------------------------------
+// Batch 11: Missing dispatch stubs — binary ops
+// ---------------------------------------------------------------------------
+
+void hagane_fmax_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  auto a_nan = at::isnan(a);
+  auto b_nan = at::isnan(b);
+  iter.tensor(0).copy_(at::where(a_nan, b, at::where(b_nan, a, at::maximum(a, b))));
+}
+
+void hagane_fmin_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  auto a_nan = at::isnan(a);
+  auto b_nan = at::isnan(b);
+  iter.tensor(0).copy_(at::where(a_nan, b, at::where(b_nan, a, at::minimum(a, b))));
+}
+
+void hagane_max_elementwise_kernel(TensorIterator& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  at::Tensor sa, sb;
+  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
+  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
+  if (haganeOpsMaximum(&a, &b, &out) != HAGANE_OPS_SUCCESS)
+    max_elementwise_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_min_elementwise_kernel(TensorIterator& iter) {
+  auto out = make_ops_tensor(iter, 0);
+  at::Tensor sa, sb;
+  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
+  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
+  if (haganeOpsMinimum(&a, &b, &out) != HAGANE_OPS_SUCCESS)
+    min_elementwise_stub(c10::DeviceType::CPU, iter);
+}
+
+void hagane_smooth_l1_kernel(TensorIteratorBase& iter, double beta) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  auto diff = at::abs(at::sub(a, b));
+  iter.tensor(0).copy_(at::where(at::lt(diff, beta),
+    at::div(at::mul(diff, diff), 2.0 * beta),
+    at::sub(diff, beta / 2.0)));
+}
+
+void hagane_huber_kernel(TensorIterator& iter, double delta) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  auto diff = at::abs(at::sub(a, b));
+  iter.tensor(0).copy_(at::where(at::le(diff, delta),
+    at::mul(at::mul(diff, diff), 0.5),
+    at::sub(at::mul(diff, delta), 0.5 * delta * delta)));
+}
+
+void hagane_mse_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  auto diff = at::sub(a, b);
+  iter.tensor(0).copy_(at::mul(diff, diff));
+}
+
+void hagane_logaddexp_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  auto m = at::maximum(a, b);
+  iter.tensor(0).copy_(at::add(m, at::log(at::add(at::exp(at::sub(a, m)), at::exp(at::sub(b, m))))));
+}
+
+void hagane_logaddexp2_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  auto m = at::maximum(a, b);
+  auto log2e = 1.0 / std::log(2.0);
+  iter.tensor(0).copy_(at::add(m, at::mul(at::log(at::add(at::exp2(at::sub(a, m)), at::exp2(at::sub(b, m)))), log2e)));
+}
+
+void hagane_hypot_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  iter.tensor(0).copy_(at::sqrt(at::add(at::mul(a, a), at::mul(b, b))));
+}
+
+void hagane_heaviside_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& values = iter.tensor(2);
+  iter.tensor(0).copy_(at::where(at::lt(a, 0), at::zeros_like(a), at::where(at::eq(a, 0), values, at::ones_like(a))));
+}
+
+void hagane_xlogy_kernel(TensorIteratorBase& iter) {
+  const Tensor& x = iter.tensor(1);
+  const Tensor& y = iter.tensor(2);
+  iter.tensor(0).copy_(at::where(at::eq(x, 0), at::zeros_like(x), at::mul(x, at::log(y))));
+}
+
+void hagane_xlog1py_kernel(TensorIteratorBase& iter) {
+  const Tensor& x = iter.tensor(1);
+  const Tensor& y = iter.tensor(2);
+  iter.tensor(0).copy_(at::where(at::eq(x, 0), at::zeros_like(x), at::mul(x, at::log1p(y))));
+}
+
+void hagane_lshift_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  iter.tensor(0).copy_(at::mul(a, at::pow(2, b)));
+}
+
+void hagane_rshift_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  iter.tensor(0).copy_(at::div(a, at::pow(2, b), "trunc"));
+}
+
+void hagane_ldexp_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  iter.tensor(0).copy_(at::mul(a, at::pow(2, b)));
+}
+
+void hagane_add_clamp_kernel(TensorIterator& iter, const Scalar& alpha, const Scalar& min_val, const Scalar& max_val) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  iter.tensor(0).copy_(at::clamp(at::add(a, b, alpha), min_val, max_val));
+}
+
+void hagane_gcd_kernel(TensorIteratorBase& iter) {
+  auto cpu_a = iter.tensor(1).to(at::kCPU);
+  auto cpu_b = iter.tensor(2).to(at::kCPU);
+  iter.tensor(0).copy_(at::gcd(cpu_a, cpu_b).to(iter.tensor(0).device()));
+}
+
+void hagane_lcm_kernel(TensorIteratorBase& iter) {
+  auto cpu_a = iter.tensor(1).to(at::kCPU);
+  auto cpu_b = iter.tensor(2).to(at::kCPU);
+  iter.tensor(0).copy_(at::lcm(cpu_a, cpu_b).to(iter.tensor(0).device()));
+}
+
+void hagane_nextafter_kernel(TensorIteratorBase& iter) {
+  auto cpu_a = iter.tensor(1).to(at::kCPU);
+  auto cpu_b = iter.tensor(2).to(at::kCPU);
+  iter.tensor(0).copy_(at::nextafter(cpu_a, cpu_b).to(iter.tensor(0).device()));
+}
+
+void hagane_igamma_kernel(TensorIteratorBase& iter) {
+  auto cpu_a = iter.tensor(1).to(at::kCPU);
+  auto cpu_b = iter.tensor(2).to(at::kCPU);
+  iter.tensor(0).copy_(at::igamma(cpu_a, cpu_b).to(iter.tensor(0).device()));
+}
+
+void hagane_igammac_kernel(TensorIteratorBase& iter) {
+  auto cpu_a = iter.tensor(1).to(at::kCPU);
+  auto cpu_b = iter.tensor(2).to(at::kCPU);
+  iter.tensor(0).copy_(at::igammac(cpu_a, cpu_b).to(iter.tensor(0).device()));
+}
+
+void hagane_zeta_kernel(TensorIteratorBase& iter) {
+  auto cpu_a = iter.tensor(1).to(at::kCPU);
+  auto cpu_b = iter.tensor(2).to(at::kCPU);
+  iter.tensor(0).copy_(at::special_zeta(cpu_a, cpu_b).to(iter.tensor(0).device()));
+}
+
+// Polynomial stubs — CPU fallback (rarely used in inference)
+#define HAGANE_BINARY_SPECIAL_CPU_FALLBACK(name, torch_fn) \
+void hagane_##name##_kernel(TensorIteratorBase& iter) { \
+  auto cpu_a = iter.tensor(1).to(at::kCPU); \
+  auto cpu_b = iter.tensor(2).to(at::kCPU); \
+  iter.tensor(0).copy_(torch_fn(cpu_a, cpu_b).to(iter.tensor(0).device())); \
+}
+
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(chebyshev_polynomial_t, at::special_chebyshev_polynomial_t)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(chebyshev_polynomial_u, at::special_chebyshev_polynomial_u)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(chebyshev_polynomial_v, at::special_chebyshev_polynomial_v)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(chebyshev_polynomial_w, at::special_chebyshev_polynomial_w)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(hermite_polynomial_h, at::special_hermite_polynomial_h)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(hermite_polynomial_he, at::special_hermite_polynomial_he)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(laguerre_polynomial_l, at::special_laguerre_polynomial_l)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(legendre_polynomial_p, at::special_legendre_polynomial_p)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(shifted_chebyshev_polynomial_t, at::special_shifted_chebyshev_polynomial_t)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(shifted_chebyshev_polynomial_u, at::special_shifted_chebyshev_polynomial_u)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(shifted_chebyshev_polynomial_v, at::special_shifted_chebyshev_polynomial_v)
+HAGANE_BINARY_SPECIAL_CPU_FALLBACK(shifted_chebyshev_polynomial_w, at::special_shifted_chebyshev_polynomial_w)
+
+#undef HAGANE_BINARY_SPECIAL_CPU_FALLBACK
+
+// ---------------------------------------------------------------------------
+// Batch 11: Missing dispatch stubs — ternary ops (PointwiseOps)
+// ---------------------------------------------------------------------------
+
+void hagane_addcmul_kernel(TensorIteratorBase& iter, const Scalar& value) {
+  const Tensor& self = iter.tensor(1);
+  const Tensor& t1 = iter.tensor(2);
+  const Tensor& t2 = iter.tensor(3);
+  iter.tensor(0).copy_(at::add(self, at::mul(at::mul(t1, t2), value)));
+}
+
+void hagane_addcdiv_kernel(TensorIteratorBase& iter, const Scalar& value) {
+  const Tensor& self = iter.tensor(1);
+  const Tensor& t1 = iter.tensor(2);
+  const Tensor& t2 = iter.tensor(3);
+  iter.tensor(0).copy_(at::add(self, at::mul(at::div(t1, t2), value)));
+}
+
+void hagane_smooth_l1_backward_kernel(TensorIterator& iter, const Scalar& norm, double beta) {
+  const Tensor& grad = iter.tensor(1);
+  const Tensor& a = iter.tensor(2);
+  const Tensor& b = iter.tensor(3);
+  auto diff = at::sub(a, b);
+  auto abs_diff = at::abs(diff);
+  auto result = at::where(at::lt(abs_diff, beta), at::div(diff, beta), at::sign(diff));
+  iter.tensor(0).copy_(at::mul(result, norm));
+}
+
+void hagane_huber_backward_kernel(TensorIterator& iter, const Scalar& norm, double delta) {
+  const Tensor& grad = iter.tensor(1);
+  const Tensor& a = iter.tensor(2);
+  const Tensor& b = iter.tensor(3);
+  auto diff = at::sub(a, b);
+  auto abs_diff = at::abs(diff);
+  auto result = at::where(at::le(abs_diff, delta), diff, at::mul(at::sign(diff), delta));
+  iter.tensor(0).copy_(at::mul(result, norm));
+}
+
+void hagane_mse_backward_kernel(TensorIterator& iter, const Scalar& norm) {
+  const Tensor& grad = iter.tensor(1);
+  const Tensor& a = iter.tensor(2);
+  const Tensor& b = iter.tensor(3);
+  iter.tensor(0).copy_(at::mul(at::mul(at::sub(a, b), 2.0), norm));
+}
+
+// ---------------------------------------------------------------------------
+// Batch 11: Missing dispatch stubs — activation ops
+// ---------------------------------------------------------------------------
+
+void hagane_hardtanh_backward_kernel(TensorIterator& iter, const Scalar& min_val, const Scalar& max_val) {
+  const Tensor& grad = iter.tensor(1);
+  const Tensor& self = iter.tensor(2);
+  auto mask = at::logical_and(at::ge(self, min_val), at::le(self, max_val));
+  iter.tensor(0).copy_(at::where(mask, grad, at::zeros_like(grad)));
+}
+
+void hagane_prelu_kernel(TensorIterator& iter) {
+  const Tensor& input = iter.tensor(1);
+  const Tensor& weight = iter.tensor(2);
+  iter.tensor(0).copy_(at::where(at::gt(input, 0), input, at::mul(input, weight)));
+}
+
+void hagane_prelu_backward_kernel(TensorIterator& iter) {
+  const Tensor& grad = iter.tensor(1);
+  const Tensor& input = iter.tensor(2);
+  const Tensor& weight = iter.tensor(3);
+  iter.tensor(0).copy_(at::where(at::gt(input, 0), grad, at::mul(weight, grad)));
+}
+
+void hagane_glu_kernel(TensorIteratorBase& iter) {
+  const Tensor& a = iter.tensor(1);
+  const Tensor& b = iter.tensor(2);
+  iter.tensor(0).copy_(at::mul(a, at::sigmoid(b)));
+}
+
+void hagane_glu_backward_kernel(TensorIterator& iter) {
+  // iter: output, sigmoid(secondHalf), firstHalf, grad_output
+  // CPU kernel computes: (1 - a) * a * b * c
+  const Tensor& sig = iter.tensor(1);
+  const Tensor& first = iter.tensor(2);
+  const Tensor& grad = iter.tensor(3);
+  iter.tensor(0).copy_(at::mul(at::mul(at::mul(at::rsub(sig, 1.0), sig), first), grad));
+}
+
+void hagane_shrink_backward_kernel(TensorIteratorBase& iter, const Scalar& lambd) {
+  const Tensor& grad = iter.tensor(1);
+  const Tensor& self = iter.tensor(2);
+  iter.tensor(0).copy_(at::where(at::ne(self, 0.0), grad, at::zeros_like(grad)));
+}
+
+void hagane_log_sigmoid_backward_kernel(TensorIterator& iter) {
+  // CUDA path: iter has (output, input, grad_output)
+  const Tensor& input = iter.tensor(1);
+  const Tensor& grad = iter.tensor(2);
+  iter.tensor(0).copy_(at::mul(grad, at::sigmoid(at::neg(input))));
+}
+
+// ---------------------------------------------------------------------------
+// Batch 11: Missing dispatch stubs — unary ops
+// ---------------------------------------------------------------------------
+
+void hagane_acosh_kernel(TensorIteratorBase& iter) {
+  const Tensor& in = iter.tensor(1);
+  iter.tensor(0).copy_(at::log(at::add(in, at::sqrt(at::sub(at::mul(in, in), 1.0)))));
+}
+
+void hagane_asinh_kernel(TensorIteratorBase& iter) {
+  const Tensor& in = iter.tensor(1);
+  iter.tensor(0).copy_(at::log(at::add(in, at::sqrt(at::add(at::mul(in, in), 1.0)))));
+}
+
+void hagane_atanh_kernel(TensorIteratorBase& iter) {
+  const Tensor& in = iter.tensor(1);
+  iter.tensor(0).copy_(at::mul(at::log(at::div(at::add(in, 1.0), at::rsub(in, 1.0))), 0.5));
+}
+
+void hagane_digamma_kernel(TensorIteratorBase& iter) {
+  auto cpu_in = iter.tensor(1).to(at::kCPU);
+  iter.tensor(0).copy_(at::digamma(cpu_in).to(iter.tensor(0).device()));
+}
+
+void hagane_trigamma_kernel(TensorIteratorBase& iter) {
+  auto cpu_in = iter.tensor(1).to(at::kCPU);
+  iter.tensor(0).copy_(at::polygamma(1, cpu_in).to(iter.tensor(0).device()));
+}
+
+void hagane_erfinv_kernel(TensorIteratorBase& iter) {
+  auto cpu_in = iter.tensor(1).to(at::kCPU);
+  iter.tensor(0).copy_(at::erfinv(cpu_in).to(iter.tensor(0).device()));
+}
+
+void hagane_i0_kernel(TensorIteratorBase& iter) {
+  auto cpu_in = iter.tensor(1).to(at::kCPU);
+  iter.tensor(0).copy_(at::i0(cpu_in).to(iter.tensor(0).device()));
+}
+
+void hagane_frexp_kernel(TensorIteratorBase& iter) {
+  auto cpu_in = iter.tensor(2).to(at::kCPU);
+  auto [mantissa, exponent] = at::frexp(cpu_in);
+  auto dev = iter.tensor(0).device();
+  iter.tensor(0).copy_(mantissa.to(dev));
+  iter.tensor(1).copy_(exponent.to(dev));
+}
+
+void hagane_angle_kernel(TensorIteratorBase& iter) {
+  const Tensor& in = iter.tensor(1);
+  iter.tensor(0).copy_(at::where(at::lt(in, 0), at::full_like(in, M_PI), at::zeros_like(in)));
+}
+
+void hagane_conj_physical_kernel(TensorIteratorBase& iter) {
+  iter.tensor(0).copy_(iter.tensor(1));
+}
+
+void hagane_sgn_kernel(TensorIteratorBase& iter) {
+  iter.tensor(0).copy_(at::sign(iter.tensor(1)));
+}
+
+void hagane_round_decimals_kernel(TensorIteratorBase& iter, int64_t decimals) {
+  const Tensor& in = iter.tensor(1);
+  if (decimals == 0) {
+    iter.tensor(0).copy_(at::round(in));
+  } else {
+    double scale = std::pow(10.0, decimals);
+    iter.tensor(0).copy_(at::div(at::round(at::mul(in, scale)), scale));
+  }
+}
+
+void hagane_isposinf_kernel(TensorIteratorBase& iter) {
+  const Tensor& in = iter.tensor(1);
+  iter.tensor(0).copy_(at::logical_and(at::isinf(in), at::gt(in, 0)));
+}
+
+void hagane_isneginf_kernel(TensorIteratorBase& iter) {
+  const Tensor& in = iter.tensor(1);
+  iter.tensor(0).copy_(at::logical_and(at::isinf(in), at::lt(in, 0)));
+}
+
+void hagane_polygamma_kernel(TensorIteratorBase& iter, const int64_t n) {
+  auto cpu_in = iter.tensor(1).to(at::kCPU);
+  iter.tensor(0).copy_(at::polygamma(n, cpu_in).to(iter.tensor(0).device()));
+}
+
+// Unary special math — CPU fallback (rarely used in inference)
+#define HAGANE_UNARY_CPU_FALLBACK(name, torch_fn) \
+void hagane_##name##_kernel(TensorIteratorBase& iter) { \
+  auto cpu_in = iter.tensor(1).to(at::kCPU); \
+  iter.tensor(0).copy_(torch_fn(cpu_in).to(iter.tensor(0).device())); \
+}
+
+HAGANE_UNARY_CPU_FALLBACK(special_entr, at::special_entr)
+HAGANE_UNARY_CPU_FALLBACK(special_erfcx, at::special_erfcx)
+HAGANE_UNARY_CPU_FALLBACK(special_i0e, at::special_i0e)
+HAGANE_UNARY_CPU_FALLBACK(special_i1, at::special_i1)
+HAGANE_UNARY_CPU_FALLBACK(special_i1e, at::special_i1e)
+HAGANE_UNARY_CPU_FALLBACK(special_ndtri, at::special_ndtri)
+HAGANE_UNARY_CPU_FALLBACK(special_log_ndtr, at::special_log_ndtr)
+HAGANE_UNARY_CPU_FALLBACK(special_airy_ai, at::special_airy_ai)
+HAGANE_UNARY_CPU_FALLBACK(special_bessel_j0, at::special_bessel_j0)
+HAGANE_UNARY_CPU_FALLBACK(special_bessel_j1, at::special_bessel_j1)
+HAGANE_UNARY_CPU_FALLBACK(special_bessel_y0, at::special_bessel_y0)
+HAGANE_UNARY_CPU_FALLBACK(special_bessel_y1, at::special_bessel_y1)
+HAGANE_UNARY_CPU_FALLBACK(special_modified_bessel_i0, at::special_modified_bessel_i0)
+HAGANE_UNARY_CPU_FALLBACK(special_modified_bessel_i1, at::special_modified_bessel_i1)
+HAGANE_UNARY_CPU_FALLBACK(special_modified_bessel_k0, at::special_modified_bessel_k0)
+HAGANE_UNARY_CPU_FALLBACK(special_modified_bessel_k1, at::special_modified_bessel_k1)
+HAGANE_UNARY_CPU_FALLBACK(special_scaled_modified_bessel_k0, at::special_scaled_modified_bessel_k0)
+HAGANE_UNARY_CPU_FALLBACK(special_scaled_modified_bessel_k1, at::special_scaled_modified_bessel_k1)
+HAGANE_UNARY_CPU_FALLBACK(special_spherical_bessel_j0, at::special_spherical_bessel_j0)
+
+#undef HAGANE_UNARY_CPU_FALLBACK
+
+// ---------------------------------------------------------------------------
+// Batch 11: Missing dispatch stubs — reduce ops
+// ---------------------------------------------------------------------------
+
+void hagane_nansum_kernel(TensorIterator& iter) {
+  // Replace NaN with 0 and delegate to sum
+  const Tensor& in = iter.tensor(1);
+  auto cleaned = at::nan_to_num(in, 0.0);
+  auto out = make_ops_tensor(iter, 0);
+  auto in_desc = make_tensor_desc(cleaned);
+  if (haganeOpsSum(&in_desc, &out) != HAGANE_OPS_SUCCESS) {
+    // CPU fallback: copy cleaned data back and use sum
+    iter.tensor(0).copy_(cleaned.sum());
+  }
+}
+
+void hagane_xor_sum_kernel(TensorIterator& iter) {
+  // XOR reduction — reduce via repeated halving with bitwise_xor
+  auto in = iter.tensor(1);
+  auto flat = in.flatten();
+  while (flat.numel() > 1) {
+    int64_t n = flat.numel();
+    int64_t half = n / 2;
+    auto a = flat.narrow(0, 0, half);
+    auto b = flat.narrow(0, half, half);
+    flat = at::bitwise_xor(a, b);
+    if (n % 2 != 0) {
+      flat = at::bitwise_xor(flat, in.flatten().narrow(0, n - 1, 1));
+    }
+  }
+  iter.tensor(0).copy_(flat.squeeze());
+}
+
+// hagane_norm_kernel already defined above (line ~2381)
+
+void hagane_powsum_kernel(TensorIterator& iter, const Scalar& p) {
+  const Tensor& in = iter.tensor(1);
+  double pval = p.toDouble();
+  iter.tensor(0).copy_(at::sum(at::pow(at::abs(in), pval)));
+}
+
+// ---------------------------------------------------------------------------
+// Batch 11: Missing dispatch stubs — isin
+// ---------------------------------------------------------------------------
+
+void hagane_isin_default_kernel(const Tensor& elements, const Tensor& test_elements, bool invert, const Tensor& out) {
+  auto cpu_e = elements.to(at::kCPU);
+  auto cpu_t = test_elements.to(at::kCPU);
+  out.copy_(at::isin(cpu_e, cpu_t, invert).to(out.device()));
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -3213,6 +3661,104 @@ REGISTER_DISPATCH(frac_stub, &hagane_frac_kernel)
 REGISTER_DISPATCH(sinc_stub, &hagane_sinc_kernel)
 REGISTER_DISPATCH(nan_to_num_stub, &hagane_nan_to_num_kernel)
 REGISTER_DISPATCH(signbit_stub, &hagane_signbit_kernel)
+
+// Batch 11: Binary ops
+REGISTER_DISPATCH(fmax_stub, &hagane_fmax_kernel)
+REGISTER_DISPATCH(fmin_stub, &hagane_fmin_kernel)
+REGISTER_DISPATCH(max_elementwise_stub, &hagane_max_elementwise_kernel)
+REGISTER_DISPATCH(min_elementwise_stub, &hagane_min_elementwise_kernel)
+REGISTER_DISPATCH(smooth_l1_stub, &hagane_smooth_l1_kernel)
+REGISTER_DISPATCH(huber_stub, &hagane_huber_kernel)
+REGISTER_DISPATCH(mse_stub, &hagane_mse_kernel)
+REGISTER_DISPATCH(logaddexp_stub, &hagane_logaddexp_kernel)
+REGISTER_DISPATCH(logaddexp2_stub, &hagane_logaddexp2_kernel)
+REGISTER_DISPATCH(hypot_stub, &hagane_hypot_kernel)
+REGISTER_DISPATCH(heaviside_stub, &hagane_heaviside_kernel)
+REGISTER_DISPATCH(xlogy_stub, &hagane_xlogy_kernel)
+REGISTER_DISPATCH(xlog1py_stub, &hagane_xlog1py_kernel)
+REGISTER_DISPATCH(lshift_stub, &hagane_lshift_kernel)
+REGISTER_DISPATCH(rshift_stub, &hagane_rshift_kernel)
+REGISTER_DISPATCH(ldexp_stub, &hagane_ldexp_kernel)
+REGISTER_DISPATCH(add_clamp_stub, &hagane_add_clamp_kernel)
+REGISTER_DISPATCH(gcd_stub, &hagane_gcd_kernel)
+REGISTER_DISPATCH(lcm_stub, &hagane_lcm_kernel)
+REGISTER_DISPATCH(nextafter_stub, &hagane_nextafter_kernel)
+REGISTER_DISPATCH(igamma_stub, &hagane_igamma_kernel)
+REGISTER_DISPATCH(igammac_stub, &hagane_igammac_kernel)
+REGISTER_DISPATCH(zeta_stub, &hagane_zeta_kernel)
+REGISTER_DISPATCH(chebyshev_polynomial_t_stub, &hagane_chebyshev_polynomial_t_kernel)
+REGISTER_DISPATCH(chebyshev_polynomial_u_stub, &hagane_chebyshev_polynomial_u_kernel)
+REGISTER_DISPATCH(chebyshev_polynomial_v_stub, &hagane_chebyshev_polynomial_v_kernel)
+REGISTER_DISPATCH(chebyshev_polynomial_w_stub, &hagane_chebyshev_polynomial_w_kernel)
+REGISTER_DISPATCH(hermite_polynomial_h_stub, &hagane_hermite_polynomial_h_kernel)
+REGISTER_DISPATCH(hermite_polynomial_he_stub, &hagane_hermite_polynomial_he_kernel)
+REGISTER_DISPATCH(laguerre_polynomial_l_stub, &hagane_laguerre_polynomial_l_kernel)
+REGISTER_DISPATCH(legendre_polynomial_p_stub, &hagane_legendre_polynomial_p_kernel)
+REGISTER_DISPATCH(shifted_chebyshev_polynomial_t_stub, &hagane_shifted_chebyshev_polynomial_t_kernel)
+REGISTER_DISPATCH(shifted_chebyshev_polynomial_u_stub, &hagane_shifted_chebyshev_polynomial_u_kernel)
+REGISTER_DISPATCH(shifted_chebyshev_polynomial_v_stub, &hagane_shifted_chebyshev_polynomial_v_kernel)
+REGISTER_DISPATCH(shifted_chebyshev_polynomial_w_stub, &hagane_shifted_chebyshev_polynomial_w_kernel)
+
+// Batch 11: Ternary / pointwise ops
+REGISTER_DISPATCH(addcmul_stub, &hagane_addcmul_kernel)
+REGISTER_DISPATCH(addcdiv_stub, &hagane_addcdiv_kernel)
+REGISTER_DISPATCH(smooth_l1_backward_stub, &hagane_smooth_l1_backward_kernel)
+REGISTER_DISPATCH(huber_backward_stub, &hagane_huber_backward_kernel)
+REGISTER_DISPATCH(mse_backward_stub, &hagane_mse_backward_kernel)
+
+// Batch 11: Activation ops
+REGISTER_DISPATCH(hardtanh_backward_stub, &hagane_hardtanh_backward_kernel)
+REGISTER_DISPATCH(prelu_stub, &hagane_prelu_kernel)
+REGISTER_DISPATCH(prelu_backward_stub, &hagane_prelu_backward_kernel)
+REGISTER_DISPATCH(glu_stub, &hagane_glu_kernel)
+REGISTER_DISPATCH(glu_backward_stub, &hagane_glu_backward_kernel)
+REGISTER_DISPATCH(shrink_backward_stub, &hagane_shrink_backward_kernel)
+REGISTER_DISPATCH(log_sigmoid_backward_stub, &hagane_log_sigmoid_backward_kernel)
+
+// Batch 11: Unary ops
+REGISTER_DISPATCH(acosh_stub, &hagane_acosh_kernel)
+REGISTER_DISPATCH(asinh_stub, &hagane_asinh_kernel)
+REGISTER_DISPATCH(atanh_stub, &hagane_atanh_kernel)
+REGISTER_DISPATCH(digamma_stub, &hagane_digamma_kernel)
+REGISTER_DISPATCH(trigamma_stub, &hagane_trigamma_kernel)
+REGISTER_DISPATCH(erfinv_stub, &hagane_erfinv_kernel)
+REGISTER_DISPATCH(i0_stub, &hagane_i0_kernel)
+REGISTER_DISPATCH(frexp_stub, &hagane_frexp_kernel)
+REGISTER_DISPATCH(angle_stub, &hagane_angle_kernel)
+REGISTER_DISPATCH(conj_physical_stub, &hagane_conj_physical_kernel)
+REGISTER_DISPATCH(sgn_stub, &hagane_sgn_kernel)
+REGISTER_DISPATCH(round_decimals_stub, &hagane_round_decimals_kernel)
+REGISTER_DISPATCH(isposinf_stub, &hagane_isposinf_kernel)
+REGISTER_DISPATCH(isneginf_stub, &hagane_isneginf_kernel)
+REGISTER_DISPATCH(polygamma_stub, &hagane_polygamma_kernel)
+REGISTER_DISPATCH(special_entr_stub, &hagane_special_entr_kernel)
+REGISTER_DISPATCH(special_erfcx_stub, &hagane_special_erfcx_kernel)
+REGISTER_DISPATCH(special_i0e_stub, &hagane_special_i0e_kernel)
+REGISTER_DISPATCH(special_i1_stub, &hagane_special_i1_kernel)
+REGISTER_DISPATCH(special_i1e_stub, &hagane_special_i1e_kernel)
+REGISTER_DISPATCH(special_ndtri_stub, &hagane_special_ndtri_kernel)
+REGISTER_DISPATCH(special_log_ndtr_stub, &hagane_special_log_ndtr_kernel)
+REGISTER_DISPATCH(special_airy_ai_stub, &hagane_special_airy_ai_kernel)
+REGISTER_DISPATCH(special_bessel_j0_stub, &hagane_special_bessel_j0_kernel)
+REGISTER_DISPATCH(special_bessel_j1_stub, &hagane_special_bessel_j1_kernel)
+REGISTER_DISPATCH(special_bessel_y0_stub, &hagane_special_bessel_y0_kernel)
+REGISTER_DISPATCH(special_bessel_y1_stub, &hagane_special_bessel_y1_kernel)
+REGISTER_DISPATCH(special_modified_bessel_i0_stub, &hagane_special_modified_bessel_i0_kernel)
+REGISTER_DISPATCH(special_modified_bessel_i1_stub, &hagane_special_modified_bessel_i1_kernel)
+REGISTER_DISPATCH(special_modified_bessel_k0_stub, &hagane_special_modified_bessel_k0_kernel)
+REGISTER_DISPATCH(special_modified_bessel_k1_stub, &hagane_special_modified_bessel_k1_kernel)
+REGISTER_DISPATCH(special_scaled_modified_bessel_k0_stub, &hagane_special_scaled_modified_bessel_k0_kernel)
+REGISTER_DISPATCH(special_scaled_modified_bessel_k1_stub, &hagane_special_scaled_modified_bessel_k1_kernel)
+REGISTER_DISPATCH(special_spherical_bessel_j0_stub, &hagane_special_spherical_bessel_j0_kernel)
+
+// Batch 11: Reduce ops
+REGISTER_DISPATCH(nansum_stub, &hagane_nansum_kernel)
+REGISTER_DISPATCH(xor_sum_stub, &hagane_xor_sum_kernel)
+REGISTER_DISPATCH(norm_stub, &hagane_norm_kernel)
+REGISTER_DISPATCH(powsum_stub, &hagane_powsum_kernel)
+
+// Batch 11: Compare ops
+REGISTER_DISPATCH(isin_default_stub, &hagane_isin_default_kernel)
 
 // =========================================================================
 // Batch 6: Structured Kernels — Softmax, Pooling, Upsample, Conv, Padding
@@ -6364,15 +6910,40 @@ C10_EXPORT Tensor _sparse_semi_structured_apply_dense(const Tensor& input, const
 // ---------------------------------------------------------------------------
 
 C10_EXPORT Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2, int64_t qGroupSize, const Tensor& qScaleAndZeros) {
-  TORCH_CHECK(false, "INT4 quantization not yet supported on Hagane/Metal");
+  // Dequantize INT4 weights then matmul
+  // mat2: packed INT4 [N, K/2], qScaleAndZeros: [N, K/qGroupSize, 2]
+  auto N = mat2.size(0);
+  auto K_packed = mat2.size(1);
+  auto K = K_packed * 2;
+
+  auto mat2_byte = mat2.to(at::kByte);
+  auto low = at::bitwise_and(mat2_byte, 0x0F).to(at::kFloat);
+  auto high = at::bitwise_right_shift(mat2_byte.to(at::kInt), 4).to(at::kFloat);
+  auto unpacked = at::stack({low, high}, -1).reshape({N, K});
+
+  auto s = qScaleAndZeros.select(-1, 0);
+  auto z = qScaleAndZeros.select(-1, 1);
+  auto s_exp = s.unsqueeze(-1).expand({N, -1, qGroupSize}).reshape({N, K});
+  auto z_exp = z.unsqueeze(-1).expand({N, -1, qGroupSize}).reshape({N, K});
+
+  auto dequant = at::mul(at::sub(unpacked, z_exp), s_exp);
+  return at::mm(self, dequant.t());
 }
 
 C10_EXPORT Tensor _weight_int8pack_mm_cuda(const Tensor& self, const Tensor& mat2, const Tensor& scales) {
-  TORCH_CHECK(false, "INT8 quantization not yet supported on Hagane/Metal");
+  // Dequantize INT8 weights then matmul
+  auto dequant = at::mul(mat2.to(self.dtype()), scales.unsqueeze(1));
+  return at::mm(self, dequant.t());
 }
 
 C10_EXPORT Tensor _convert_weight_to_int4pack_cuda(const Tensor& self, int64_t innerKTiles) {
-  TORCH_CHECK(false, "INT4 quantization not yet supported on Hagane/Metal");
+  // Pack pairs of INT8 values into INT4 bytes
+  auto K = self.size(1);
+  TORCH_CHECK(K % 2 == 0, "K must be even for INT4 packing");
+  auto self_byte = self.to(at::kByte);
+  auto low = self_byte.slice(1, 0, K, 2);
+  auto high = self_byte.slice(1, 1, K, 2);
+  return at::bitwise_or(low, at::bitwise_left_shift(high.to(at::kInt), 4));
 }
 
 C10_EXPORT Tensor make_per_tensor_quantized_tensor_cuda(const Tensor& self, double scale, int64_t zero_point) {
