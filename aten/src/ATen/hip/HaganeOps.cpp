@@ -40,6 +40,7 @@
 #include <ATen/native/UnaryOps.h>
 #include <c10/core/Scalar.h>
 #include <c10/macros/Export.h>
+#include <ATen/native/transformers/attention.h>
 
 // Batch 6: structured kernel class declarations
 #include <ATen/ops/_softmax_native.h>
@@ -336,18 +337,23 @@ C10_EXPORT void sortKeyValueInplace(
 C10_EXPORT void launch_stable_sort_kernel(
     const TensorBase& self, int64_t dim, bool descending,
     const TensorBase& values, const TensorBase& indices) {
-  auto val_d = make_tensor_desc(values);
-  auto idx_d = make_tensor_desc(indices);
+  // Copy input to values
   std::memcpy(const_cast<void*>(values.const_data_ptr()),
               self.const_data_ptr(), self.numel() * self.itemsize());
+  // Initialize indices to iota [0,1,2,...] — haganeOpsSort permutes in-place
+  {
+    int64_t n = indices.numel();
+    int64_t* idx_ptr = static_cast<int64_t*>(const_cast<void*>(indices.const_data_ptr()));
+    for (int64_t i = 0; i < n; i++) idx_ptr[i] = i;
+  }
+  auto val_d = make_tensor_desc(values);
+  auto idx_d = make_tensor_desc(indices);
   if (haganeOpsSort(&val_d, &idx_d, static_cast<int32_t>(dim), descending ? 1 : 0) != HAGANE_OPS_SUCCESS) {
     Tensor self_t(self);
     auto self_cpu = self_t.cpu();
     auto [sorted, sorted_idx] = self_cpu.sort(dim, descending, /*stable=*/true);
-    std::memcpy(const_cast<void*>(values.const_data_ptr()), sorted.const_data_ptr(),
-                values.numel() * values.itemsize());
-    std::memcpy(const_cast<void*>(indices.const_data_ptr()), sorted_idx.const_data_ptr(),
-                indices.numel() * indices.itemsize());
+    Tensor(values).copy_(sorted);
+    Tensor(indices).copy_(sorted_idx);
   }
 }
 
@@ -360,10 +366,8 @@ C10_EXPORT void launch_gather_topk_kernel(
   if (haganeOpsTopk(&in_d, &val_d, &idx_d, k, static_cast<int32_t>(dim), largest ? 1 : 0) != HAGANE_OPS_SUCCESS) {
     Tensor self_t(self);
     auto [topk_vals, topk_idx] = self_t.cpu().topk(k, dim, largest, /*sorted=*/true);
-    std::memcpy(const_cast<void*>(values.const_data_ptr()), topk_vals.const_data_ptr(),
-                values.numel() * values.itemsize());
-    std::memcpy(const_cast<void*>(indices.const_data_ptr()), topk_idx.const_data_ptr(),
-                indices.numel() * indices.itemsize());
+    Tensor(values).copy_(topk_vals);
+    Tensor(indices).copy_(topk_idx);
   }
 }
 
@@ -2301,24 +2305,10 @@ void hagane_sum_kernel(TensorIterator& iter) {
 }
 
 void hagane_mean_kernel(TensorIterator& iter) {
-  // Compute sum via the working sum dispatch, then divide by reduction count
-  sum_stub(c10::DeviceType::CUDA, iter);
-  // Divide output by N = in_numel / out_numel
-  const at::Tensor& in_t = iter.tensor(1);
-  const at::Tensor& out_t = iter.tensor(0);
-  int64_t out_numel = out_t.numel();
-  float N = (out_numel > 0) ? static_cast<float>(in_t.numel()) / static_cast<float>(out_numel) : 1.0f;
-  if (N <= 1.0f) return;
-  // Use out_t.data_ptr() — the actual tensor memory
-  if (out_t.scalar_type() == c10::ScalarType::Float) {
-    float* ptr = static_cast<float*>(out_t.data_ptr());
-    for (int64_t i = 0; i < out_numel; i++) ptr[i] /= N;
-  } else if (out_t.scalar_type() == c10::ScalarType::Half) {
-    auto* ptr = static_cast<c10::Half*>(out_t.data_ptr());
-    for (int64_t i = 0; i < out_numel; i++) ptr[i] = static_cast<c10::Half>(static_cast<float>(ptr[i]) / N);
-  } else if (out_t.scalar_type() == c10::ScalarType::BFloat16) {
-    auto* ptr = static_cast<c10::BFloat16*>(out_t.data_ptr());
-    for (int64_t i = 0; i < out_numel; i++) ptr[i] = static_cast<c10::BFloat16>(static_cast<float>(ptr[i]) / N);
+  auto out = make_ops_tensor(iter, 0);
+  auto in = make_ops_tensor(iter, 1);
+  if (haganeOpsMean(&in, &out) != HAGANE_OPS_SUCCESS) {
+    mean_stub(c10::DeviceType::CPU, iter);
   }
 }
 
@@ -6065,23 +6055,31 @@ C10_EXPORT int64_t _fused_sdp_choice_cuda(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
     std::optional<double> scale, bool enable_gqa) {
-  return 0; // 0 = math backend (our softmax+matmul path)
+  return 1; // 1 = flash backend → routes to _hagane_sdpa_forward
 }
+REGISTER_CUDA_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cuda)
 
 static std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t, int64_t, Tensor, Tensor, Tensor>
 _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
     std::optional<double> scale) {
+  // Handle GQA: expand K/V heads to match Q heads
+  auto k = key, v = value;
+  if (query.size(-3) != key.size(-3)) {
+    int64_t num_groups = query.size(-3) / key.size(-3);
+    k = key.repeat_interleave(num_groups, -3);
+    v = value.repeat_interleave(num_groups, -3);
+  }
   double s = scale.value_or(1.0 / std::sqrt((double)query.size(-1)));
-  auto attn_weight = at::mul(at::bmm(query, key.transpose(-2, -1)), s);
+  auto attn_weight = at::mul(at::matmul(query, k.transpose(-2, -1)), s);
   if (is_causal) {
-    int64_t L = query.size(-2), S = key.size(-2);
-    auto mask = at::ones({L, S}, query.options().dtype(kBool)).tril();
+    int64_t L = query.size(-2), S = k.size(-2);
+    auto mask = at::ones({L, S}, query.options().dtype(kBool)).tril(S - L);
     attn_weight = attn_weight.masked_fill(~mask, -std::numeric_limits<float>::infinity());
   }
   if (attn_mask.has_value()) attn_weight = at::add(attn_weight, *attn_mask);
   auto attn_probs = at::softmax(attn_weight, -1);
-  auto output = at::bmm(attn_probs, value);
+  auto output = at::matmul(attn_probs, v);
   auto logsumexp = attn_weight.logsumexp(-1);
   return std::make_tuple(output, logsumexp, Tensor(), Tensor(),
       (int64_t)0, (int64_t)0, Tensor(), Tensor(), Tensor());
@@ -6222,12 +6220,13 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _scaled_dot_product_cudnn_attentio
       Tensor(), Tensor(), max_q, max_k, dropout_p, false, Tensor(), Tensor(), scale, std::nullopt, std::nullopt);
 }
 
-C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor> _scaled_dot_product_flash_attention_cuda(
+C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t, int64_t, Tensor, Tensor, Tensor>
+_scaled_dot_product_flash_attention_cuda(
     const Tensor& query, const Tensor& key, const Tensor& value,
     double dropout_p, bool is_causal, bool /*return_debug_mask*/,
     std::optional<double> scale) {
   auto [o, lse, _1, _2, _3, _4, _5, _6, _7] = _hagane_sdpa_forward(query, key, value, std::nullopt, dropout_p, is_causal, scale);
-  return std::make_tuple(o, lse, Tensor(), Tensor());
+  return std::make_tuple(o, lse, Tensor(), Tensor(), query.size(-2), key.size(-2), Tensor(), Tensor(), Tensor());
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _scaled_dot_product_flash_attention_backward_cuda(
@@ -6241,7 +6240,8 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _scaled_dot_product_flash_attentio
       Tensor(), Tensor(), max_q, max_k, dropout_p, false, Tensor(), Tensor(), scale, std::nullopt, std::nullopt);
 }
 
-C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor> _scaled_dot_product_flash_attention_cuda_quantized(
+C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t, int64_t, Tensor, Tensor, Tensor>
+_scaled_dot_product_flash_attention_cuda_quantized(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& /*descale_q*/, const std::optional<Tensor>& /*descale_k*/,
     const std::optional<Tensor>& /*descale_v*/,
