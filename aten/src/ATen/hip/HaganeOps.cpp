@@ -127,11 +127,57 @@
 
 #include <cstring>
 
+#include <c10/hip/HIPCachingAllocator.h>
+
 // Phase 12a: every raw-byte read/write of a device pointer must flush the
 // lazy MLX pending graph first. Otherwise a stashed mx::array could later
 // memcpy stale bytes over freshly-written data (or the reader picks up
 // pre-eval zeroes). haganeOpsFlush() is cheap and idempotent on empty map.
 #define HAGANE_BEFORE_RAW_READ() ::haganeOpsFlush()
+
+// Erase stale pending entries when PyTorch's caching allocator frees a block.
+// Without this, address reuse causes lazy results to be read as wrong-dtype data.
+static std::atomic<int> g_erase_count{0};
+static std::atomic<int> g_copy_lazy_count{0};
+static std::atomic<int> g_copy_fallback_count{0};
+
+static void hagane_register_allocator_hook() {
+  static bool registered = false;
+  if (registered) return;
+  registered = true;
+  if (getenv("HAGANE_NO_ALLOC_HOOK")) {
+    fprintf(stderr, "[hagane] allocator trace hook DISABLED via env\n");
+    return;
+  }
+  c10::cuda::CUDACachingAllocator::attachAllocatorTraceTracker(
+    [](const c10::CachingDeviceAllocator::TraceEntry& e) {
+      if (e.action_ == c10::CachingDeviceAllocator::TraceEntry::FREE_REQUESTED) {
+        haganeOpsPendingErase(reinterpret_cast<void*>(e.addr_));
+        g_erase_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  fprintf(stderr, "[hagane] allocator trace hook registered\n");
+}
+
+void haganeOpsCopyStats(int* lazy, int* fallback, int* erased) {
+  if (lazy) *lazy = g_copy_lazy_count.load();
+  if (fallback) *fallback = g_copy_fallback_count.load();
+  if (erased) *erased = g_erase_count.load();
+}
+void haganeOpsCopyStatsReset() {
+  g_copy_lazy_count.store(0);
+  g_copy_fallback_count.store(0);
+  g_erase_count.store(0);
+}
+// Dump counters to stderr and reset. Called from Python bench via ctypes.
+extern "C" void hagane_dump_copy_stats(const char* tag) {
+  fprintf(stderr, "[stats %s] lazy=%d fallback=%d erased=%d\n",
+    tag ? tag : "", g_copy_lazy_count.load(),
+    g_copy_fallback_count.load(), g_erase_count.load());
+}
+extern "C" void hagane_reset_copy_stats() {
+  haganeOpsCopyStatsReset();
+}
 
 // GroupNorm dispatches through DispatchStub (unlike LayerNorm which uses C10_EXPORT)
 #include <ATen/native/group_norm.h>
@@ -1713,20 +1759,49 @@ static Tensor hagane_add_scalar(const Tensor& t, double val) {
 // ---------------------------------------------------------------------------
 
 void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
-  // Fast path: contiguous, same dtype -> memcpy
+  hagane_register_allocator_hook();
+  // Build descriptors from the actual tensors' data_ptr — NOT iter.data_ptr().
+  // For cross-dtype copies, TensorIterator may use internal temporary buffers,
+  // so iter.data_ptr(arg) won't match the pending stash key from upstream ops.
+  const auto& dst_t = iter.tensor(0);
+  const auto& src_t = iter.tensor(1);
+  haganeOpsTensor_t src_d, dst_d;
+  src_d.data = const_cast<void*>(src_t.data_ptr());
+  src_d.shape = src_t.sizes().data();
+  src_d.strides = src_t.strides().data();
+  src_d.ndim = static_cast<int32_t>(src_t.dim());
+  src_d.dtype = to_hagane_dtype(src_t.scalar_type());
+  dst_d.data = const_cast<void*>(dst_t.data_ptr());
+  dst_d.shape = dst_t.sizes().data();
+  dst_d.strides = dst_t.strides().data();
+  dst_d.ndim = static_cast<int32_t>(dst_t.dim());
+  dst_d.dtype = to_hagane_dtype(dst_t.scalar_type());
+
+  if (haganeOpsCopyFull(&src_d, &dst_d) == HAGANE_OPS_SUCCESS) {
+    g_copy_lazy_count.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  g_copy_fallback_count.fetch_add(1, std::memory_order_relaxed);
+  // Dep-targeted flush: the MLX graph walk at stash time (collect_leaf_
+  // buffers) populates a reverse index from leaf Buffer → stash keys, so
+  // we materialize only the entries the upcoming copy would corrupt —
+  // not every pending entry like the prior blanket HAGANE_BEFORE_RAW_READ.
   if (iter.is_contiguous() && iter.dtype(0) == iter.dtype(1)) {
     void* dst = iter.data_ptr(0);
     void* src = iter.data_ptr(1);
     int64_t nbytes = iter.numel() * iter.element_size(0);
     if (nbytes > 0) {
-      HAGANE_BEFORE_RAW_READ();
+      ::haganeOpsFlushRegion(src, nbytes);
+      ::haganeOpsFlushForWrite(dst, nbytes);
       std::memcpy(dst, src, nbytes);
     }
-    return;
+  } else {
+    int64_t src_nbytes = src_t.numel() * src_t.element_size();
+    int64_t dst_nbytes = dst_t.numel() * dst_t.element_size();
+    ::haganeOpsFlushRegion(const_cast<void*>(src_t.data_ptr()), src_nbytes);
+    ::haganeOpsFlushForWrite(const_cast<void*>(dst_t.data_ptr()), dst_nbytes);
+    copy_stub(c10::DeviceType::CPU, iter, non_blocking);
   }
-  // Slow path: CPU copy handles remaining cases.
-  HAGANE_BEFORE_RAW_READ();
-  copy_stub(c10::DeviceType::CPU, iter, non_blocking);
 }
 
 void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
@@ -5873,8 +5948,6 @@ C10_EXPORT std::tuple<Tensor, Tensor> _fused_rms_norm_cuda(
   } else {
     haganeOpsRmsNorm(&in_d, nullptr, &out_d, static_cast<float>(e));
   }
-  haganeOpsFlush();
-
   // rrms only needed for backward — return empty when grad is disabled
   if (!input.requires_grad()) {
     return std::make_tuple(output, at::empty({M}, input.options().dtype(at::kFloat)));

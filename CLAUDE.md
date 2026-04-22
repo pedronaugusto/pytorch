@@ -1,3 +1,14 @@
+# Platform context
+
+This PyTorch tree is a source fork carrying Hagane-platform dispatch for Apple Silicon (ROCm build with `HIP_PLATFORM=hagane`). Before doing any work here, read:
+
+- `../kura/architecture.md` §16 — Hagane runtime (MLX-first principle, clr-equivalence, HIP→Metal mapping, where Hagane sits in the platform)
+- `../kura/decisions/007-hagane-integration-path.md` — why PyTorch-on-Metal exists here (vLLM Metal backend via PyTorch dispatch)
+- `../kura/decisions/015-hagane-dep-tracking.md` — cross-op lazy graph + byte-range dep tracking (what `aten/src/ATen/hip/HaganeOps.cpp` depends on)
+- `../hagane/docs/PYTORCH_OPS.md` — per-op dispatch status and performance table
+
+Architecture narrative and phase tracking live in kura. Do not add that content to this file.
+
 # Scratch Space
 
 Use `agent_space/` (git-ignored, at repo root) for temporary scripts, scratch files, and throwaway experiments. Do not commit files from this directory.
