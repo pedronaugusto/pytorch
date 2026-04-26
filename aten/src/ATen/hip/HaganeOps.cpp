@@ -6309,18 +6309,27 @@ static std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t, int64_t, Tensor, Tens
 _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
     std::optional<double> scale) {
+  // ViT-style attention arrives as `qkv.view(B, T, H, D).transpose(1, 2)` —
+  // non-contiguous along stride. The matmul/softmax chain below routes per-op
+  // through Hagane dispatch which produces NaN on bf16 non-contig inputs
+  // (separate bug, see kura/status/2026-04-27-hagane-sdpa-noncontig-bf16-nan.md).
+  // Defensive contiguous() here keeps the fast path correct for ViT, Whisper
+  // and any model that doesn't go through the fused haganeOpsBatchedLlamaStep
+  // primitive. Llama hits a different path so this overhead never fires.
+  auto q = query.is_contiguous() ? query : query.contiguous();
+  auto k = key.is_contiguous() ? key : key.contiguous();
+  auto v = value.is_contiguous() ? value : value.contiguous();
   // Handle GQA: expand K/V heads to match Q heads
-  auto k = key, v = value;
-  if (query.size(-3) != key.size(-3)) {
-    int64_t num_groups = query.size(-3) / key.size(-3);
-    k = key.repeat_interleave(num_groups, -3);
-    v = value.repeat_interleave(num_groups, -3);
+  if (q.size(-3) != k.size(-3)) {
+    int64_t num_groups = q.size(-3) / k.size(-3);
+    k = k.repeat_interleave(num_groups, -3);
+    v = v.repeat_interleave(num_groups, -3);
   }
-  double s = scale.value_or(1.0 / std::sqrt((double)query.size(-1)));
-  auto attn_weight = at::mul(at::matmul(query, k.transpose(-2, -1)), s);
+  double s = scale.value_or(1.0 / std::sqrt((double)q.size(-1)));
+  auto attn_weight = at::mul(at::matmul(q, k.transpose(-2, -1)), s);
   if (is_causal) {
-    int64_t L = query.size(-2), S = k.size(-2);
-    auto mask = at::ones({L, S}, query.options().dtype(kBool)).tril(S - L);
+    int64_t L = q.size(-2), S = k.size(-2);
+    auto mask = at::ones({L, S}, q.options().dtype(kBool)).tril(S - L);
     attn_weight = attn_weight.masked_fill(~mask, -std::numeric_limits<float>::infinity());
   }
   if (attn_mask.has_value()) attn_weight = at::add(attn_weight, *attn_mask);
