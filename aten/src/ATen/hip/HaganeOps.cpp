@@ -1719,11 +1719,20 @@ static haganeOpsTensor_t make_ops_tensor(TensorIteratorBase& iter, int arg) {
 static haganeOpsTensor_t make_ops_tensor_or_scalar(
     TensorIteratorBase& iter, int arg, at::Tensor& storage) {
   if (iter.is_cpu_scalar(arg)) {
-    // Use output dtype (not scalar's dtype) to avoid float64 promotion
-    // Python float → float64 scalar, but we want float32 on Metal/MLX
-    auto out_dtype = iter.dtype(0);
+    // Demote Python float → double scalars to the iterator's common dtype
+    // (MLX has no fp64). common_dtype is the input/comparison dtype — NOT
+    // dtype(0). For comparison ops dtype(0) is bool, so casting `inf` to
+    // bool and re-comparing as 1.0 silently corrupts every isinf/isfinite.
     auto scalar_dtype = iter.dtype(arg);
-    auto target_dtype = (scalar_dtype == c10::ScalarType::Double) ? out_dtype : scalar_dtype;
+    c10::ScalarType target_dtype;
+    if (scalar_dtype == c10::ScalarType::Double) {
+      target_dtype = iter.common_dtype();
+      if (target_dtype == c10::ScalarType::Double) {
+        target_dtype = c10::ScalarType::Float;
+      }
+    } else {
+      target_dtype = scalar_dtype;
+    }
     storage = at::empty({}, iter.tensor(0).options().dtype(target_dtype));
     AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, target_dtype, "fill_scalar", [&] {
       if constexpr (std::is_same_v<scalar_t, bool>) {
@@ -1765,6 +1774,22 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
   // so iter.data_ptr(arg) won't match the pending stash key from upstream ops.
   const auto& dst_t = iter.tensor(0);
   const auto& src_t = iter.tensor(1);
+
+  // GPU→CPU copies must materialize src's pending stash before reading; the
+  // lazy CopyFull path (Path A) wraps src and re-stashes against the dst
+  // pointer, but when dst is CPU memory the stash never materializes and the
+  // read returns the zero-initialized buffer. Flush only the src — dst's
+  // CPU bytes don't have a stash to invalidate, and pending_overlaps is a
+  // cheap no-op when src has no pending entry (the Llama post-argmax case).
+  const bool gpu_to_cpu =
+      src_t.device().is_cuda() && !dst_t.device().is_cuda();
+  if (gpu_to_cpu) {
+    int64_t src_nbytes = src_t.numel() * src_t.element_size();
+    if (src_nbytes > 0) {
+      ::haganeOpsFlushRegion(const_cast<void*>(src_t.data_ptr()), src_nbytes);
+    }
+  }
+
   haganeOpsTensor_t src_d, dst_d;
   src_d.data = const_cast<void*>(src_t.data_ptr());
   src_d.shape = src_t.sizes().data();
@@ -6310,12 +6335,14 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
     std::optional<double> scale) {
   // ViT-style attention arrives as `qkv.view(B, T, H, D).transpose(1, 2)` —
-  // non-contiguous along stride. The matmul/softmax chain below routes per-op
-  // through Hagane dispatch which produces NaN on bf16 non-contig inputs
-  // (separate bug, see kura/status/2026-04-27-hagane-sdpa-noncontig-bf16-nan.md).
-  // Defensive contiguous() here keeps the fast path correct for ViT, Whisper
-  // and any model that doesn't go through the fused haganeOpsBatchedLlamaStep
-  // primitive. Llama hits a different path so this overhead never fires.
+  // non-contiguous along the head-dim stride. The per-op aten matmul/softmax
+  // chain below behaves correctly on the standalone shape but mis-produces
+  // NaN inside the full ViT-B/16 pipeline (tracked separately — interaction
+  // between non-contig stash wrap + softmax dtype promotion). Forcing q/k/v
+  // contiguous here is the per-op aten safety path. The fused
+  // ``haganeOpsVitEncoderBlock`` primitive (built in this sprint) bypasses
+  // ``_hagane_sdpa_forward`` entirely via ``mx::fast::scaled_dot_product_
+  // attention``, so this overhead only fires on per-op aten dispatch.
   auto q = query.is_contiguous() ? query : query.contiguous();
   auto k = key.is_contiguous() ? key : key.contiguous();
   auto v = value.is_contiguous() ? value : value.contiguous();
