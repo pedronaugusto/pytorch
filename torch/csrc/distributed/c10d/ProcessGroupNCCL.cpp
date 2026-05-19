@@ -10,13 +10,13 @@
 #include <tuple>
 #include <utility>
 
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDAGraph.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGraph.h>
 #include <c10/core/DeviceType.h>
-#include <c10/cuda/CUDAAllocatorConfig.h>
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGraphsC10Utils.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <c10/hip/HIPAllocatorConfig.h>
+#include <c10/hip/HIPException.h>
+#include <c10/hip/HIPGraphsC10Utils.h>
+#include <c10/hip/HIPGuard.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Logging.h>
 #include <c10/util/WaitCounter.h>
@@ -245,7 +245,7 @@ struct RocmWatchdogEventQueryContextGuard {
 #endif // USE_ROCM
 
 #ifdef USE_ROCM
-// Watchdog-side cudaEventQuery workaround for HIP runtimes without the
+// Watchdog-side hipEventQuery workaround for HIP runtimes without the
 // capture-mode fix.
 // TODO: Remove once all supported runtimes include
 // https://github.com/ROCm/rocm-systems/pull/3176
@@ -256,7 +256,7 @@ bool queryEventWithRocmWatchdogCaptureWorkaround(
   }
 
   // Must unconditionally return false here during watchdog + active capture:
-  // on affected HIP runtimes, even calling cudaEventQuery from the watchdog
+  // on affected HIP runtimes, even calling hipEventQuery from the watchdog
   // thread while another thread has GLOBAL capture active can invalidate that
   // capture and cause downstream failures. Skip the query entirely and report
   // "not complete yet"; the watchdog will re-poll once capture ends. Timeout
@@ -267,15 +267,15 @@ bool queryEventWithRocmWatchdogCaptureWorkaround(
     return false;
   }
 
-  const cudaError_t err =
-      C10_CUDA_ERROR_HANDLED(cudaEventQuery(event->event()));
-  if (err == cudaSuccess) {
+  const hipError_t err =
+      C10_CUDA_ERROR_HANDLED(hipEventQuery(event->event()));
+  if (err == hipSuccess) {
     return true;
-  } else if (err != cudaErrorNotReady) {
+  } else if (err != hipErrorNotReady) {
     C10_CUDA_CHECK(err);
   } else {
     // ignore and clear the error if not ready
-    (void)cudaGetLastError();
+    (void)hipGetLastError();
   }
 
   return false;
@@ -325,7 +325,7 @@ bool shouldAllCommunicatorsRegisterAllTensors() {
 // There are two modes to do so:
 // - If TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=1 then *ALL* segments
 //   will be registered with *ALL* NCCL communicators (for the same device),
-//   even if they were allocated with cudaMalloc (which NCCL doesn't like).
+//   even if they were allocated with hipMalloc (which NCCL doesn't like).
 // - If a MemPool is explicitly registered with a ProcessGroup, then all its
 //   segments (current and future) will be registered with the NCCL communicator
 //   corresponding to the pool's device. This works best if the MemPool is set
@@ -591,7 +591,7 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(
       distDebugLevel_(distDebugLevel) {
   // Creates the CUDA event wrappers
   // Note: The actual events are lazily created when first recorded to with
-  // DEFAULT_FLAGS = cudaEventDisableTiming.
+  // DEFAULT_FLAGS = hipEventDisableTiming.
   if (cudaEventCacheEnabled) {
     ncclStartEvent_ = enableTiming
         ? CUDAEventCache::get(device.index())->create(enableTiming)
@@ -599,10 +599,10 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(
     ncclEndEvent_ = CUDAEventCache::get(device.index())->create(enableTiming);
   } else {
     ncclStartEvent_ = enableTiming
-        ? std::make_shared<at::cuda::CUDAEvent>(cudaEventDefault)
+        ? std::make_shared<at::cuda::CUDAEvent>(hipEventDefault)
         : nullptr;
     ncclEndEvent_ = std::make_shared<at::cuda::CUDAEvent>(
-        enableTiming ? cudaEventDefault : cudaEventDisableTiming);
+        enableTiming ? hipEventDefault : hipEventDisableTiming);
   }
   futureWorkResult_ =
       c10::make_intrusive<at::ivalue::Future>(c10::AnyEnumType::get());
@@ -717,11 +717,11 @@ bool ProcessGroupNCCL::WorkNCCL::startedGPUExecutionInternal() const {
 
 bool ProcessGroupNCCL::WorkNCCL::finishedGPUExecutionInternal() const {
   // Checking the work's corresponding CUDA event's status
-  // It calls `cudaEventQuery` eventually. Although this seems to be a
+  // It calls `hipEventQuery` eventually. Although this seems to be a
   // non-blocking call, but we did notice hangs in the past. It can
   // hang if another thread is holding the CUDA global context lock. For
-  // example, when doing a `cudaDeviceSynchronize` or even
-  // `cudaStreamSynchronize`.
+  // example, when doing a `hipDeviceSynchronize` or even
+  // `hipStreamSynchronize`.
 #ifdef USE_ROCM
   if (!queryEventWithRocmWatchdogCaptureWorkaround(ncclEndEvent_)) {
 #else
@@ -2443,7 +2443,7 @@ void ProcessGroupNCCL::Watchdog::runLoop() {
 
       // allow watchdog to do an event query on a side thread
       at::cuda::CUDAGuard device_guard(work.ncclEndEvent_->device_index());
-      at::cuda::CUDAStreamCaptureModeGuard g{cudaStreamCaptureModeThreadLocal};
+      at::cuda::CUDAStreamCaptureModeGuard g{hipStreamCaptureModeThreadLocal};
 #ifdef USE_ROCM
       // Mark this thread/scope as watchdog event-query context so the ROCm
       // workaround applies only here (not to main-thread wait()/isCompleted()).
@@ -3285,12 +3285,12 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
 
   ncclStreams_.emplace(deviceKey, streamVal);
 
-  // Note: these events are created with the (default) cudaEventDisableTiming
+  // Note: these events are created with the (default) hipEventDisableTiming
   // flag This flag provides the best performance when used with
-  // cudaStreamWaitEvent() and cudaEventQuery(). Since we here don't measure the
+  // hipStreamWaitEvent() and hipEventQuery(). Since we here don't measure the
   // performance using cudaEvent, this should be set.
   // TODO(kwen2501): is ncclEvents_ used anywhere else?
-  ncclEvents_.emplace(deviceKey, at::cuda::CUDAEvent(cudaEventDisableTiming));
+  ncclEvents_.emplace(deviceKey, at::cuda::CUDAEvent(hipEventDisableTiming));
 
   // Move the NCCL resource to cache
   auto it = inInitializationCommMap_.find(deviceKey);
@@ -5997,7 +5997,7 @@ bool ProcessGroupNCCL::supportsTensorAlloc(c10::DeviceIndex deviceIdx) {
 
   // We do an extra check to see if CUDA driver supports multicast.  If not, we
   // will return false. Although `ncclMemAlloc` will fall back to regular
-  // `cudaMalloc` and hence not error out, we may still want to avoid creating a
+  // `hipMalloc` and hence not error out, we may still want to avoid creating a
   // separate memory pool for NCCL.
   return c10d::cuda::deviceSupportsMulticast(deviceIdx);
 }
@@ -6029,7 +6029,7 @@ at::Tensor ProcessGroupNCCL::allocateTensor(
   // Allocate tensor under this MemPool's context
   auto tid = std::this_thread::get_id();
   c10::cuda::CUDACachingAllocator::beginAllocateToPool(
-      memPool_->device(), memPool_->id(), [=](cudaStream_t) {
+      memPool_->device(), memPool_->id(), [=](hipStream_t) {
         auto current_tid = std::this_thread::get_id();
         return current_tid == tid;
       });
@@ -6167,7 +6167,7 @@ void ProcessGroupNCCL::initializeDeviceStateForComm(
 
   devNCCLCommMap_[key] = comm;
   ncclStreams_.emplace(key, stream);
-  ncclEvents_.emplace(key, at::cuda::CUDAEvent(cudaEventDisableTiming));
+  ncclEvents_.emplace(key, at::cuda::CUDAEvent(hipEventDisableTiming));
   usedDeviceIdxs_.insert(device.index());
 
   if (shouldAllCommunicatorsRegisterAllTensors()) {

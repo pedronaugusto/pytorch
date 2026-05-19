@@ -7,9 +7,9 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_team_manager.hpp>
 
 #include <ATen/ceil_div.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPCachingAllocator.h>
+#include <c10/hip/HIPGuard.h>
 #include <c10/util/error.h>
 #include <c10/util/flat_hash_map.h>
 
@@ -52,7 +52,7 @@ struct NVSHMEMAllocation {
       return;
     }
     c10::cuda::CUDAGuard guard(device_idx);
-    nvshmem_free(ptr); // nvshmem_free has no return value
+    rocshmem::rocshmem_free(ptr); // rocshmem::rocshmem_free has no return value
   }
 };
 
@@ -106,20 +106,20 @@ class NVSHMEMPeerAllocInfo : public c10::intrusive_ptr_target {
       auto rank_to_global_rank_dev =
           reinterpret_cast<int*>(c10::cuda::CUDACachingAllocator::raw_alloc(
               sizeof(int) * world_size_));
-      AT_CUDA_CHECK(cudaMemcpy(
+      AT_CUDA_CHECK(hipMemcpy(
           rank_to_global_rank_dev,
           rank_to_global_rank.data(),
           sizeof(int) * world_size_,
-          cudaMemcpyHostToDevice));
+          hipMemcpyHostToDevice));
       rank_to_global_rank_dev_map[group_name] = rank_to_global_rank_dev;
     }
     auto& rank_to_global_rank = it->second;
 
     world_within_cuda_p2p_ = true;
     for (int r = 0; r < world_size_; ++r) {
-      auto peer_ptr = nvshmem_ptr(base_ptr_, rank_to_global_rank[r]);
+      auto peer_ptr = rocshmem::rocshmem_ptr(base_ptr_, rank_to_global_rank[r]);
       buffers_.push_back(peer_ptr);
-      // If a peer is over network, `nvshmem_ptr` returns null
+      // If a peer is over network, `rocshmem::rocshmem_ptr` returns null
       if (peer_ptr == nullptr) {
         world_within_cuda_p2p_ = false;
       }
@@ -127,13 +127,13 @@ class NVSHMEMPeerAllocInfo : public c10::intrusive_ptr_target {
 
     // TODO: use the same allocation for signal pad
     const size_t signal_pad_size = get_signal_pad_size();
-    void* signal_pad_ptr = nvshmem_malloc(signal_pad_size);
-    TORCH_CHECK(signal_pad_ptr != nullptr, "nvshmem_malloc failed");
-    AT_CUDA_CHECK(cudaMemset(signal_pad_ptr, 0, signal_pad_size));
+    void* signal_pad_ptr = rocshmem::rocshmem_malloc(signal_pad_size);
+    TORCH_CHECK(signal_pad_ptr != nullptr, "rocshmem::rocshmem_malloc failed");
+    AT_CUDA_CHECK(hipMemset(signal_pad_ptr, 0, signal_pad_size));
 
     for (int r = 0; r < world_size_; ++r) {
       signal_pads_.push_back(
-          nvshmem_ptr(signal_pad_ptr, rank_to_global_rank[r]));
+          rocshmem::rocshmem_ptr(signal_pad_ptr, rank_to_global_rank[r]));
     }
 
     const size_t arr_size = sizeof(void*) * world_size_;
@@ -142,13 +142,13 @@ class NVSHMEMPeerAllocInfo : public c10::intrusive_ptr_target {
     signal_pads_dev_ = reinterpret_cast<void**>(
         c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
 
-    AT_CUDA_CHECK(cudaMemcpy(
-        buffers_dev_, buffers_.data(), arr_size, cudaMemcpyHostToDevice));
-    AT_CUDA_CHECK(cudaMemcpy(
+    AT_CUDA_CHECK(hipMemcpy(
+        buffers_dev_, buffers_.data(), arr_size, hipMemcpyHostToDevice));
+    AT_CUDA_CHECK(hipMemcpy(
         signal_pads_dev_,
         signal_pads_.data(),
         arr_size,
-        cudaMemcpyHostToDevice));
+        hipMemcpyHostToDevice));
 
 #if !defined(USE_ROCM) // Multi-cast is not supported on ROCm yet
     // Initialize multicast address
@@ -332,23 +332,23 @@ static void initialize_nvshmem_with_store(
   c10::cuda::CUDAGuard guard(device_idx);
   maybe_initialize_env_vars();
   // Make sure the CUDA runtime is initialized.
-  cudaFree(nullptr);
+  hipFree(nullptr);
 
-  nvshmemx_uniqueid_t unique_id;
+  rocshmem::rocshmem_uniqueid_t unique_id;
   NVSHMEM_CHECK(
-      nvshmemx_get_uniqueid(&unique_id), "nvshmemx_get_uniqueid failed");
+      rocshmem::rocshmem_get_uniqueid(&unique_id), "rocshmem::rocshmem_get_uniqueid failed");
 
   // Using an existing store_all_gather due to laziness.
   // TODO(yifu): should use broadcast
   auto unique_ids =
       storeExchange.all_gather(store, rank, world_size, unique_id);
 
-  nvshmemx_init_attr_t attr;
-  nvshmemx_set_attr_uniqueid_args(rank, world_size, &unique_ids[0], &attr);
+  rocshmem::rocshmem_init_attr_t attr;
+  rocshmem::rocshmem_set_attr_uniqueid_args(rank, world_size, &unique_ids[0], &attr);
 
   NVSHMEM_CHECK(
-      nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr),
-      "nvshmemx_init_attr failed");
+      rocshmem::rocshmem_init_attr(rocshmem::ROCSHMEM_INIT_WITH_UNIQUEID, &attr),
+      "rocshmem::rocshmem_init_attr failed");
 
   is_initialized = true;
 
@@ -377,9 +377,9 @@ class NVSHMEMSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     initialize_nvshmem_with_store(
         group->getStore(), group->getRank(), group->getSize(), device_idx);
 
-    auto ptr = nvshmem_malloc(size);
+    auto ptr = rocshmem::rocshmem_malloc(size);
     // If size is 0 (which is legal allocation request) we shouldn't error out
-    TORCH_CHECK(ptr != nullptr || size == 0, "nvshmem_malloc failed");
+    TORCH_CHECK(ptr != nullptr || size == 0, "rocshmem::rocshmem_malloc failed");
     {
       std::lock_guard<std::mutex> lock(mutex_);
       allocations_.try_emplace(

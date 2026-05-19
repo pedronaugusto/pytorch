@@ -1,4 +1,4 @@
-#include <c10/cuda/CUDAStream.h>
+#include <c10/hip/HIPStream.h>
 #include <torch/csrc/distributed/c10d/cuda/CUDAEventCache.hpp>
 #include <map>
 
@@ -34,7 +34,7 @@ std::shared_ptr<at::cuda::CUDAEvent> CUDAEventCache::create(bool timing) {
       events.pop_front();
     } else {
       event = new at::cuda::CUDAEvent(
-          timing ? cudaEventDefault : cudaEventDisableTiming);
+          timing ? hipEventDefault : hipEventDisableTiming);
     }
   }
   return std::shared_ptr<at::cuda::CUDAEvent>(event, std::move(deleter));

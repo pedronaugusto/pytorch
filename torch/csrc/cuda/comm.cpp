@@ -9,8 +9,8 @@
 
 #include <ATen/ATen.h>
 #include <ATen/WrapDimUtils.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPGuard.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/autograd/variable.h>
 #include <optional>

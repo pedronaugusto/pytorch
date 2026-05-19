@@ -315,6 +315,8 @@ def get_undefined_native_symbols(
         "at::native::unique_dim_cuda(",
         "at::native::unique_consecutive_cuda(",
         "at::native::unique_dim_consecutive_cuda(",
+        "at::native::pixel_shuffle_cuda(",
+        "at::native::pixel_unshuffle_cuda(",
         "at::native::_histc_cuda(",
         "at::native::_histc_out_cuda(",
         "at::native::_bincount_cuda(",

@@ -177,22 +177,22 @@ void upsample_bicubic2d_backward_out_frame(
   });
 }
 
-void upsample_bicubic2d_backward_kernel(
+void upsample_bicubic2d_backward_kernel_impl(
     const Tensor& grad_input,
     const Tensor& grad_output_,
-    IntArrayRef output_size,
-    IntArrayRef input_size,
     bool align_corners,
     std::optional<double> scales_h,
     std::optional<double> scales_w) {
 
-  int64_t output_height = output_size[0];
-  int64_t output_width = output_size[1];
+  // X+32 Lane D — recover output/input sizes from tensors so the kernel fits
+  // the upsampling_bicubic2d DispatchStub typedef (5-arg, no IntArrayRef).
+  int64_t output_height = grad_output_.size(2);
+  int64_t output_width = grad_output_.size(3);
 
-  int64_t nbatch = input_size[0];
-  int64_t channels = input_size[1];
-  int64_t input_height = input_size[2];
-  int64_t input_width = input_size[3];
+  int64_t nbatch = grad_input.size(0);
+  int64_t channels = grad_input.size(1);
+  int64_t input_height = grad_input.size(2);
+  int64_t input_width = grad_input.size(3);
 
   auto grad_output = grad_output_.contiguous();
   // Special case: input/output same size, just copy
@@ -221,6 +221,13 @@ void upsample_bicubic2d_backward_kernel(
 }
 } // namespace
 
+REGISTER_ARCH_DISPATCH(upsample_bicubic2d_backward_kernel, DEFAULT, &upsample_bicubic2d_backward_kernel_impl)
+REGISTER_AVX512_DISPATCH(upsample_bicubic2d_backward_kernel, &upsample_bicubic2d_backward_kernel_impl)
+REGISTER_AVX2_DISPATCH(upsample_bicubic2d_backward_kernel, &upsample_bicubic2d_backward_kernel_impl)
+REGISTER_VSX_DISPATCH(upsample_bicubic2d_backward_kernel, &upsample_bicubic2d_backward_kernel_impl)
+REGISTER_ZVECTOR_DISPATCH(upsample_bicubic2d_backward_kernel, &upsample_bicubic2d_backward_kernel_impl)
+REGISTER_SVE256_DISPATCH(upsample_bicubic2d_backward_kernel, &upsample_bicubic2d_backward_kernel_impl)
+
 TORCH_IMPL_FUNC(upsample_bicubic2d_out_cpu) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -242,7 +249,7 @@ TORCH_IMPL_FUNC(upsample_bicubic2d_backward_out_cpu) (
     const Tensor& grad_input
 ) {
   grad_input.zero_();
-  upsample_bicubic2d_backward_kernel(grad_input, grad_output, output_size, input_size, align_corners, scales_h, scales_w);
+  upsample_bicubic2d_backward_kernel(kCPU, grad_input, grad_output, align_corners, scales_h, scales_w);
 }
 
 TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_out_cpu) (
@@ -297,6 +304,7 @@ Tensor _upsample_bicubic2d_aa(
 }
 
 DEFINE_DISPATCH(upsample_bicubic2d_kernel);
+DEFINE_DISPATCH(upsample_bicubic2d_backward_kernel);
 DEFINE_DISPATCH(_upsample_bicubic2d_aa_kernel);
 DEFINE_DISPATCH(_upsample_bicubic2d_aa_backward_kernel);
 

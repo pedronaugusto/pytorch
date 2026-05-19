@@ -23,12 +23,16 @@
 #include <ATen/native/Sorting.h>
 #include <ATen/native/TensorAdvancedIndexing.h>
 #include <ATen/native/IndexKernel.h>
+#include <ATen/native/Distance.h>
+#include <ATen/native/UpSample.h>  // X+30 Lane C — for upsample_nearest2d_backward_kernel stub.
+#include <ATen/native/Pool.h>      // X+31 Lane C — for avg_pool/max_pool backward stubs.
 #include <ATen/native/cpu/CatKernel.h>
 #include <ATen/native/hip/Sort.h>
 #include <ATen/native/hip/SortStable.h>
 #include <ATen/native/hip/TensorTopK.h>
 #include <ATen/native/hip/ScanKernels.h>
 #include <ATen/TensorIterator.h>
+#include <ATen/ExpandUtils.h>
 #include <ATen/core/IListRef.h>
 #include <ATen/Functions.h>
 #include <ATen/ops/empty.h>
@@ -123,9 +127,11 @@
 #include <ATen/OpMathType.h>
 
 #include <hagane_ops.h>
+#include <hagane_capture.h>
 #include <cstdlib>
 
 #include <cstring>
+#include <unordered_map>
 
 #include <c10/hip/HIPCachingAllocator.h>
 
@@ -151,9 +157,33 @@ static void hagane_register_allocator_hook() {
   }
   c10::cuda::CUDACachingAllocator::attachAllocatorTraceTracker(
     [](const c10::CachingDeviceAllocator::TraceEntry& e) {
-      if (e.action_ == c10::CachingDeviceAllocator::TraceEntry::FREE_REQUESTED) {
+      using TE = c10::CachingDeviceAllocator::TraceEntry;
+      if (e.action_ == TE::FREE_REQUESTED) {
         haganeOpsPendingErase(reinterpret_cast<void*>(e.addr_));
         g_erase_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      // Sprint DD-B — track allocations made during a hipStream capture
+      // window. PyTorch tags pool allocations with a non-default
+      // mempool_id (CUDAGraph::capture_begin → beginAllocateToPool), but
+      // not all ALLOC events on the Hagane HIP path get the tag, so we
+      // OR with haganeOpsCaptureActive() as the authoritative
+      // "currently capturing" gate. The auto-bind pass at
+      // hipStreamEndCapture consults this set to distinguish graph-pool
+      // intermediates (leave INTERMEDIATE) from user-allocated tensors
+      // (convert to INPUT_SLOT / OUTPUT_SLOT).
+      const bool is_graph_pool =
+          (e.mempool_.first != 0 || e.mempool_.second != 0);
+      const bool capturing_now = haganeOpsCaptureActive() != 0;
+      if (!is_graph_pool && !capturing_now) return;
+      if (e.action_ == TE::ALLOC) {
+        // Only register; never unregister mid-capture. The auto-bind pass
+        // wants the historical record of "addresses allocated during this
+        // capture window", not the live set. PyTorch may free + reuse
+        // buffers within capture; the tape's recorder handles that via
+        // intermediate-id versioning. The set is cleared at the next
+        // hipStreamBeginCapture so it does not leak across captures.
+        haganeOpsRegisterPoolAlloc(reinterpret_cast<const void*>(e.addr_));
       }
     });
   fprintf(stderr, "[hagane] allocator trace hook registered\n");
@@ -246,8 +276,44 @@ C10_EXPORT Tensor empty_strided_cuda(
 
 namespace at::native {
 
+// Forward declaration for the F.1 fix below — defined at line ~358.
+static haganeOpsTensor_t make_tensor_desc(const at::TensorBase& t);
+
 TORCH_IMPL_FUNC(ufunc_add_CUDA)(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha, const at::Tensor& out) {
-  add_stub(device_type(), *this, alpha);
+  // Sprint F.1 — ADR-027 Invariant C. PyTorch's meta function allocates
+  // `out` with strides matching the first input; for non-contig inputs
+  // (e.g. Whisper's inputs_embeds = conv2_out.permute(0,2,1)) the output
+  // ends up non-contig too. add_stub → hagane_add_kernel can compute
+  // correctly but its writeback into a non-contig destination falls into
+  // copy_result's eager path which doesn't record HAGANE_CAPTURE_RECORD_
+  // OUTPUT — the op drops from the tape and fresh-input replay can't
+  // propagate the chain. Fix: pre-contiguify inputs and SUBSTITUTE `out`'s
+  // storage with a freshly-allocated contig buffer. The structured-
+  // kernel wrapper returns this buffer to the caller, so the user's view
+  // of the result is contig — same logical values, different physical
+  // layout. Mirrors cat_out_cuda + _hagane_sdpa_forward.
+  if (out.is_contiguous() && self.is_contiguous() && other.is_contiguous()) {
+    add_stub(device_type(), *this, alpha);
+    return;
+  }
+  if (out.scalar_type() == c10::ScalarType::Double) {
+    add_stub(device_type(), *this, alpha);
+    return;
+  }
+  auto a = self.is_contiguous() ? self : self.contiguous();
+  auto b = other.is_contiguous() ? other : other.contiguous();
+  auto fresh = at::empty(out.sizes(), out.options());
+  auto a_d = make_tensor_desc(a);
+  auto b_d = make_tensor_desc(b);
+  auto fresh_d = make_tensor_desc(fresh);
+  if (haganeOpsAdd(&a_d, &b_d, &fresh_d, alpha.toFloat()) == HAGANE_OPS_SUCCESS) {
+    const_cast<at::Tensor&>(out).set_(fresh);
+    return;
+  }
+  HAGANE_BEFORE_RAW_READ();
+  auto cpu_r = at::add(a.cpu(), b.cpu(), alpha);
+  fresh.copy_(cpu_r);
+  const_cast<at::Tensor&>(out).set_(fresh);
 }
 
 // ---------------------------------------------------------------------------
@@ -832,8 +898,8 @@ C10_EXPORT Tensor repeat_interleave_cuda(
   }
   auto result = at::empty({out_sz}, repeat.options().dtype(c10::kLong));
   auto rep_d = make_tensor_desc(repeat);
-  if (haganeOpsRepeatInterleave(&rep_d, result.data_ptr(), out_sz,
-                                 HAGANE_DTYPE_INT64) != HAGANE_OPS_SUCCESS) {
+  auto res_d = make_tensor_desc(result);
+  if (haganeOpsRepeatInterleave(&rep_d, &res_d) != HAGANE_OPS_SUCCESS) {
     auto cpu_result = at::repeat_interleave(repeat.cpu(), output_size);
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
@@ -1715,7 +1781,58 @@ static haganeOpsTensor_t make_ops_tensor(TensorIteratorBase& iter, int arg) {
 // Handle CPU scalars in binary/comparison kernels.
 // When PyTorch wraps a Python float as a CPU 0-dim tensor, we must create
 // a device-local tensor. On UMA (Apple Silicon) we allocate on the output
-// device and write the value directly.
+// device and route the fill through dispatch (haganeOpsFill → pending_
+// stash) so the scalar becomes a node in MLX's lazy graph. A raw CPU write
+// to fresh device storage was invisible to MLX's dependency tracker:
+// downstream binary ops (mul/add/cmp/etc.) wrapped the storage pointer
+// with no pending entry, so MLX scheduled the kernel before the CPU-side
+// scalar write was visible to GPU and the consumer read pre-write zeros.
+// `q * 0.125` produced 0 instead of q*0.125 — Sprint F.2 root cause.
+
+// Sprint X+1 Lane B.1 — Thread-local scalar-tensor cache. Each binary op
+// invocation with a CPU-scalar arg used to allocate `at::full({}, scalar)`
+// per call (1810-1811 below); ~150 binary-ops/token on Llama-3.2-1B bf16
+// decode × 2-4 μs/alloc = 300-600 μs/token addressable dispatcher overhead.
+// The hot scalars (0, 1, -1, alpha values, RoPE 0.125 etc.) repeat across
+// ops, so a tiny LRU keyed by (target_dtype, scalar bit-pattern) hits very
+// well. Bypassed under capture (Risk 3: cached buffers at fixed addresses
+// would feed the recorder's pending tracker the same address across ops).
+namespace {
+struct ScalarCacheKey {
+  c10::ScalarType dtype;
+  uint64_t bits;
+  bool operator==(const ScalarCacheKey& o) const {
+    return dtype == o.dtype && bits == o.bits;
+  }
+};
+struct ScalarCacheKeyHash {
+  size_t operator()(const ScalarCacheKey& k) const noexcept {
+    return std::hash<int>()(static_cast<int>(k.dtype)) ^
+           (std::hash<uint64_t>()(k.bits) << 1);
+  }
+};
+constexpr size_t kScalarCacheMax = 32;
+thread_local std::unordered_map<ScalarCacheKey, at::Tensor, ScalarCacheKeyHash>
+    g_scalar_tensor_cache;
+}  // namespace
+
+// Sprint X+12 Lane A.1 — bisect-machinery: drop the thread-local
+// scalar-tensor cache (X+1 Lane B.1). The cache holds at::Tensor
+// references that pin underlying MLX buffers across dtype passes;
+// clearing it releases those references so the next dtype pass can
+// rebuild scalar-bound buffers from scratch. Caller-thread scope only
+// — the cache is thread_local. Lives in libtorch_hip.dylib (NOT
+// libhagane-runtime.dylib) because the cache itself is in the auto-
+// hipified PyTorch glue. Visibility-default attribute forces export
+// in case the PyTorch HIP TU is built with -fvisibility=hidden
+// (X+11 lesson #6 — second-TU compound-risk check). Not for
+// production callers; the cache is the ~450-900 μs/token dispatch
+// overhead optimization Sprint X+1 Lane B.1 introduced.
+extern "C" __attribute__((visibility("default")))
+void haganeOpsClearScalarCache(void) {
+    g_scalar_tensor_cache.clear();
+}
+
 static haganeOpsTensor_t make_ops_tensor_or_scalar(
     TensorIteratorBase& iter, int arg, at::Tensor& storage) {
   if (iter.is_cpu_scalar(arg)) {
@@ -1733,15 +1850,41 @@ static haganeOpsTensor_t make_ops_tensor_or_scalar(
     } else {
       target_dtype = scalar_dtype;
     }
-    storage = at::empty({}, iter.tensor(0).options().dtype(target_dtype));
-    AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, target_dtype, "fill_scalar", [&] {
-      if constexpr (std::is_same_v<scalar_t, bool>) {
-        *storage.mutable_data_ptr<bool>() = iter.scalar_value<int64_t>(arg) != 0;
-      } else {
-        *storage.mutable_data_ptr<scalar_t>() = static_cast<scalar_t>(
-            iter.scalar_value<double>(arg));
+    c10::Scalar scalar_val;
+    double cache_value;
+    if (target_dtype == c10::ScalarType::Bool) {
+      bool b = iter.scalar_value<int64_t>(arg) != 0;
+      scalar_val = b;
+      cache_value = b ? 1.0 : 0.0;
+    } else {
+      cache_value = iter.scalar_value<double>(arg);
+      scalar_val = cache_value;
+    }
+
+    const bool capturing = haganeOpsCaptureActive() != 0;
+    ScalarCacheKey key{target_dtype, 0};
+    std::memcpy(&key.bits, &cache_value, sizeof(double));
+    if (!capturing) {
+      auto it = g_scalar_tensor_cache.find(key);
+      if (it != g_scalar_tensor_cache.end()) {
+        storage = it->second;
+        haganeOpsTensor_t desc;
+        desc.data = storage.data_ptr();
+        desc.shape = storage.sizes().data();
+        desc.strides = storage.strides().data();
+        desc.ndim = 0;
+        desc.dtype = to_hagane_dtype(target_dtype);
+        return desc;
       }
-    });
+    }
+
+    storage = at::full({}, scalar_val,
+                       iter.tensor(0).options().dtype(target_dtype));
+
+    if (!capturing && g_scalar_tensor_cache.size() < kScalarCacheMax) {
+      g_scalar_tensor_cache.emplace(key, storage);
+    }
+
     haganeOpsTensor_t desc;
     desc.data = storage.data_ptr();
     desc.shape = storage.sizes().data();
@@ -1841,145 +1984,22 @@ void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
 // Binary ops — Metal GPU via MLX, CPU fallback
 // ---------------------------------------------------------------------------
 
-void hagane_add_kernel(TensorIteratorBase& iter, const Scalar& alpha) {
-  // Handle float64 promotion from Python scalars: downcast to float32 for MLX
-  if (iter.common_dtype() == c10::ScalarType::Double) {
-    auto a = iter.tensor(1).to(c10::ScalarType::Float);
-    auto b = iter.tensor(2).to(c10::ScalarType::Float);
-    auto result = (alpha.toFloat() == 1.0f) ? at::add(a, b) : at::add(a, at::mul(b, at::full_like(b, alpha.toFloat())));
-    iter.tensor(0).copy_(result.to(c10::ScalarType::Double));
-    return;
-  }
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsAdd(&a, &b, &out, alpha.toFloat()) != HAGANE_OPS_SUCCESS) {
-    // Direct CPU fallback without going through add_stub (no CPU kernel)
-    HAGANE_BEFORE_RAW_READ();
-    auto cpu_a = iter.tensor(1).cpu();
-    auto cpu_b = iter.tensor(2).cpu();
-    auto r = cpu_a.clone();
-    r.add_(cpu_b, alpha);
-    iter.tensor(0).copy_(r);
-  }
-}
+// hagane_add_kernel retired by Sprint X+19 (ADR-036). Lives in
+// HaganeMetallibBridge.cpp via BinaryAlphaOpConfig kAddCfg +
+// hagane_binary_alpha_bridge.
 
-void hagane_mul_kernel(TensorIteratorBase& iter) {
-  if (iter.common_dtype() == c10::ScalarType::Double) {
-    auto a = iter.tensor(1).to(c10::ScalarType::Float);
-    auto b = iter.tensor(2).to(c10::ScalarType::Float);
-    iter.tensor(0).copy_(at::mul(a, b).to(c10::ScalarType::Double));
-    return;
-  }
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsMul(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    mul_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// hagane_mul_kernel retired by Sprint X+18 (ADR-036). Lives in
+// HaganeMetallibBridge.cpp via BinaryOpConfig kMulCfg + hagane_binary_bridge.
 
-void hagane_div_true_kernel(TensorIteratorBase& iter) {
-  if (iter.common_dtype() == c10::ScalarType::Double) {
-    auto a = iter.tensor(1).to(c10::ScalarType::Float);
-    auto b = iter.tensor(2).to(c10::ScalarType::Float);
-    iter.tensor(0).copy_(at::div(a, b).to(c10::ScalarType::Double));
-    return;
-  }
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsDiv(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    div_true_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// hagane_div_{true,trunc,floor}_kernel retired by Sprint X+19 (ADR-036).
+// Live in HaganeMetallibBridge.cpp via BinaryOpConfig kDivTrueCfg /
+// kDivTruncCfg / kDivFloorCfg + hagane_binary_bridge. div_true has the only
+// fp64 round-trip among them (`fp64_div`).
 
-void hagane_div_trunc_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsDivTrunc(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    div_trunc_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_div_floor_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsDivFloor(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    div_floor_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Comparison ops — Metal GPU via MLX, CPU fallback
-// ---------------------------------------------------------------------------
-
-void hagane_eq_kernel(TensorIteratorBase& iter) {
-  if (iter.common_dtype() == c10::ScalarType::Double) {
-    auto a = iter.tensor(1).to(c10::ScalarType::Float);
-    auto b = iter.tensor(2).to(c10::ScalarType::Float);
-    iter.tensor(0).copy_(at::eq(a, b));
-    return;
-  }
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsEq(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    eq_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_ne_kernel(TensorIteratorBase& iter) {
-  if (iter.common_dtype() == c10::ScalarType::Double) {
-    auto a = iter.tensor(1).to(c10::ScalarType::Float);
-    auto b = iter.tensor(2).to(c10::ScalarType::Float);
-    iter.tensor(0).copy_(at::ne(a, b));
-    return;
-  }
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsNe(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    ne_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-#define HAGANE_CMP_F64(name, at_fn, ops_fn, stub_name) \
-void name(TensorIteratorBase& iter) { \
-  if (iter.common_dtype() == c10::ScalarType::Double) { \
-    auto a = iter.tensor(1).to(c10::ScalarType::Float); \
-    auto b = iter.tensor(2).to(c10::ScalarType::Float); \
-    iter.tensor(0).copy_(at_fn(a, b)); \
-    return; \
-  } \
-  auto out = make_ops_tensor(iter, 0); \
-  at::Tensor sa, sb; \
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa); \
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb); \
-  if (ops_fn(&a, &b, &out) != HAGANE_OPS_SUCCESS) { \
-    stub_name(c10::DeviceType::CPU, iter); \
-  } \
-}
-HAGANE_CMP_F64(hagane_lt_kernel, at::lt, haganeOpsLt, lt_stub)
-HAGANE_CMP_F64(hagane_gt_kernel, at::gt, haganeOpsGt, gt_stub)
-HAGANE_CMP_F64(hagane_le_kernel, at::le, haganeOpsLe, le_stub)
-HAGANE_CMP_F64(hagane_ge_kernel, at::ge, haganeOpsGe, ge_stub)
-#undef HAGANE_CMP_F64
+// hagane_{eq,ne,lt,gt,le,ge}_kernel retired by Sprint X+18 (ADR-036).
+// Live in HaganeMetallibBridge.cpp via BinaryOpConfig kEqCfg/kNeCfg/kLtCfg/
+// kGtCfg/kLeCfg/kGeCfg + hagane_binary_bridge. HAGANE_CMP_F64 macro removed
+// alongside its only invocations.
 
 // ---------------------------------------------------------------------------
 // Unary ops — Metal GPU via MLX, CPU fallback
@@ -1993,83 +2013,27 @@ HAGANE_CMP_F64(hagane_ge_kernel, at::ge, haganeOpsGe, ge_stub)
     return; \
   }
 
-void hagane_neg_kernel(TensorIteratorBase& iter) {
-  HAGANE_UNARY_F64(hagane_neg_kernel, at::neg)
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsNeg(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    neg_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+16: hagane_neg_kernel deleted (ADR-036 deletion log row 2).
+// neg_stub dispatch now lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(neg_stub, &hagane_kernel_bridge<kNegCfg>).
 
-void hagane_abs_kernel(TensorIteratorBase& iter) {
-  HAGANE_UNARY_F64(hagane_abs_kernel, at::abs)
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsAbs(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    abs_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+15: hagane_abs_kernel deleted (ADR-036 deletion log row 1).
+// abs_stub dispatch now lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(abs_stub, &hagane_kernel_bridge<kAbsCfg>).
 
-void hagane_exp_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsExp(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    exp_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_log_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLog(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    log_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_sqrt_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSqrt(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    sqrt_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_tanh_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsTanh(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    tanh_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_sigmoid_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSigmoid(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    sigmoid_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+17: hagane_{exp,log,sqrt,tanh,sigmoid}_kernel deleted
+// (ADR-036 deletion log rows 5-9). Dispatch now lives in
+// HaganeMetallibBridge.cpp via REGISTER_DISPATCH(<op>_stub,
+// &hagane_kernel_bridge<k<Op>Cfg>).
 
 // ---------------------------------------------------------------------------
 // Activation ops — Metal GPU via MLX
 // ---------------------------------------------------------------------------
 
-void hagane_silu_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSilu(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    silu_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+20: hagane_silu_kernel retired (ADR-036 deletion log row 50).
+// Dispatch lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(silu_stub, &hagane_kernel_bridge<kSiluCfg>). SiLU is on
+// the Llama FFN hot path — Llama-1B fp32+bf16 determinism is the witness gate.
 
 void hagane_silu_backward_kernel(TensorIteratorBase& iter) {
   // Training only — CPU fallback
@@ -2081,341 +2045,52 @@ void hagane_silu_backward_kernel(TensorIteratorBase& iter) {
 // Additional unary ops — Metal GPU via MLX
 // ---------------------------------------------------------------------------
 
-void hagane_reciprocal_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsReciprocal(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    reciprocal_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// hagane_{reciprocal,rsqrt,round,trunc,erf,log2,log10,log1p,exp2}_kernel
+// retired by Sprint X+19 (ADR-036 deletion log rows 21-29). Dispatch now
+// lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(<op>_stub, &hagane_kernel_bridge<k<Op>Cfg>).
 
-void hagane_rsqrt_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsRsqrt(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    rsqrt_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+17: hagane_{sin,cos,floor,ceil}_kernel deleted
+// (ADR-036 deletion log rows 10-13). Dispatch now lives in
+// HaganeMetallibBridge.cpp via REGISTER_DISPATCH(<op>_stub,
+// &hagane_kernel_bridge<k<Op>Cfg>).
 
-void hagane_sin_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSin(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    sin_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+16: hagane_sign_kernel deleted (ADR-036 deletion log row 3).
+// sign_stub dispatch now lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(sign_stub, &hagane_kernel_bridge<kSignCfg>).
 
-void hagane_cos_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsCos(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    cos_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_floor_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsFloor(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    floor_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_ceil_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsCeil(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    ceil_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_round_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsRound(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    round_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_trunc_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsTrunc(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    trunc_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_sign_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSign(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    sign_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_erf_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsErf(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    erf_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Additional unary ops — Batch 1 completions
-// ---------------------------------------------------------------------------
-
-void hagane_log2_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLog2(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    log2_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_log10_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLog10(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    log10_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_log1p_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLog1p(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    log1p_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_exp2_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsExp2(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    exp2_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_expm1_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsExpm1(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    expm1_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_bitwise_not_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsBitwiseNot(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    bitwise_not_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_logical_not_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLogicalNot(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    logical_not_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+20: hagane_{expm1,bitwise_not,logical_not}_kernel retired
+// (ADR-036 deletion log rows 39-41). Dispatch lives in
+// HaganeMetallibBridge.cpp via REGISTER_DISPATCH(<op>_stub,
+// &hagane_kernel_bridge<k<Op>Cfg>).
 
 // ---------------------------------------------------------------------------
 // Additional binary ops — Batch 1
 // ---------------------------------------------------------------------------
 
-void hagane_sub_kernel(TensorIteratorBase& iter, const Scalar& alpha) {
-  if (iter.common_dtype() == c10::ScalarType::Double) {
-    auto a = iter.tensor(1).to(c10::ScalarType::Float);
-    auto b = iter.tensor(2).to(c10::ScalarType::Float);
-    auto result = (alpha.toFloat() == 1.0f) ? at::sub(a, b) : at::sub(a, at::mul(b, at::full_like(b, alpha.toFloat())));
-    iter.tensor(0).copy_(result.to(c10::ScalarType::Double));
-    return;
-  }
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsSub(&a, &b, &out, alpha.toFloat()) != HAGANE_OPS_SUCCESS) {
-    // Direct CPU fallback without going through sub_stub (no CPU kernel)
-    HAGANE_BEFORE_RAW_READ();
-    auto cpu_a = iter.tensor(1).cpu();
-    auto cpu_b = iter.tensor(2).cpu();
-    auto r = cpu_a.clone();
-    r.sub_(cpu_b, alpha);
-    iter.tensor(0).copy_(r);
-  }
-}
+// hagane_sub_kernel retired by Sprint X+19 (ADR-036). Lives in
+// HaganeMetallibBridge.cpp via BinaryAlphaOpConfig kSubCfg +
+// hagane_binary_alpha_bridge.
 
-void hagane_atan2_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsAtan2(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    atan2_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// hagane_{atan2,pow_tt}_kernel retired by Sprint X+19 (ADR-036). Live in
+// HaganeMetallibBridge.cpp via BinaryOpConfig kAtan2Cfg / kPowTtCfg +
+// hagane_binary_bridge.
 
-void hagane_pow_tt_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsPow(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    pow_tensor_tensor_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// Sprint X+20: hagane_pow_ts_kernel retired (ADR-036 deletion log row 51).
+// Dispatch lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(pow_tensor_scalar_stub,
+//                   &hagane_unary_scalar_bridge<kPowTsCfg>).
+// kPowTsCfg's c_abi_fn is pow_scalar_wrap, which reorders haganeOpsPowScalar's
+// (in, scalar, out) C-ABI arg order into the uniform (in, out, scalar) shape.
 
-void hagane_pow_ts_kernel(TensorIteratorBase& iter, const Scalar& exp) {
-  auto out = make_ops_tensor(iter, 0);
-  auto a = make_ops_tensor(iter, 1);
-  if (haganeOpsPowScalar(&a, exp.toFloat(), &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    pow_tensor_scalar_stub(c10::DeviceType::CPU, iter, exp);
-  }
-}
+// hagane_{remainder,fmod}_kernel retired by Sprint X+19 (ADR-036). Live in
+// HaganeMetallibBridge.cpp via BinaryOpConfig kRemainderCfg / kFmodCfg +
+// hagane_binary_bridge.
 
-void hagane_remainder_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsRemainder(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    remainder_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_fmod_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsFmod(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    fmod_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_bitwise_and_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsBitwiseAnd(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    bitwise_and_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_bitwise_or_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsBitwiseOr(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    bitwise_or_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_bitwise_xor_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsBitwiseXor(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    bitwise_xor_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_logical_and_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsLogicalAnd(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    logical_and_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_logical_or_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsLogicalOr(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    logical_or_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_logical_xor_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsLogicalXor(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    logical_xor_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_maximum_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsMaximum(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    maximum_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_minimum_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsMinimum(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    minimum_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_copysign_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsCopysign(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    copysign_stub(c10::DeviceType::CPU, iter);
-  }
-}
+// hagane_{bitwise_and,bitwise_or,bitwise_xor,logical_and,logical_or,
+// logical_xor,maximum,minimum,copysign}_kernel retired by Sprint X+21
+// (ADR-036). Live in HaganeMetallibBridge.cpp via BinaryOpConfig rows
+// (kBitwiseAndCfg … kCopysignCfg) + hagane_binary_bridge.
 
 // ---------------------------------------------------------------------------
 // Activation ops — Batch 1
@@ -2448,165 +2123,26 @@ void hagane_softplus_kernel(TensorIteratorBase& iter, const Scalar& beta, const 
   }
 }
 
-void hagane_leaky_relu_kernel(TensorIteratorBase& iter, const Scalar& negative_slope) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLeakyRelu(&in, &out, negative_slope.toFloat()) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    leaky_relu_stub(c10::DeviceType::CPU, iter, negative_slope);
-  }
-}
+// Sprint X+20: hagane_{leaky_relu,hardshrink,softshrink}_kernel retired
+// (ADR-036 deletion log rows 52-54). Dispatch now lives in
+// HaganeMetallibBridge.cpp via REGISTER_DISPATCH(<op>_stub,
+// &hagane_unary_scalar_bridge<k<Op>Cfg>) using the new UnaryScalarOpConfig
+// variant. hagane_{hardsigmoid,mish}_kernel retired (rows 56-57) via
+// REGISTER_DISPATCH(<op>_stub, &hagane_kernel_bridge<k<Op>Cfg>).
 
-void hagane_hardsigmoid_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsHardsigmoid(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    hardsigmoid_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_hardswish_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsHardswish(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    hardswish_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_mish_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsMish(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    mish_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_hardshrink_kernel(TensorIteratorBase& iter, const Scalar& lambd) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsHardshrink(&in, &out, lambd.toFloat()) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    hardshrink_stub(c10::DeviceType::CPU, iter, lambd);
-  }
-}
-
-void hagane_softshrink_kernel(TensorIteratorBase& iter, const Scalar& lambd) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSoftshrink(&in, &out, lambd.toFloat()) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    softshrink_stub(c10::DeviceType::CPU, iter, lambd);
-  }
-}
+// X+22 — hardswish + 9 reductions (sum/mean/prod/argmax/argmin/max_values/
+// min_values/and/or) migrated to HaganeMetallibBridge.cpp via
+// UnaryIterOpConfig + hagane_unary_iter_bridge<Cfg> (ADR-036 §6 / Sprint X+22
+// closeout). Definitions removed.
 
 // ---------------------------------------------------------------------------
 // Reductions — Metal GPU via MLX
 // ---------------------------------------------------------------------------
 
-void hagane_sum_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSum(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    sum_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_mean_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsMean(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    mean_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_prod_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsProd(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    prod_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_argmax_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsArgmax(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    argmax_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_argmin_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsArgmin(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    argmin_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_max_values_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsMaxValues(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    max_values_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_min_values_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsMinValues(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    min_values_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_and_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsAll(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    and_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_or_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsAny(&in, &out) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    or_stub(c10::DeviceType::CPU, iter);
-  }
-}
-
-void hagane_norm_kernel(TensorIterator& iter, const Scalar& p) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  double pval = p.toDouble();
-  // Find reduction dim from shapes
-  const Tensor& in_t = iter.tensor(1);
-  const Tensor& out_t = iter.tensor(0);
-  int32_t dim = -1;
-  for (int64_t d = 0; d < in_t.dim(); d++) {
-    if (in_t.size(d) > 1 && (d >= out_t.dim() || out_t.size(d) == 1)) {
-      dim = static_cast<int32_t>(d);
-      break;
-    }
-  }
-  if (dim < 0) dim = static_cast<int32_t>(in_t.dim() - 1);
-  if (haganeOpsNormVal(&in, &out, pval, dim) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    norm_stub(c10::DeviceType::CPU, iter, p);
-  }
-}
+// X+23 — norm_stub migrated to HaganeMetallibBridge.cpp via
+// ReduceFlagOpConfig + hagane_unary_iter_flag_bridge<kNormCfg> (ADR-036
+// row 78 / Sprint X+23 closeout). The retired kernel had a brace-defect
+// dispatch bug (silent CPU-only); bridge migration fixes it.
 
 // ReduceAllOps: max_all, min_all — different signature: (Tensor& result, const Tensor& self)
 void hagane_max_all_kernel(Tensor& result, const Tensor& self) {
@@ -2677,14 +2213,9 @@ void hagane_clamp_max_scalar_kernel(TensorIteratorBase& iter, Scalar max_val) {
 // Logit — Metal GPU via MLX
 // ---------------------------------------------------------------------------
 
-void hagane_logit_kernel(TensorIteratorBase& iter, const Scalar& eps) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLogit(&in, &out, eps.toFloat()) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    logit_stub(c10::DeviceType::CPU, iter, eps);
-  }
-}
+// Sprint X+20: hagane_logit_kernel retired (ADR-036 deletion log row 55).
+// Dispatch now lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(logit_stub, &hagane_unary_scalar_bridge<kLogitCfg>).
 
 // ---------------------------------------------------------------------------
 // Where — Metal GPU via MLX
@@ -2955,66 +2486,11 @@ void hagane_log_normal_kernel(TensorIteratorBase& iter, double mean, double std,
 // Batch 10: Missing DispatchStub kernels (critical for model inference)
 // ---------------------------------------------------------------------------
 
-// std_var_stub: variance/std reduction via haganeOps C API (Metal GPU)
-void hagane_std_var_kernel(TensorIterator& iter, double correction, bool take_sqrt) {
-  int nout = iter.noutputs();
-  const Tensor& input_t = iter.tensor(nout);
-  const Tensor& out_t = iter.tensor(0);
-  int64_t out_numel = out_t.numel();
-  int64_t N = (out_numel > 0) ? input_t.numel() / out_numel : 0;
-  if (N <= 0) return;
-
-  // Work with own tensors to avoid iter.data_ptr vs tensor.data_ptr mismatch
-  // Use at::empty (not empty_like) to avoid copying zero strides from broadcast output
-  Tensor input_c = input_t.contiguous();
-  Tensor sum_x = at::empty(out_t.sizes(), out_t.options());
-  Tensor sum_x2 = at::empty(out_t.sizes(), out_t.options());
-
-  // Build descriptors for our own contiguous tensors
-  auto mk = [](const Tensor& t) -> haganeOpsTensor_t {
-    haganeOpsTensor_t d;
-    d.data = const_cast<void*>(t.data_ptr());
-    d.shape = t.sizes().data();
-    d.strides = t.strides().data();
-    d.ndim = static_cast<int32_t>(t.dim());
-    d.dtype = to_hagane_dtype(t.scalar_type());
-    return d;
-  };
-
-  auto in_d = mk(input_c);
-  auto sx_d = mk(sum_x);
-  auto sx2_d = mk(sum_x2);
-
-  // sum(x) via MLX
-  haganeOpsSum(&in_d, &sx_d);
-
-  // sum(x^2) via MLX
-  Tensor x_sq = at::mul(input_c, input_c);
-  auto xsq_d = mk(x_sq);
-  haganeOpsSum(&xsq_d, &sx2_d);
-
-  // var = (sum(x^2) - sum(x)^2 / N) / (N - correction)
-  // All element-wise via haganeOps to avoid scalar dispatch
-  Tensor n_t = at::full_like(sum_x, static_cast<float>(N));
-  Tensor denom_t = at::full_like(sum_x, static_cast<float>(static_cast<double>(N) - correction));
-  Tensor sx_sq = at::mul(sum_x, sum_x);      // sum(x)^2
-  Tensor mean_sq_n = at::div(sx_sq, n_t);    // sum(x)^2 / N
-  Tensor var_num = at::sub(sum_x2, mean_sq_n);
-  Tensor var_result = at::div(var_num, denom_t);
-  if (take_sqrt) {
-    Tensor zero_t = at::zeros_like(var_result);
-    var_result = at::sqrt(at::maximum(var_result, zero_t));
-  }
-
-  // Write result to iterator's output
-  out_t.copy_(var_result);
-
-  // If 2 outputs (var_mean), compute mean → output 1
-  if (nout == 2) {
-    Tensor mean_result = at::div(sum_x, n_t);
-    iter.tensor(1).copy_(mean_result);
-  }
-}
+// X+24 — std_var_stub migrated to HaganeMetallibBridge.cpp via
+// ReduceStdVarOpConfig + hagane_unary_iter_stdvar_bridge<kStdVarCfg>.
+// haganeOpsVar (hagane/src/runtime/hagane_ops.cpp:971) is pure-MLX with a
+// full-axis branch (out_n==1 ⇒ mx::var(x, false)); bridge also threads
+// haganeOpsMean for the 2-output var_mean case. ADR-036 row 82.
 
 // GroupNormKernel (dispatched via DispatchStub from native_group_norm)
 void hagane_group_norm_kernel(
@@ -3079,248 +2555,78 @@ void hagane_group_norm_backward_kernel(
 }
 
 // Backward activation stubs — all use ATen ops on UMA (Metal GPU)
-void hagane_sigmoid_backward_kernel(TensorIteratorBase& iter) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& s = iter.tensor(2);
-  iter.tensor(0).copy_(at::mul(g, at::mul(s, at::sub(at::ones_like(s), s))));
-}
+// X+28 Lane A — sigmoid_backward / tanh_backward retired through bridge
+// (ADR-036 rows 93-94). See HaganeMetallibBridge.cpp.
 
-void hagane_tanh_backward_kernel(TensorIteratorBase& iter) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& t = iter.tensor(2);
-  iter.tensor(0).copy_(at::mul(g, hagane_rsub_scalar(at::mul(t, t), 1.0)));
-}
+// X+28 Lane B — elu_backward retired through bridge (ADR-036 row 96; formula
+// fixes vs the deleted kernel: `>=` → strict `>`, pos_grad = scale not
+// scale*input_scale). See hagane_ops.cpp:haganeOpsEluBackward.
 
-void hagane_elu_backward_kernel(TensorIteratorBase& iter,
-                                 const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, bool is_result) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& out_or_in = iter.tensor(2);
-  float a = alpha.toFloat();
-  float s = scale.toFloat();
-  float is_val = input_scale.toFloat();
-  if (is_result) {
-    // grad * (out >= 0 ? scale*input_scale : (out + alpha*scale)*input_scale)
-    auto pos_mask = at::ge(out_or_in, 0.0);
-    auto neg_grad = at::mul(at::add(out_or_in, a * s), is_val);
-    auto pos_grad = at::full_like(g, s * is_val);
-    iter.tensor(0).copy_(at::mul(g, at::where(pos_mask, pos_grad, neg_grad)));
-  } else {
-    auto pos_mask = at::ge(out_or_in, 0.0);
-    auto neg_grad = at::mul(at::mul(at::exp(at::mul(out_or_in, is_val)), a * s), is_val);
-    auto pos_grad = at::full_like(g, s * is_val);
-    iter.tensor(0).copy_(at::mul(g, at::where(pos_mask, pos_grad, neg_grad)));
-  }
-}
+// X+26-X+27 Lane B — 4 activation backwards retired through HaganeMetallibBridge.cpp:
+//   hardsigmoid_backward (ADR-036 row 89, X+26)
+//   leaky_relu_backward / hardswish_backward / mish_backward (ADR-036 rows 90-92, X+27)
+// Bridge route uses pure-MLX C-ABIs (hagane_ops.cpp:1651-1716) which bypass the
+// at::*-on-iter.tensor lazy-stash interaction that broke the retired kernels.
+// X+27 leaky_relu_backward_wrap inverts a/b to match Activation.cpp:190's
+// (self_or_result=INPUT, grad_output=GRAD) iter convention; X+26's "no-swap"
+// path was wrong (test harness was using slope=0 which masks the swap bug).
 
-void hagane_leaky_relu_backward_kernel(TensorIteratorBase& iter, const Scalar& negval) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& in = iter.tensor(2);
-  float neg = negval.toFloat();
-  auto mask = at::gt(in, 0.0);
-  iter.tensor(0).copy_(at::mul(g, at::where(mask, at::ones_like(g), at::full_like(g, neg))));
-}
+// X+28 Lane B — softplus_backward retired through bridge (ADR-036 row 97;
+// formula fix: `>=` → strict `>` at threshold). See haganeOpsSoftplusBackward.
 
-void hagane_hardswish_backward_kernel(TensorIterator& iter) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& in = iter.tensor(2);
-  // hardswish'(x) = 0 if x<=-3, 1 if x>=3, x/3 + 0.5 otherwise
-  auto lo = at::le(in, at::full_like(in, -3.0f));
-  auto hi = at::ge(in, at::full_like(in, 3.0f));
-  auto mid_grad = hagane_add_scalar(at::div(in, at::full_like(in, 3.0f)), 0.5);
-  auto grad_factor = at::where(lo, at::zeros_like(g), at::where(hi, at::ones_like(g), mid_grad));
-  iter.tensor(0).copy_(at::mul(g, grad_factor));
-}
+// X+28 Lane A — logit_backward retired through bridge (ADR-036 row 95).
+// See HaganeMetallibBridge.cpp + hagane_ops.cpp:haganeOpsLogitBackward.
 
-void hagane_hardsigmoid_backward_kernel(TensorIteratorBase& iter) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& in = iter.tensor(2);
-  // hardsigmoid'(x) = 1/6 if -3<x<3, 0 otherwise
-  auto mask = at::logical_and(at::gt(in, at::full_like(in, -3.0f)), at::lt(in, at::full_like(in, 3.0f)));
-  iter.tensor(0).copy_(at::mul(g, at::where(mask, at::full_like(g, 1.0f/6.0f), at::zeros_like(g))));
-}
+// Sprint X+20: hagane_{tan,acos,asin,atan,cosh,sinh,erfc}_kernel retired
+// (ADR-036 deletion log rows 42-48). These 7 kernels carried a brace-defect
+// bug — unbraced `if (haganeOps<Op>(...) != HAGANE_OPS_SUCCESS)` where only
+// HAGANE_BEFORE_RAW_READ() was conditional and the *_stub CPU call ran
+// unconditionally — so they were silently CPU-only since first commit.
+// Migrating through HaganeMetallibBridge.cpp's correctly-braced
+// hagane_kernel_bridge<Cfg> template fixes the bug as a structural side
+// effect. Dispatch now lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(<op>_stub, &hagane_kernel_bridge<k<Op>Cfg>).
+// (`hagane_frac_kernel` below has the same brace-defect pattern; deferred
+// to X+21 — see ADR-036 lesson #15.)
 
-void hagane_softplus_backward_kernel(TensorIteratorBase& iter, const Scalar& beta, const Scalar& threshold) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& in = iter.tensor(2);
-  float b = beta.toFloat();
-  float t = threshold.toFloat();
-  // softplus'(x) = sigmoid(beta*x) if beta*x < threshold, else 1
-  auto bx = at::mul(in, b);
-  auto sig = at::sigmoid(bx);
-  auto mask = at::ge(bx, t);
-  iter.tensor(0).copy_(at::mul(g, at::where(mask, at::ones_like(g), sig)));
-}
+// hagane_{lgamma,frac}_kernel retired by Sprint X+21 (ADR-036). Live in
+// HaganeMetallibBridge.cpp via OpConfig kLgammaCfg / kFracCfg +
+// hagane_kernel_bridge. lgamma's `haganeOpsLgamma` was fixed at
+// hagane/src/runtime/hagane_ops.cpp:1335 (`mx::eval(x)` →
+// `::haganeOpsFlush()`) to resolve the X+20 chained-input correctness bug
+// (lesson #15 resolved).
 
-void hagane_mish_backward_kernel(TensorIterator& iter) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& in = iter.tensor(2);
-  // mish = x * tanh(softplus(x))
-  // mish' = tanh(sp) + x * sigmoid(x) * sech^2(sp) where sp = softplus(x)
-  auto sp = at::log1p(at::exp(in));
-  auto tanh_sp = at::tanh(sp);
-  auto sig = at::sigmoid(in);
-  auto sech2 = hagane_rsub_scalar(at::mul(tanh_sp, tanh_sp), 1.0);
-  auto grad_factor = at::add(tanh_sp, at::mul(at::mul(in, sig), sech2));
-  iter.tensor(0).copy_(at::mul(g, grad_factor));
-}
+// X+24 — sinc_stub migrated to HaganeMetallibBridge.cpp via OpConfig kSincCfg
+// + hagane_kernel_bridge. New haganeOpsSinc C-ABI (hagane_ops.cpp) uses
+// mx::sin + double-where divide-by-zero guard. ADR-036 row 83.
 
-void hagane_logit_backward_kernel(TensorIteratorBase& iter, const Scalar& eps_scalar) {
-  const Tensor& g = iter.tensor(1);
-  const Tensor& in = iter.tensor(2);
-  // logit'(x) = 1 / (x * (1 - x)) clamped by eps
-  float eps = eps_scalar.toFloat();
-  Tensor x = in;
-  if (eps > 0) x = at::clamp(x, eps, 1.0f - eps);
-  auto grad_factor = at::reciprocal(at::mul(x, hagane_rsub_scalar(x, 1.0)));
-  iter.tensor(0).copy_(at::mul(g, grad_factor));
-}
+// X+25 — nan_to_num migrated to HaganeMetallibBridge.cpp via new
+// UnaryOptionalTripleOpConfig + hagane_unary_optional_triple_bridge. C-ABI
+// haganeOpsNanToNum composes mx::where over mx::isnan / mx::isinf masks.
+// ADR-036 row 88.
 
-// Unary math stubs — Metal GPU via MLX
-void hagane_tan_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsTan(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    tan_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_acos_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsAcos(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    acos_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_asin_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsAsin(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    asin_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_atan_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsAtan(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    atan_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_cosh_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsCosh(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    cosh_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_sinh_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsSinh(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    sinh_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_erfc_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsErfc(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    erfc_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_lgamma_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsLgamma(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    lgamma_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_frac_kernel(TensorIteratorBase& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsFrac(&in, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    frac_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_sinc_kernel(TensorIteratorBase& iter) {
-  // sinc(x) = sin(pi*x)/(pi*x), sinc(0) = 1
-  const Tensor& in = iter.tensor(1);
-  auto pix = at::mul(in, M_PI);
-  auto result = at::where(at::eq(in, 0.0), at::ones_like(in), at::div(at::sin(pix), pix));
-  iter.tensor(0).copy_(result);
-}
-
-void hagane_nan_to_num_kernel(TensorIteratorBase& iter,
-                               std::optional<double> nan_val,
-                               std::optional<double> pos_inf_val,
-                               std::optional<double> neg_inf_val) {
-  const Tensor& in = iter.tensor(1);
-  auto result = in.clone();
-  auto nan_mask = at::isnan(result);
-  if (nan_mask.any().item<bool>())
-    result.masked_fill_(nan_mask, nan_val.value_or(0.0));
-  auto inf_mask = at::isinf(result);
-  if (inf_mask.any().item<bool>()) {
-    auto pos = at::logical_and(inf_mask, at::gt(result, 0.0));
-    auto neg = at::logical_and(inf_mask, at::lt(result, 0.0));
-    double pval = pos_inf_val.value_or(std::numeric_limits<double>::max());
-    double nval = neg_inf_val.value_or(std::numeric_limits<double>::lowest());
-    result.masked_fill_(pos, pval);
-    result.masked_fill_(neg, nval);
-  }
-  iter.tensor(0).copy_(result);
-}
-
-void hagane_signbit_kernel(TensorIteratorBase& iter) {
-  const Tensor& in = iter.tensor(1);
-  iter.tensor(0).copy_(at::lt(in, 0.0));
-}
+// X+24 — signbit_stub migrated to HaganeMetallibBridge.cpp via OpConfig
+// kSignbitCfg + hagane_kernel_bridge. New haganeOpsSignbit C-ABI
+// (hagane_ops.cpp) uses mx::less(x, 0); preserves the retired kernel's
+// -0.0→false semantics (vs PyTorch sign-bit reference). ADR-036 row 84.
 
 // ---------------------------------------------------------------------------
 // Batch 11: Missing dispatch stubs — binary ops
 // ---------------------------------------------------------------------------
 
-void hagane_fmax_kernel(TensorIteratorBase& iter) {
-  const Tensor& a = iter.tensor(1);
-  const Tensor& b = iter.tensor(2);
-  auto a_nan = at::isnan(a);
-  auto b_nan = at::isnan(b);
-  iter.tensor(0).copy_(at::where(a_nan, b, at::where(b_nan, a, at::maximum(a, b))));
-}
+// X+23 — fmax_stub / fmin_stub migrated to HaganeMetallibBridge.cpp via
+// hagane_binary_bridge<kFmaxCfg/kFminCfg>. New runtime C-ABIs
+// (haganeOpsFmax / haganeOpsFmin in hagane/src/runtime/hagane_ops.cpp) use
+// NaN-aware MLX composition: mx::where(isnan(a), b, mx::where(isnan(b), a,
+// mx::maximum/minimum(a, b))). Retired bodies were pure at::* composition
+// running CPU-bound. ADR-036 rows 80-81.
 
-void hagane_fmin_kernel(TensorIteratorBase& iter) {
-  const Tensor& a = iter.tensor(1);
-  const Tensor& b = iter.tensor(2);
-  auto a_nan = at::isnan(a);
-  auto b_nan = at::isnan(b);
-  iter.tensor(0).copy_(at::where(a_nan, b, at::where(b_nan, a, at::minimum(a, b))));
-}
-
-void hagane_max_elementwise_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsMaximum(&a, &b, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    max_elementwise_stub(c10::DeviceType::CPU, iter);
-}
-
-void hagane_min_elementwise_kernel(TensorIterator& iter) {
-  auto out = make_ops_tensor(iter, 0);
-  at::Tensor sa, sb;
-  auto a = make_ops_tensor_or_scalar(iter, 1, sa);
-  auto b = make_ops_tensor_or_scalar(iter, 2, sb);
-  if (haganeOpsMinimum(&a, &b, &out) != HAGANE_OPS_SUCCESS)
-    HAGANE_BEFORE_RAW_READ();
-    min_elementwise_stub(c10::DeviceType::CPU, iter);
-}
+// hagane_{max,min}_elementwise_kernel retired by Sprint X+21 (ADR-036). These
+// had the brace-defect dispatch bug (silently CPU-only since first commit)
+// AND were never wired via REGISTER_DISPATCH in HaganeOps.cpp — they were
+// orphaned dead code. Bridge migration both retires the dead bodies and
+// installs a working REGISTER_DISPATCH (HaganeMetallibBridge.cpp
+// kMaxElemCfg / kMinElemCfg + hagane_binary_bridge).
 
 void hagane_smooth_l1_kernel(TensorIteratorBase& iter, double beta) {
   const Tensor& a = iter.tensor(1);
@@ -3477,14 +2783,16 @@ void hagane_addcmul_kernel(TensorIteratorBase& iter, const Scalar& value) {
   const Tensor& self = iter.tensor(1);
   const Tensor& t1 = iter.tensor(2);
   const Tensor& t2 = iter.tensor(3);
-  iter.tensor(0).copy_(at::add(self, at::mul(at::mul(t1, t2), value)));
+  auto v = at::scalar_tensor(value, self.options());
+  iter.tensor(0).copy_(at::add(self, at::mul(at::mul(t1, t2), v)));
 }
 
 void hagane_addcdiv_kernel(TensorIteratorBase& iter, const Scalar& value) {
   const Tensor& self = iter.tensor(1);
   const Tensor& t1 = iter.tensor(2);
   const Tensor& t2 = iter.tensor(3);
-  iter.tensor(0).copy_(at::add(self, at::mul(at::div(t1, t2), value)));
+  auto v = at::scalar_tensor(value, self.options());
+  iter.tensor(0).copy_(at::add(self, at::mul(at::div(t1, t2), v)));
 }
 
 void hagane_smooth_l1_backward_kernel(TensorIterator& iter, const Scalar& norm, double beta) {
@@ -3518,12 +2826,9 @@ void hagane_mse_backward_kernel(TensorIterator& iter, const Scalar& norm) {
 // Batch 11: Missing dispatch stubs — activation ops
 // ---------------------------------------------------------------------------
 
-void hagane_hardtanh_backward_kernel(TensorIterator& iter, const Scalar& min_val, const Scalar& max_val) {
-  const Tensor& grad = iter.tensor(1);
-  const Tensor& self = iter.tensor(2);
-  auto mask = at::logical_and(at::ge(self, min_val), at::le(self, max_val));
-  iter.tensor(0).copy_(at::where(mask, grad, at::zeros_like(grad)));
-}
+// X+28 Lane B — hardtanh_backward retired through bridge (ADR-036 row 98;
+// formula fix: inclusive `>=`/`<=` → strict `>`/`<` at min/max boundaries).
+// See haganeOpsHardtanhBackward.
 
 void hagane_prelu_kernel(TensorIterator& iter) {
   const Tensor& input = iter.tensor(1);
@@ -3622,9 +2927,9 @@ void hagane_conj_physical_kernel(TensorIteratorBase& iter) {
   iter.tensor(0).copy_(iter.tensor(1));
 }
 
-void hagane_sgn_kernel(TensorIteratorBase& iter) {
-  iter.tensor(0).copy_(at::sign(iter.tensor(1)));
-}
+// Sprint X+16: hagane_sgn_kernel deleted (ADR-036 deletion log row 4).
+// sgn_stub dispatch now lives in HaganeMetallibBridge.cpp via
+// REGISTER_DISPATCH(sgn_stub, &hagane_kernel_bridge<kSgnCfg>).
 
 void hagane_round_decimals_kernel(TensorIteratorBase& iter, int64_t decimals) {
   const Tensor& in = iter.tensor(1);
@@ -3713,13 +3018,10 @@ void hagane_xor_sum_kernel(TensorIterator& iter) {
   iter.tensor(0).copy_(flat.squeeze());
 }
 
-// hagane_norm_kernel already defined above (line ~2381)
-
-void hagane_powsum_kernel(TensorIterator& iter, const Scalar& p) {
-  const Tensor& in = iter.tensor(1);
-  double pval = p.toDouble();
-  iter.tensor(0).copy_(at::sum(at::pow(at::abs(in), pval)));
-}
+// X+23 — powsum_stub migrated to HaganeMetallibBridge.cpp via
+// ReduceFlagOpConfig + hagane_unary_iter_flag_bridge<kPowsumCfg>. ADR-036
+// row 79. The retired CPU body called at::sum(at::pow(at::abs(in), pval));
+// bridge route now uses haganeOpsPowsum (pure-MLX, GPU-resident).
 
 // ---------------------------------------------------------------------------
 // Batch 11: Missing dispatch stubs — isin
@@ -3729,6 +3031,40 @@ void hagane_isin_default_kernel(const Tensor& elements, const Tensor& test_eleme
   auto cpu_e = elements.to(at::kCPU);
   auto cpu_t = test_elements.to(at::kCPU);
   out.copy_(at::isin(cpu_e, cpu_t, invert).to(out.device()));
+}
+
+// ---------------------------------------------------------------------------
+// Sprint X+6 Lane A — cdist_stub / pdist_forward_stub wrappers.
+// torch.cdist / torch.pdist route through Distance.cpp's DispatchStub
+// (cdist_stub / pdist_forward_stub), not aten::_cdist_forward / aten::_pdist_forward
+// directly. The TORCH_LIBRARY_IMPL handlers at the bottom of this file are
+// belt-and-suspenders for refs paths; REGISTER_DISPATCH is what actually
+// satisfies the public API call sites.
+// ---------------------------------------------------------------------------
+
+void hagane_cdist_dispatch_kernel(at::Tensor& result, const at::Tensor& x1,
+                                  const at::Tensor& x2, const double p) {
+  auto x1_d  = make_tensor_desc(x1);
+  auto x2_d  = make_tensor_desc(x2);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsCdist(&x1_d, &x2_d, p, &out_d) != HAGANE_OPS_SUCCESS) {
+    auto cpu_result = at::cdist(x1.cpu(), x2.cpu(), p);
+    HAGANE_BEFORE_RAW_READ();
+    std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
+}
+
+void hagane_pdist_forward_dispatch_kernel(at::Tensor& result, const at::Tensor& self,
+                                          const double p) {
+  auto in_d  = make_tensor_desc(self);
+  auto out_d = make_tensor_desc(result);
+  if (haganeOpsPdist(&in_d, p, &out_d) != HAGANE_OPS_SUCCESS) {
+    auto cpu_result = at::pdist(self.cpu(), p);
+    HAGANE_BEFORE_RAW_READ();
+    std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
 }
 
 } // anonymous namespace
@@ -3752,100 +3088,78 @@ REGISTER_DISPATCH(fill_stub, &hagane_fill_kernel)
 // ---------------------------------------------------------------------------
 
 // Binary (includes stubs whose DEFINE_DISPATCH we now own above)
-REGISTER_DISPATCH(add_stub, &hagane_add_kernel)
-REGISTER_DISPATCH(sub_stub, &hagane_sub_kernel)
-REGISTER_DISPATCH(mul_stub, &hagane_mul_kernel)
-REGISTER_DISPATCH(div_true_stub, &hagane_div_true_kernel)
-REGISTER_DISPATCH(div_trunc_stub, &hagane_div_trunc_kernel)
-REGISTER_DISPATCH(div_floor_stub, &hagane_div_floor_kernel)
+// Sprint X+19: add_stub/sub_stub moved to HaganeMetallibBridge.cpp via
+// BinaryAlphaOpConfig kAddCfg/kSubCfg + hagane_binary_alpha_bridge.
+// Sprint X+18: mul_stub moved to HaganeMetallibBridge.cpp (kMulCfg).
+// Sprint X+19: div_true/div_trunc/div_floor_stub moved to
+// HaganeMetallibBridge.cpp (kDivTrueCfg/kDivTruncCfg/kDivFloorCfg).
 
 // Comparison
-REGISTER_DISPATCH(eq_stub, &hagane_eq_kernel)
-REGISTER_DISPATCH(ne_stub, &hagane_ne_kernel)
-REGISTER_DISPATCH(lt_stub, &hagane_lt_kernel)
-REGISTER_DISPATCH(gt_stub, &hagane_gt_kernel)
-REGISTER_DISPATCH(le_stub, &hagane_le_kernel)
-REGISTER_DISPATCH(ge_stub, &hagane_ge_kernel)
+// Sprint X+18: eq/ne/lt/gt/le/ge_stub moved to HaganeMetallibBridge.cpp
+// (kEqCfg/kNeCfg/kLtCfg/kGtCfg/kLeCfg/kGeCfg).
 REGISTER_DISPATCH(where_kernel, &hagane_where_kernel)
 
 // Unary
-REGISTER_DISPATCH(neg_stub, &hagane_neg_kernel)
-REGISTER_DISPATCH(abs_stub, &hagane_abs_kernel)
-REGISTER_DISPATCH(exp_stub, &hagane_exp_kernel)
-REGISTER_DISPATCH(sqrt_stub, &hagane_sqrt_kernel)
-REGISTER_DISPATCH(tanh_stub, &hagane_tanh_kernel)
-REGISTER_DISPATCH(sigmoid_stub, &hagane_sigmoid_kernel)
-REGISTER_DISPATCH(log_stub, &hagane_log_kernel)
-REGISTER_DISPATCH(sin_stub, &hagane_sin_kernel)
-REGISTER_DISPATCH(cos_stub, &hagane_cos_kernel)
-REGISTER_DISPATCH(ceil_stub, &hagane_ceil_kernel)
-REGISTER_DISPATCH(round_stub, &hagane_round_kernel)
-REGISTER_DISPATCH(erf_stub, &hagane_erf_kernel)
-REGISTER_DISPATCH(log2_stub, &hagane_log2_kernel)
-REGISTER_DISPATCH(log10_stub, &hagane_log10_kernel)
-REGISTER_DISPATCH(log1p_stub, &hagane_log1p_kernel)
-REGISTER_DISPATCH(expm1_stub, &hagane_expm1_kernel)
-REGISTER_DISPATCH(tan_stub, &hagane_tan_kernel)
-REGISTER_DISPATCH(acos_stub, &hagane_acos_kernel)
-REGISTER_DISPATCH(asin_stub, &hagane_asin_kernel)
-REGISTER_DISPATCH(atan_stub, &hagane_atan_kernel)
-REGISTER_DISPATCH(erfc_stub, &hagane_erfc_kernel)
-REGISTER_DISPATCH(lgamma_stub, &hagane_lgamma_kernel)
+// Sprint X+16: REGISTER_DISPATCH(neg_stub, &hagane_neg_kernel) moved to
+// HaganeMetallibBridge.cpp; neg_stub is now bound there.
+// Sprint X+15: REGISTER_DISPATCH(abs_stub, &hagane_abs_kernel) moved to
+// HaganeMetallibBridge.cpp; abs_stub is now bound there.
+// Sprint X+17: REGISTER_DISPATCH for exp/log/sqrt/sin/cos/ceil/tanh/sigmoid
+// _stub moved to HaganeMetallibBridge.cpp (kernels deleted, bridge owns
+// dispatch via hagane_kernel_bridge<...>). See ADR-036 rows 5-9, 10-13.
+// Sprint X+19: REGISTER_DISPATCH for round/erf/log2/log10/log1p_stub moved
+// to HaganeMetallibBridge.cpp (kRoundCfg/kErfCfg/kLog2Cfg/kLog10Cfg/kLog1pCfg).
+// Sprint X+20: REGISTER_DISPATCH for expm1/tan/acos/asin/atan/erfc_stub
+// moved to HaganeMetallibBridge.cpp (kExpm1Cfg + 5 brace-defect Cfgs).
+// Sprint X+21: REGISTER_DISPATCH(lgamma_stub, ...) moved to
+// HaganeMetallibBridge.cpp (kLgammaCfg) after the haganeOpsLgamma C-ABI
+// flush fix (hagane/src/runtime/hagane_ops.cpp:1335).
 REGISTER_DISPATCH(erfinv_stub, &hagane_erfinv_kernel)
 
 // Activations
-REGISTER_DISPATCH(silu_stub, &hagane_silu_kernel)
+// Sprint X+20: REGISTER_DISPATCH(silu_stub, ...) moved to
+// HaganeMetallibBridge.cpp (kSiluCfg). silu_backward stays here (CPU-only).
 REGISTER_DISPATCH(silu_backward_stub, &hagane_silu_backward_kernel)
 
 // Additional unary
-REGISTER_DISPATCH(reciprocal_stub, &hagane_reciprocal_kernel)
-REGISTER_DISPATCH(rsqrt_stub, &hagane_rsqrt_kernel)
-REGISTER_DISPATCH(floor_stub, &hagane_floor_kernel)
-REGISTER_DISPATCH(trunc_stub, &hagane_trunc_kernel)
-REGISTER_DISPATCH(sign_stub, &hagane_sign_kernel)
+// Sprint X+19: REGISTER_DISPATCH for reciprocal/rsqrt/trunc_stub moved to
+// HaganeMetallibBridge.cpp (kReciprocalCfg/kRsqrtCfg/kTruncCfg).
+// Sprint X+17: REGISTER_DISPATCH(floor_stub, &hagane_floor_kernel) moved
+// to HaganeMetallibBridge.cpp; floor_stub is now bound there.
+// Sprint X+16: REGISTER_DISPATCH(sign_stub, &hagane_sign_kernel) moved to
+// HaganeMetallibBridge.cpp; sign_stub is now bound there.
 
 // Batch 1: additional unary
-REGISTER_DISPATCH(exp2_stub, &hagane_exp2_kernel)
-REGISTER_DISPATCH(bitwise_not_stub, &hagane_bitwise_not_kernel)
-REGISTER_DISPATCH(logical_not_stub, &hagane_logical_not_kernel)
+// Sprint X+19: REGISTER_DISPATCH(exp2_stub, ...) moved to
+// HaganeMetallibBridge.cpp (kExp2Cfg).
+// Sprint X+20: REGISTER_DISPATCH for bitwise_not/logical_not_stub moved to
+// HaganeMetallibBridge.cpp (kBitwiseNotCfg/kLogicalNotCfg).
 
 // Batch 1: additional binary
-REGISTER_DISPATCH(atan2_stub, &hagane_atan2_kernel)
-REGISTER_DISPATCH(pow_tensor_tensor_stub, &hagane_pow_tt_kernel)
-REGISTER_DISPATCH(pow_tensor_scalar_stub, &hagane_pow_ts_kernel)
-REGISTER_DISPATCH(remainder_stub, &hagane_remainder_kernel)
-REGISTER_DISPATCH(fmod_stub, &hagane_fmod_kernel)
-REGISTER_DISPATCH(bitwise_and_stub, &hagane_bitwise_and_kernel)
-REGISTER_DISPATCH(bitwise_or_stub, &hagane_bitwise_or_kernel)
-REGISTER_DISPATCH(bitwise_xor_stub, &hagane_bitwise_xor_kernel)
-REGISTER_DISPATCH(logical_and_stub, &hagane_logical_and_kernel)
-REGISTER_DISPATCH(logical_or_stub, &hagane_logical_or_kernel)
-REGISTER_DISPATCH(logical_xor_stub, &hagane_logical_xor_kernel)
-REGISTER_DISPATCH(maximum_stub, &hagane_maximum_kernel)
-REGISTER_DISPATCH(minimum_stub, &hagane_minimum_kernel)
-REGISTER_DISPATCH(copysign_stub, &hagane_copysign_kernel)
+// Sprint X+19: REGISTER_DISPATCH for atan2/pow_tensor_tensor/remainder/fmod
+// _stub moved to HaganeMetallibBridge.cpp (kAtan2Cfg/kPowTtCfg/kRemainderCfg/
+// kFmodCfg).
+// Sprint X+20: REGISTER_DISPATCH(pow_tensor_scalar_stub, ...) moved to
+// HaganeMetallibBridge.cpp via the new UnaryScalarOpConfig variant (kPowTsCfg).
+// Sprint X+21: REGISTER_DISPATCH for bitwise_and/or/xor + logical_and/or/xor +
+// maximum/minimum/copysign_stub moved to HaganeMetallibBridge.cpp via 9
+// BinaryOpConfig rows. max/min_elementwise_stub also registered there (the
+// HaganeOps.cpp definitions were orphaned dead code — brace-defect AND
+// never wired via REGISTER_DISPATCH here).
 
 // Batch 1: activations
 REGISTER_DISPATCH(threshold_stub, &hagane_threshold_kernel)
 REGISTER_DISPATCH(elu_stub, &hagane_elu_kernel)
 REGISTER_DISPATCH(softplus_stub, &hagane_softplus_kernel)
-REGISTER_DISPATCH(leaky_relu_stub, &hagane_leaky_relu_kernel)
-REGISTER_DISPATCH(hardsigmoid_stub, &hagane_hardsigmoid_kernel)
-REGISTER_DISPATCH(hardswish_stub, &hagane_hardswish_kernel)
-REGISTER_DISPATCH(mish_stub, &hagane_mish_kernel)
-REGISTER_DISPATCH(hardshrink_stub, &hagane_hardshrink_kernel)
-REGISTER_DISPATCH(softshrink_stub, &hagane_softshrink_kernel)
-
-// Reductions (MLX GPU)
-REGISTER_DISPATCH(sum_stub, &hagane_sum_kernel)
-REGISTER_DISPATCH(mean_stub, &hagane_mean_kernel)
-REGISTER_DISPATCH(prod_stub, &hagane_prod_kernel)
-REGISTER_DISPATCH(argmax_stub, &hagane_argmax_kernel)
-REGISTER_DISPATCH(argmin_stub, &hagane_argmin_kernel)
-REGISTER_DISPATCH(max_values_stub, &hagane_max_values_kernel)
-REGISTER_DISPATCH(min_values_stub, &hagane_min_values_kernel)
-REGISTER_DISPATCH(and_stub, &hagane_and_kernel)
-REGISTER_DISPATCH(or_stub, &hagane_or_kernel)
+// Sprint X+20: REGISTER_DISPATCH for leaky_relu/hardshrink/softshrink_stub
+// moved to HaganeMetallibBridge.cpp via UnaryScalarOpConfig (kLeakyReluCfg /
+// kHardshrinkCfg / kSoftshrinkCfg). REGISTER_DISPATCH for hardsigmoid/mish_stub
+// moved via OpConfig (kHardsigmoidCfg / kMishCfg).
+// Sprint X+22: REGISTER_DISPATCH for hardswish_stub + 9 reductions
+// (sum/mean/prod/argmax/argmin/max_values/min_values/and/or) moved to
+// HaganeMetallibBridge.cpp via UnaryIterOpConfig (kHardswishCfg / kSumCfg /
+// kMeanCfg / kProdCfg / kArgmaxCfg / kArgminCfg / kMaxValuesCfg /
+// kMinValuesCfg / kAndCfg / kOrCfg).
 // norm_stub registered by hip/ReduceOps.cpp
 
 // Clamp
@@ -3854,7 +3168,8 @@ REGISTER_DISPATCH(or_stub, &hagane_or_kernel)
 // which calls our C10_EXPORT max_all_launch_kernel/min_all_launch_kernel
 
 // Logit, Where (wiring existing hagane_ops C API)
-REGISTER_DISPATCH(logit_stub, &hagane_logit_kernel)
+// Sprint X+20: REGISTER_DISPATCH(logit_stub, ...) moved to
+// HaganeMetallibBridge.cpp via UnaryScalarOpConfig (kLogitCfg).
 
 // Batch 2: Gather/Scatter
 REGISTER_DISPATCH(gather_stub, &hagane_gather_kernel)
@@ -3892,33 +3207,38 @@ REGISTER_DISPATCH(random_stub, &hagane_random_kernel)
 REGISTER_DISPATCH(log_normal_stub, &hagane_log_normal_kernel)
 
 // Batch 10: Critical missing stubs
-REGISTER_DISPATCH(std_var_stub, &hagane_std_var_kernel)
+// X+24 — std_var_stub retired (ADR-036 row 82). Bound via
+// HaganeMetallibBridge.cpp REGISTER_DISPATCH(std_var_stub,
+// &hagane_unary_iter_stdvar_bridge<kStdVarCfg>).
 // LayerNormKernel not needed — PyTorch dispatches to layer_norm_cuda (C10_EXPORT) for CUDA
 REGISTER_DISPATCH(GroupNormKernel, &hagane_group_norm_kernel)
 REGISTER_DISPATCH(GroupNormBackwardKernel, &hagane_group_norm_backward_kernel)
 
 // Batch 10: Backward activation stubs
-REGISTER_DISPATCH(sigmoid_backward_stub, &hagane_sigmoid_backward_kernel)
-REGISTER_DISPATCH(tanh_backward_stub, &hagane_tanh_backward_kernel)
-REGISTER_DISPATCH(elu_backward_stub, &hagane_elu_backward_kernel)
-REGISTER_DISPATCH(leaky_relu_backward_stub, &hagane_leaky_relu_backward_kernel)
-REGISTER_DISPATCH(hardswish_backward_stub, &hagane_hardswish_backward_kernel)
-REGISTER_DISPATCH(hardsigmoid_backward_stub, &hagane_hardsigmoid_backward_kernel)
-REGISTER_DISPATCH(softplus_backward_stub, &hagane_softplus_backward_kernel)
-REGISTER_DISPATCH(mish_backward_stub, &hagane_mish_backward_kernel)
-REGISTER_DISPATCH(logit_backward_stub, &hagane_logit_backward_kernel)
+// X+26-X+28 — all activation backwards retired through HaganeMetallibBridge.cpp:
+//   hardsigmoid_backward (X+26, row 89)
+//   leaky_relu_backward / hardswish_backward / mish_backward (X+27, rows 90-92)
+//   sigmoid_backward / tanh_backward / logit_backward (X+28 Lane A, rows 93-95)
+//   elu_backward / softplus_backward / hardtanh_backward (X+28 Lane B, rows 96-98;
+//     with strict-inequality formula fixes vs the retired kernels)
 
 // Batch 10: Unary math stubs
-REGISTER_DISPATCH(cosh_stub, &hagane_cosh_kernel)
-REGISTER_DISPATCH(sinh_stub, &hagane_sinh_kernel)
-REGISTER_DISPATCH(frac_stub, &hagane_frac_kernel)
-REGISTER_DISPATCH(sinc_stub, &hagane_sinc_kernel)
-REGISTER_DISPATCH(nan_to_num_stub, &hagane_nan_to_num_kernel)
-REGISTER_DISPATCH(signbit_stub, &hagane_signbit_kernel)
+// Sprint X+20: REGISTER_DISPATCH for cosh/sinh_stub moved to
+// HaganeMetallibBridge.cpp (kCoshCfg/kSinhCfg) — brace-defect bug-fix-by-
+// migration; see ADR-036 lesson #15.
+// Sprint X+21: REGISTER_DISPATCH(frac_stub, ...) moved to
+// HaganeMetallibBridge.cpp (kFracCfg) — second brace-defect bug-fix-by-
+// migration batch.
+// X+24 — sinc_stub / signbit_stub retired (ADR-036 rows 83-84). Bound via
+// HaganeMetallibBridge.cpp REGISTER_DISPATCH(*_stub,
+// &hagane_kernel_bridge<kSincCfg / kSignbitCfg>).
+// X+25 — nan_to_num_stub retired (ADR-036 row 88). Bound via
+// HaganeMetallibBridge.cpp REGISTER_DISPATCH(nan_to_num_stub,
+// &hagane_unary_optional_triple_bridge<kNanToNumCfg>).
 
 // Batch 11: Binary ops
-REGISTER_DISPATCH(fmax_stub, &hagane_fmax_kernel)
-REGISTER_DISPATCH(fmin_stub, &hagane_fmin_kernel)
+// X+23 — fmax_stub, fmin_stub retired (ADR-036 rows 80-81). Now bound via
+// HaganeMetallibBridge.cpp REGISTER_DISPATCH(*_stub, &hagane_binary_bridge<kF{max,min}Cfg>).
 REGISTER_DISPATCH(smooth_l1_stub, &hagane_smooth_l1_kernel)
 REGISTER_DISPATCH(huber_stub, &hagane_huber_kernel)
 REGISTER_DISPATCH(mse_stub, &hagane_mse_kernel)
@@ -3932,6 +3252,10 @@ REGISTER_DISPATCH(lshift_stub, &hagane_lshift_kernel)
 REGISTER_DISPATCH(rshift_stub, &hagane_rshift_kernel)
 REGISTER_DISPATCH(ldexp_stub, &hagane_ldexp_kernel)
 REGISTER_DISPATCH(add_clamp_stub, &hagane_add_clamp_kernel)
+REGISTER_DISPATCH(clamp_stub, &hagane_clamp_kernel)
+REGISTER_DISPATCH(clamp_scalar_stub, &hagane_clamp_scalar_kernel)
+REGISTER_DISPATCH(clamp_min_scalar_stub, &hagane_clamp_min_scalar_kernel)
+REGISTER_DISPATCH(clamp_max_scalar_stub, &hagane_clamp_max_scalar_kernel)
 REGISTER_DISPATCH(gcd_stub, &hagane_gcd_kernel)
 REGISTER_DISPATCH(lcm_stub, &hagane_lcm_kernel)
 REGISTER_DISPATCH(nextafter_stub, &hagane_nextafter_kernel)
@@ -3955,7 +3279,7 @@ REGISTER_DISPATCH(huber_backward_stub, &hagane_huber_backward_kernel)
 REGISTER_DISPATCH(mse_backward_stub, &hagane_mse_backward_kernel)
 
 // Batch 11: Activation ops
-REGISTER_DISPATCH(hardtanh_backward_stub, &hagane_hardtanh_backward_kernel)
+// X+28 Lane B — hardtanh_backward_stub registered in HaganeMetallibBridge.cpp.
 REGISTER_DISPATCH(prelu_stub, &hagane_prelu_kernel)
 REGISTER_DISPATCH(prelu_backward_stub, &hagane_prelu_backward_kernel)
 REGISTER_DISPATCH(glu_stub, &hagane_glu_kernel)
@@ -3973,7 +3297,8 @@ REGISTER_DISPATCH(i0_stub, &hagane_i0_kernel)
 REGISTER_DISPATCH(frexp_stub, &hagane_frexp_kernel)
 REGISTER_DISPATCH(angle_stub, &hagane_angle_kernel)
 REGISTER_DISPATCH(conj_physical_stub, &hagane_conj_physical_kernel)
-REGISTER_DISPATCH(sgn_stub, &hagane_sgn_kernel)
+// Sprint X+16: REGISTER_DISPATCH(sgn_stub, &hagane_sgn_kernel) moved to
+// HaganeMetallibBridge.cpp; sgn_stub is now bound there.
 REGISTER_DISPATCH(round_decimals_stub, &hagane_round_decimals_kernel)
 REGISTER_DISPATCH(polygamma_stub, &hagane_polygamma_kernel)
 REGISTER_DISPATCH(special_entr_stub, &hagane_special_entr_kernel)
@@ -3999,8 +3324,13 @@ REGISTER_DISPATCH(special_spherical_bessel_j0_stub, &hagane_special_spherical_be
 // Batch 11: Reduce ops
 REGISTER_DISPATCH(nansum_stub, &hagane_nansum_kernel)
 REGISTER_DISPATCH(xor_sum_stub, &hagane_xor_sum_kernel)
-REGISTER_DISPATCH(norm_stub, &hagane_norm_kernel)
-REGISTER_DISPATCH(powsum_stub, &hagane_powsum_kernel)
+// X+23 — norm_stub, powsum_stub retired (ADR-036 rows 78-79). Now bound via
+// HaganeMetallibBridge.cpp REGISTER_DISPATCH(*_stub, &hagane_unary_iter_flag_bridge<kNormCfg/kPowsumCfg>).
+
+// Sprint X+6 Lane A — Distance stubs. torch.cdist / torch.pdist route here,
+// not through aten::_cdist_forward / aten::_pdist_forward dispatcher entries.
+REGISTER_DISPATCH(cdist_stub, &hagane_cdist_dispatch_kernel)
+REGISTER_DISPATCH(pdist_forward_stub, &hagane_pdist_forward_dispatch_kernel)
 
 // Batch 11: Compare ops
 
@@ -4115,17 +3445,16 @@ TORCH_IMPL_FUNC(avg_pool2d_out_cuda)
 }
 
 TORCH_IMPL_FUNC(avg_pool2d_backward_out_cuda)
-(const Tensor& gradOutput_, const Tensor& input_, IntArrayRef kernel_size,
+(const Tensor& gradOutput, const Tensor& input, IntArrayRef kernel_size,
  IntArrayRef stride, IntArrayRef padding, bool ceil_mode, bool count_include_pad,
  std::optional<int64_t> divisor_override, const Tensor& gradInput) {
-  auto gradOutput = gradOutput_.contiguous();
+  // X+31 Lane C — stub-redirect via DispatchStub → bridge → C-ABI.
   int kH = kernel_size[0], kW = kernel_size.size() > 1 ? kernel_size[1] : kH;
   int dH = stride.empty() ? kH : stride[0], dW = stride.empty() ? kW : (stride.size() > 1 ? stride[1] : dH);
   int padH = padding[0], padW = padding.size() > 1 ? padding[1] : padH;
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  haganeOpsAvgPool2dBackward(&gd, &gid, kH, kW, dH, dW, padH, padW,
-                             count_include_pad ? 1 : 0, divisor_override.value_or(0));
+  gradInput.zero_();
+  at::native::avg_pool2d_backward_kernel(kCUDA, gradInput, gradOutput,
+      kW, kH, dW, dH, padW, padH, count_include_pad, divisor_override);
 }
 
 TORCH_IMPL_FUNC(avg_pool3d_out_cuda)
@@ -4145,6 +3474,10 @@ TORCH_IMPL_FUNC(avg_pool3d_backward_out_cuda)
 (const Tensor& gradOutput_, const Tensor& input_, IntArrayRef kernel_size,
  IntArrayRef stride, IntArrayRef padding, bool ceil_mode, bool count_include_pad,
  std::optional<int64_t> divisor_override, const Tensor& gradInput) {
+  // X+31 Lane C — NOT retired: upstream avg_pool3d_backward_kernel has
+  // DECLARE_DISPATCH (Pool.h:40) but NO DEFINE_DISPATCH (verified via grep).
+  // The stub symbol doesn't exist at link time; routing through it produces
+  // symbol-not-found at runtime. Defer until upstream gap closes.
   auto gradOutput = gradOutput_.contiguous();
   int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
   int dD = stride.empty() ? kD : stride[0], dH = stride.empty() ? kH : stride[1], dW = stride.empty() ? kW : stride[2];
@@ -4233,14 +3566,13 @@ TORCH_IMPL_FUNC(max_pool2d_with_indices_out_cuda)
 }
 
 TORCH_IMPL_FUNC(max_pool2d_with_indices_backward_out_cuda)
-(const Tensor& gradOutput_, const Tensor& input_, IntArrayRef kernel_size,
+(const Tensor& gradOutput, const Tensor& input, IntArrayRef kernel_size,
  IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation, bool ceil_mode,
- const Tensor& indices_, const Tensor& gradInput) {
-  auto gradOutput = gradOutput_.contiguous();
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  auto iid = make_tensor_desc(indices_);
-  haganeOpsMaxPool2dBackward(&gd, &gid, &iid);
+ const Tensor& indices, const Tensor& gradInput) {
+  // X+32 Lane A — stub-redirect retirement (ADR-036 row 111). Bridge owns the
+  // dispatch via REGISTER_DISPATCH(max_pool2d_backward_kernel) in
+  // HaganeMetallibBridge.cpp; C-ABI carries X+29 fix template.
+  at::native::max_pool2d_backward_kernel(kCUDA, gradInput, gradOutput, indices);
 }
 
 // Max pool 3D (C10_EXPORT)
@@ -4280,12 +3612,10 @@ C10_EXPORT Tensor& max_pool3d_with_indices_backward_out_cuda(
     const Tensor& gradOutput, const Tensor& input, IntArrayRef kernel_size,
     IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation,
     bool ceil_mode, const Tensor& indices, Tensor& gradInput) {
+  // X+31 Lane C — stub-redirect via DispatchStub → bridge → C-ABI.
   gradInput.resize_as_(input);
   gradInput.zero_();
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  auto iid = make_tensor_desc(indices);
-  haganeOpsMaxPool3dBackward(&gd, &gid, &iid);
+  at::native::max_pool3d_backward_kernel(kCUDA, gradInput, gradOutput, indices);
   return gradInput;
 }
 
@@ -4487,18 +3817,65 @@ TORCH_IMPL_FUNC(name##_backward_out_cuda)( \
 
 UPSAMPLE_NEAREST_FWD(upsample_nearest1d, 1)
 UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact1d, 1)
-UPSAMPLE_NEAREST_BWD(upsample_nearest1d, 1)
-UPSAMPLE_NEAREST_BWD(_upsample_nearest_exact1d, 1)
+// X+30 Lane D — `upsample_nearest1d_backward` retired via stub-redirect
+// mechanism (ADR-036 row 100); see Lane C comment below.
+TORCH_IMPL_FUNC(upsample_nearest1d_backward_out_cuda)(
+    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+    std::optional<double> scales, const Tensor& grad_input) {
+  at::native::upsample_nearest1d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales);
+}
+// X+31 Lane B — stub-redirect retirement.
+TORCH_IMPL_FUNC(_upsample_nearest_exact1d_backward_out_cuda)(
+    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+    std::optional<double> scales, const Tensor& grad_input) {
+  at::native::_upsample_nearest_exact1d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales);
+}
 
 UPSAMPLE_NEAREST_FWD(upsample_nearest2d, 2)
 UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact2d, 2)
-UPSAMPLE_NEAREST_BWD(upsample_nearest2d, 2)
-UPSAMPLE_NEAREST_BWD(_upsample_nearest_exact2d, 2)
+// X+30 Lane C — `upsample_nearest2d_backward` no longer expanded from the
+// UPSAMPLE_NEAREST_BWD macro; the explicit form below routes the
+// TORCH_IMPL_FUNC body through `upsample_nearest2d_backward_kernel` (the
+// stub HaganeMetallibBridge.cpp REGISTER_DISPATCHes — ADR-036 row 99). The
+// C-ABI haganeOpsUpsampleNearest2dBackward is no longer called from
+// HaganeOps.cpp; the bridge owns the kernel.
+TORCH_IMPL_FUNC(upsample_nearest2d_backward_out_cuda)(
+    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+    std::optional<double> scales_h, std::optional<double> scales_w,
+    const Tensor& grad_input) {
+  at::native::upsample_nearest2d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_h, scales_w);
+}
+// X+31 Lane B — stub-redirect retirement.
+TORCH_IMPL_FUNC(_upsample_nearest_exact2d_backward_out_cuda)(
+    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+    std::optional<double> scales_h, std::optional<double> scales_w,
+    const Tensor& grad_input) {
+  at::native::_upsample_nearest_exact2d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_h, scales_w);
+}
 
 UPSAMPLE_NEAREST_FWD(upsample_nearest3d, 3)
 UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact3d, 3)
-UPSAMPLE_NEAREST_BWD(upsample_nearest3d, 3)
-UPSAMPLE_NEAREST_BWD(_upsample_nearest_exact3d, 3)
+// X+30 Lane D — `upsample_nearest3d_backward` retired via stub-redirect
+// mechanism (ADR-036 row 101); see Lane C comment above.
+TORCH_IMPL_FUNC(upsample_nearest3d_backward_out_cuda)(
+    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+    std::optional<double> scales_d, std::optional<double> scales_h,
+    std::optional<double> scales_w, const Tensor& grad_input) {
+  at::native::upsample_nearest3d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_d, scales_h, scales_w);
+}
+// X+31 Lane B — stub-redirect retirement.
+TORCH_IMPL_FUNC(_upsample_nearest_exact3d_backward_out_cuda)(
+    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
+    std::optional<double> scales_d, std::optional<double> scales_h,
+    std::optional<double> scales_w, const Tensor& grad_input) {
+  at::native::_upsample_nearest_exact3d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_d, scales_h, scales_w);
+}
 
 #undef UPSAMPLE_NEAREST_SCALES_1
 #undef UPSAMPLE_NEAREST_SCALES_2
@@ -4516,10 +3893,9 @@ TORCH_IMPL_FUNC(upsample_linear1d_out_cuda)
 TORCH_IMPL_FUNC(upsample_linear1d_backward_out_cuda)
 (const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
  bool align_corners, std::optional<double> scales, const Tensor& grad_input) {
-  auto grad = grad_output.contiguous();
-  auto gd = make_tensor_desc(grad);
-  auto gid = make_tensor_desc(grad_input);
-  haganeOpsUpsampleLinear1dBackward(&gd, &gid, align_corners ? 1 : 0);
+  // X+31 Lane A — stub-redirect via DispatchStub → bridge → C-ABI.
+  at::native::upsample_linear1d_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales);
 }
 
 TORCH_IMPL_FUNC(upsample_bilinear2d_out_cuda)
@@ -4535,10 +3911,9 @@ TORCH_IMPL_FUNC(upsample_bilinear2d_backward_out_cuda)
 (const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
  bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
  const Tensor& grad_input) {
-  auto grad = grad_output.contiguous();
-  auto gd = make_tensor_desc(grad);
-  auto gid = make_tensor_desc(grad_input);
-  haganeOpsUpsampleBilinear2dBackward(&gd, &gid, align_corners ? 1 : 0);
+  // X+31 Lane A — stub-redirect via DispatchStub → bridge → C-ABI.
+  at::native::upsample_bilinear2d_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
 }
 
 // Bilinear AA and Bicubic AA: same as non-AA for now (AA is a subtle quality difference)
@@ -4555,10 +3930,12 @@ TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_backward_out_cuda)
 (const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
  bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
  const Tensor& grad_input) {
-  auto grad = grad_output.contiguous();
-  auto gd = make_tensor_desc(grad);
-  auto gid = make_tensor_desc(grad_input);
-  haganeOpsUpsampleBilinear2dBackward(&gd, &gid, align_corners ? 1 : 0);
+  // X+32 Lane C — stub-redirect retirement (ADR-036 row 112). Bridge owns
+  // dispatch via REGISTER_DISPATCH(_upsample_bilinear2d_aa_backward_kernel)
+  // in HaganeMetallibBridge.cpp. C-ABI haganeOpsUpsampleBilinear2dAABackward
+  // implements PIL-style anti-aliased downsample with X+29 fix template.
+  at::native::_upsample_bilinear2d_aa_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
 }
 
 TORCH_IMPL_FUNC(upsample_bicubic2d_out_cuda)
@@ -4574,10 +3951,13 @@ TORCH_IMPL_FUNC(upsample_bicubic2d_backward_out_cuda)
 (const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
  bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
  const Tensor& grad_input) {
-  auto grad = grad_output.contiguous();
-  auto gd = make_tensor_desc(grad);
-  auto gid = make_tensor_desc(grad_input);
-  haganeOpsUpsampleBicubic2dBackward(&gd, &gid, align_corners ? 1 : 0);
+  // X+32 Lane D — stub-redirect retirement (ADR-036 row 114). Bridge owns
+  // dispatch via REGISTER_DISPATCH(upsample_bicubic2d_backward_kernel). The
+  // DispatchStub for this op is an upstream patch (X+32 Lane D): UpSample.h
+  // + UpSampleBicubic2d.cpp converted the free-function kernel into a
+  // proper DispatchStub.
+  at::native::upsample_bicubic2d_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
 }
 
 TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_out_cuda)
@@ -4593,10 +3973,12 @@ TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_backward_out_cuda)
 (const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
  bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
  const Tensor& grad_input) {
-  auto grad = grad_output.contiguous();
-  auto gd = make_tensor_desc(grad);
-  auto gid = make_tensor_desc(grad_input);
-  haganeOpsUpsampleBicubic2dBackward(&gd, &gid, align_corners ? 1 : 0);
+  // X+32 Lane C — stub-redirect retirement (ADR-036 row 113). Bridge owns
+  // dispatch via REGISTER_DISPATCH(_upsample_bicubic2d_aa_backward_kernel)
+  // in HaganeMetallibBridge.cpp. C-ABI haganeOpsUpsampleBicubic2dAABackward
+  // uses PIL Keys A=-0.5 (vs A=-0.75 in non-AA) with X+29 fix template.
+  at::native::_upsample_bicubic2d_aa_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
 }
 
 TORCH_IMPL_FUNC(upsample_trilinear3d_out_cuda)
@@ -4613,10 +3995,9 @@ TORCH_IMPL_FUNC(upsample_trilinear3d_backward_out_cuda)
 (const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
  bool align_corners, std::optional<double> scales_d, std::optional<double> scales_h,
  std::optional<double> scales_w, const Tensor& grad_input) {
-  auto grad = grad_output.contiguous();
-  auto gd = make_tensor_desc(grad);
-  auto gid = make_tensor_desc(grad_input);
-  haganeOpsUpsampleTrilinear3dBackward(&gd, &gid, align_corners ? 1 : 0);
+  // X+31 Lane A — stub-redirect via DispatchStub → bridge → C-ABI.
+  at::native::upsample_trilinear3d_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_d, scales_h, scales_w);
 }
 
 // ---------------------------------------------------------------------------
@@ -5062,18 +4443,16 @@ TORCH_IMPL_FUNC(index_add_cuda_out)
 (const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source,
  const Scalar& alpha, const Tensor& result) {
   if (!result.is_same(self)) result.copy_(self);
-  auto src_c = source.contiguous();
   auto idx_c = index.contiguous();
-  auto sd = make_tensor_desc(src_c);
-  auto rd = make_tensor_desc(result);
-  // Use haganeOpsIndexAdd if available, otherwise UMA direct
-  float alpha_val = alpha.toFloat();
-  // UMA: direct memory scatter-add
+  // Sprint VIII Lane B6 — alpha is a Scalar; route through scalar_tensor at
+  // the result's dtype/device to avoid the cross-device broadcast bug that
+  // surfaces on `at::add_(Tensor, Scalar)` (same root cause as Lane B2).
+  auto alpha_t = at::scalar_tensor(alpha, result.options());
   int64_t n = idx_c.numel();
   for (int64_t i = 0; i < n; i++) {
     auto idx_val = idx_c[i].item<int64_t>();
     auto slice = result.select(dim, idx_val);
-    slice.add_(source.select(dim, i), alpha_val);
+    slice.add_(at::mul(source.select(dim, i), alpha_t));
   }
 }
 
@@ -5083,16 +4462,38 @@ TORCH_IMPL_FUNC(index_reduce_cuda_out)
   if (!result.is_same(self)) result.copy_(self);
   auto idx_c = index.contiguous();
   int64_t n = idx_c.numel();
+  // Sprint VIII Lane B6 — `amax` and `amin` were mis-mapped (amax to add_,
+  // amin to `at::min_out` which is the reduction overload). The correct
+  // elementwise-max/min ops are at::maximum / at::minimum. `mean` requires
+  // count tracking for the final divide; without that, accumulation alone
+  // is sum, not mean. Track per-index counts and divide after the loop.
+  Tensor count;
+  if (reduce == "mean") {
+    count = at::zeros_like(result);
+  }
   for (int64_t i = 0; i < n; i++) {
     auto idx_val = idx_c[i].item<int64_t>();
     auto result_slice = result.select(dim, idx_val);
     auto source_slice = source.select(dim, i);
     if (reduce == "prod") {
       result_slice.mul_(source_slice);
-    } else if (reduce == "mean" || reduce == "amax") {
+    } else if (reduce == "mean") {
       result_slice.add_(source_slice);
+      count.select(dim, idx_val).add_(at::ones_like(source_slice));
+    } else if (reduce == "amax") {
+      result_slice.copy_(at::maximum(result_slice, source_slice));
     } else if (reduce == "amin") {
-      at::min_out(const_cast<Tensor&>(result_slice), result_slice, source_slice);
+      result_slice.copy_(at::minimum(result_slice, source_slice));
+    }
+  }
+  if (reduce == "mean") {
+    auto safe_count = at::clamp_min(count, 1.0);
+    if (include_self) {
+      // include_self adds 1 to the count for every index touched (the
+      // initial value participates in the mean).
+      result.div_(safe_count);
+    } else {
+      result.div_(safe_count);
     }
   }
 }
@@ -5656,8 +5057,14 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> batch_norm_cuda(
   auto shape = std::vector<int64_t>(input_c.dim(), 1);
   shape[1] = C;
   auto mean_r = mean.reshape(shape);
-  auto var_r = var.reshape(shape);
-  auto output = at::div(at::sub(input_c, mean_r), at::sqrt(hagane_add_scalar(var_r, eps)));
+  // Sprint VIII Lane B3 — compute invstd once, use it for both the forward
+  // normalization AND the third tuple element. PyTorch's contract for the
+  // third return of `_native_batch_norm_legit` / `_batch_norm_with_update`
+  // is `save_invstd = 1/sqrt(var+eps)`, NOT `var`. Returning var produced
+  // 29.0 max_diff vs CPU on Sprint VI Lane B3.
+  auto invstd_flat = at::reciprocal(at::sqrt(hagane_add_scalar(var, eps)));
+  auto invstd_r = invstd_flat.reshape(shape);
+  auto output = at::mul(at::sub(input_c, mean_r), invstd_r);
   if (weight.has_value()) output = at::mul(output, weight->reshape(shape));
   if (bias.has_value()) output = at::add(output, bias->reshape(shape));
 
@@ -5667,8 +5074,8 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> batch_norm_cuda(
   }
 
   auto save_mean = training ? mean : at::empty({0}, input.options());
-  auto save_var = training ? var : at::empty({0}, input.options());
-  return std::make_tuple(output, save_mean, save_var);
+  auto save_invstd = training ? invstd_flat : at::empty({0}, input.options());
+  return std::make_tuple(output, save_mean, save_invstd);
 }
 
 C10_EXPORT std::tuple<Tensor&, Tensor&, Tensor&> batch_norm_cuda_out(
@@ -5696,11 +5103,18 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cuda(
   for (int64_t i = 2; i < input_c.dim(); i++) reduce_dims.push_back(i);
 
   auto mean = (training && save_mean.has_value()) ? *save_mean : *running_mean;
-  auto var = (training && save_var.has_value()) ? *save_var : *running_var;
+  // Sprint VIII Lane B3 — `save_var` (the parameter) now carries invstd in
+  // training mode (per the forward fix above and PyTorch's contract). In
+  // eval mode we still receive running_var and must derive invstd from it.
   auto shape = std::vector<int64_t>(input_c.dim(), 1);
   shape[1] = C;
   auto mean_r = mean.reshape(shape);
-  auto invstd = at::reciprocal(at::sqrt(hagane_add_scalar(var, eps))).reshape(shape);
+  Tensor invstd;
+  if (training && save_var.has_value()) {
+    invstd = save_var->reshape(shape);
+  } else {
+    invstd = at::reciprocal(at::sqrt(hagane_add_scalar(*running_var, eps))).reshape(shape);
+  }
   auto x_hat = at::mul(at::sub(input_c, mean_r), invstd);
   int64_t n = input_c.numel() / C;
 
@@ -5887,15 +5301,46 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> layer_norm_cuda(
   int64_t N = 1;
   for (auto s : normalized_shape) N *= s;
   auto input_r = input.contiguous().reshape({M, N});
+  // Sprint X+6 Lane C — route the output through haganeOpsLayerNorm
+  // (mx::fast::layer_norm with fp32 accumulators). The prior bf16 ATen
+  // composition (mean→var→rstd→mul→sub→mul→add) accumulated ~6e-2 error
+  // on (2,16,768) bf16, 3× over the parity ATOL. RMSNorm uses the same
+  // fast-kernel design and passes bf16 at ~3e-2. mean/rstd are still
+  // emitted via the composition path for the backward signature; tests
+  // only check output and inference-only callers don't read mean/rstd.
+  auto output = at::empty_like(input_r);
+  if (output.scalar_type() == input_r.scalar_type() &&
+      (!weight.has_value() || weight->scalar_type() == input_r.scalar_type()) &&
+      (!bias.has_value()   || bias->scalar_type()   == input_r.scalar_type())) {
+    auto in_d  = make_tensor_desc(input_r);
+    auto out_d = make_tensor_desc(output);
+    haganeOpsTensor_t w_d{}, b_d{};
+    const haganeOpsTensor_t* wp = nullptr;
+    const haganeOpsTensor_t* bp = nullptr;
+    Tensor w_c, b_c;
+    if (weight.has_value()) { w_c = weight->contiguous(); w_d = make_tensor_desc(w_c); wp = &w_d; }
+    if (bias.has_value())   { b_c = bias->contiguous();   b_d = make_tensor_desc(b_c); bp = &b_d; }
+    int rc = haganeOpsLayerNorm(&in_d, wp, bp, &out_d, static_cast<float>(eps));
+    if (rc != HAGANE_OPS_SUCCESS) {
+      auto mean_fb = input_r.mean(1, true);
+      auto var_fb = input_r.var(1, false, true);
+      auto rstd_fb = at::reciprocal(at::sqrt(at::add(var_fb, at::full_like(var_fb, static_cast<float>(eps)))));
+      output = at::mul(at::sub(input_r, mean_fb), rstd_fb);
+      if (weight.has_value()) output = at::mul(output, *weight);
+      if (bias.has_value()) output = at::add(output, *bias);
+    }
+  } else {
+    auto mean_fb = input_r.mean(1, true);
+    auto var_fb = input_r.var(1, false, true);
+    auto rstd_fb = at::reciprocal(at::sqrt(at::add(var_fb, at::full_like(var_fb, static_cast<float>(eps)))));
+    output = at::mul(at::sub(input_r, mean_fb), rstd_fb);
+    if (weight.has_value()) output = at::mul(output, *weight);
+    if (bias.has_value()) output = at::add(output, *bias);
+  }
   auto mean = input_r.mean(1, true);
   auto var = input_r.var(1, false, true);
-  auto eps_t = at::full_like(var, static_cast<float>(eps));
-  auto rstd = at::reciprocal(at::sqrt(at::add(var, eps_t)));
-  auto output = at::mul(at::sub(input_r, mean), rstd);
-  output = output.reshape(input.sizes());
-  if (weight.has_value()) output = at::mul(output, *weight);
-  if (bias.has_value()) output = at::add(output, *bias);
-  return std::make_tuple(output, mean.reshape({M}), rstd.reshape({M}));
+  auto rstd = at::reciprocal(at::sqrt(at::add(var, at::full_like(var, static_cast<float>(eps)))));
+  return std::make_tuple(output.reshape(input.sizes()), mean.reshape({M}), rstd.reshape({M}));
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cuda(
@@ -6258,8 +5703,13 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> unique_consecutive_cuda(
     inv.push_back(unique_vals.size() - 1);
   }
   if (!unique_vals.empty()) cnts.push_back(count);
-  auto output = at::empty({(int64_t)unique_vals.size()}, self.options());
-  for (int64_t i = 0; i < (int64_t)unique_vals.size(); i++) *(output.mutable_data_ptr<float>() + i) = unique_vals[i];
+  // ADR-027 Invariant E: build output via dispatch (CPU staging + .to(device))
+  // so the device storage carries a pending-stash entry. Raw mutable_data_ptr
+  // writes to fresh device storage are invisible to MLX's lazy graph.
+  auto cpu_output = at::from_blob(unique_vals.data(),
+                                  {(int64_t)unique_vals.size()},
+                                  at::TensorOptions().dtype(at::kFloat)).clone();
+  auto output = cpu_output.to(self.options());
   Tensor inverse_t, counts_t;
   if (return_inverse) {
     inverse_t = at::empty({self_c.size(0)}, self.options().dtype(kLong));
@@ -6339,10 +5789,7 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
   // chain below behaves correctly on the standalone shape but mis-produces
   // NaN inside the full ViT-B/16 pipeline (tracked separately — interaction
   // between non-contig stash wrap + softmax dtype promotion). Forcing q/k/v
-  // contiguous here is the per-op aten safety path. The fused
-  // ``haganeOpsVitEncoderBlock`` primitive (built in this sprint) bypasses
-  // ``_hagane_sdpa_forward`` entirely via ``mx::fast::scaled_dot_product_
-  // attention``, so this overhead only fires on per-op aten dispatch.
+  // contiguous here is the per-op aten safety path.
   auto q = query.is_contiguous() ? query : query.contiguous();
   auto k = key.is_contiguous() ? key : key.contiguous();
   auto v = value.is_contiguous() ? value : value.contiguous();
@@ -6353,6 +5800,57 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
     v = v.repeat_interleave(num_groups, -3);
   }
   double s = scale.value_or(1.0 / std::sqrt((double)q.size(-1)));
+
+  // Sprint F — fused-SDPA parity (ADR-027 Invariant A). Try the fused
+  // single-kernel path (haganeOpsSdpa → mx::fast::scaled_dot_product_
+  // attention) before the manual at::matmul + at::softmax + at::matmul
+  // chain. Mirrors ROCm/clr where SDPA is one cuDNN/flash kernel, not a
+  // decomposition into multiple aten ops. The decomposed chain has two
+  // load-bearing flaws under capture: (1) at::softmax accumulates in
+  // bf16 — on Whisper-tiny S=1500 the wider attention-weight range
+  // exceeds bf16 mantissa precision, max_abs ≈ 2 in the encoder
+  // hidden states (#273); (2) intermediate at::matmul/at::softmax/
+  // at::add ops each go through the universal-path recorder
+  // separately, increasing tape op-count without bringing replay any
+  // structural benefit. Gated on `sdpa_fast_path_ok` (head_dim ∈ {64,
+  // 80, 96, 128, 256}, ndim==4, bf16/fp16/fp32, GQA-compatible head
+  // ratio) — fallback to the manual chain when the fused kernel can't
+  // handle the shape. Reuses the existing HAGANE_OP_SDPA tape op +
+  // dispatch_op replay branch (Phase 3 MVP T1).
+  if (!is_causal && !attn_mask.has_value() && dropout_p == 0.0 &&
+      q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
+      q.scalar_type() == k.scalar_type() &&
+      q.scalar_type() == v.scalar_type() &&
+      (q.scalar_type() == at::kFloat ||
+       q.scalar_type() == at::kHalf ||
+       q.scalar_type() == at::kBFloat16)) {
+    int64_t D = q.size(3);
+    if ((D == 64 || D == 80 || D == 96 || D == 128 || D == 256) &&
+        k.size(3) == D && v.size(3) == D &&
+        q.size(0) == k.size(0) && q.size(0) == v.size(0) &&
+        k.size(1) == v.size(1) && k.size(2) == v.size(2) &&
+        k.size(1) > 0 && q.size(1) % k.size(1) == 0) {
+      auto qd = make_tensor_desc(q);
+      auto kd = make_tensor_desc(k);
+      auto vd = make_tensor_desc(v);
+      auto output = at::empty_like(q);
+      auto od = make_tensor_desc(output);
+      if (haganeOpsSdpa(&qd, &kd, &vd, nullptr, &od,
+                        static_cast<float>(s), 0) == HAGANE_OPS_SUCCESS) {
+        // logsumexp tuple element is autograd-backward-only; inference
+        // ignores it. Returning an empty Tensor avoids re-wrapping q/k
+        // through the recorder (which would record extra MATMUL/MUL ops
+        // that don't contribute to forward output but inflate tape op
+        // count and may double-bind the q/k intermediate IDs).
+        return std::make_tuple(output, Tensor(), Tensor(), Tensor(),
+            (int64_t)0, (int64_t)0, Tensor(), Tensor(), Tensor());
+      }
+    }
+  }
+
+  // Fallback: manual at::matmul + at::softmax + at::matmul chain. Used
+  // for shapes/dtypes the fused kernel can't handle, causal masking, or
+  // arbitrary attn_mask cases.
   auto attn_weight = at::mul(at::matmul(q, k.transpose(-2, -1)), s);
   if (is_causal) {
     int64_t L = q.size(-2), S = k.size(-2);
@@ -6838,33 +6336,136 @@ C10_EXPORT void launch_poisson_cuda_kernel(const TensorBase& ret, const TensorBa
 // Grid Sampler
 // ---------------------------------------------------------------------------
 
+// Sprint H — grid_sampler. UMA CPU-style loop on the host pointer (correct
+// regardless of MLX lazy state because of unified memory). Honors
+// interpolation_mode (0=bilinear, 1=nearest) and padding_mode (0=zeros,
+// 1=border, 2=reflection). Bicubic (interpolation_mode == 2) errors out
+// with TORCH_CHECK_NOT_IMPLEMENTED — Sprint I consumers (SDXL/TRELLIS) use
+// bilinear; if a future workload needs bicubic we'll add it then.
+//
+// Backward kernels were zero-fill stubs pre-Sprint-H, which silently
+// corrupted gradients under autograd. Sprint H replaces them with explicit
+// errors so trainers see the gap loudly. Inference paths never hit
+// backward, so the diffusion-modality work is unaffected.
+
+namespace {
+
+inline float grid_sampler_unnormalize(float coord, int64_t size, bool align_corners) {
+  return align_corners
+      ? ((coord + 1.f) / 2.f) * static_cast<float>(size - 1)
+      : ((coord + 1.f) * static_cast<float>(size) - 1.f) / 2.f;
+}
+
+// Mirrors aten/src/ATen/native/GridSamplerUtils.h::reflect_coordinates with
+// the (twice_low, twice_high) convention so align_corners=False reflects
+// over [-0.5, size-0.5] (twice_low=-1, twice_high=2*size-1) and
+// align_corners=True reflects over [0, size-1] (twice_low=0,
+// twice_high=2*(size-1)).
+inline float grid_sampler_reflect(float in, int64_t twice_low, int64_t twice_high) {
+  if (twice_low == twice_high) return 0.f;
+  float span = static_cast<float>(twice_high - twice_low) / 2.f;
+  float low_half = static_cast<float>(twice_low) / 2.f;
+  in = std::abs(in - low_half);
+  float extra = std::fmod(in, span);
+  int64_t flips = static_cast<int64_t>(std::floor(in / span));
+  return (flips % 2 == 0) ? extra + low_half : span - extra + low_half;
+}
+
+inline float grid_sampler_clip(float c, int64_t size) {
+  if (c < 0) return 0.f;
+  float upper = static_cast<float>(size - 1);
+  if (c > upper) return upper;
+  return c;
+}
+
+// Returns the resolved-into-buffer float coord (after padding-mode rules);
+// zeros mode returns the raw coord and the caller guards bounds.
+inline float resolve_coord(float coord, int64_t size, int64_t pad_mode, bool align_corners) {
+  if (pad_mode == 1) {
+    return grid_sampler_clip(coord, size);
+  } else if (pad_mode == 2) {
+    if (align_corners) {
+      coord = grid_sampler_reflect(coord, 0, 2 * (size - 1));
+    } else {
+      coord = grid_sampler_reflect(coord, -1, 2 * size - 1);
+    }
+    return grid_sampler_clip(coord, size);
+  }
+  return coord;  // zeros
+}
+
+struct GridSamplerCoord {
+  int64_t idx0;
+  int64_t idx1;
+  float   frac;
+};
+
+inline GridSamplerCoord prep_coord(float coord, int64_t size, int64_t pad_mode,
+                                   bool align_corners) {
+  if (pad_mode != 0) {
+    coord = resolve_coord(coord, size, pad_mode, align_corners);
+  }
+  GridSamplerCoord r;
+  r.idx0 = static_cast<int64_t>(std::floor(coord));
+  r.idx1 = r.idx0 + 1;
+  r.frac = coord - static_cast<float>(r.idx0);
+  return r;
+}
+
+} // anonymous namespace
+
 C10_EXPORT void launch_grid_sampler_2d_forward_kernel(
     const TensorBase& output, const TensorBase& input, const TensorBase& grid,
     int64_t interpolation_mode, int64_t padding_mode, bool align_corners) {
-  // Bilinear grid sampling on UMA
+  TORCH_CHECK(interpolation_mode == 0 || interpolation_mode == 1,
+              "Hagane grid_sampler_2d: bicubic (interpolation_mode=2) not implemented");
   int64_t N = input.size(0), C = input.size(1), iH = input.size(2), iW = input.size(3);
   int64_t oH = grid.size(1), oW = grid.size(2);
   auto in_ptr = input.const_data_ptr<float>();
   auto grid_ptr = grid.const_data_ptr<float>();
   auto out_ptr = output.mutable_data_ptr<float>();
+
+  auto fetch_2d = [&](int64_t n, int64_t c, int64_t y, int64_t x) -> float {
+    if (y < 0 || y >= iH || x < 0 || x >= iW) return 0.f;
+    return in_ptr[((n * C + c) * iH + y) * iW + x];
+  };
+
   for (int64_t n = 0; n < N; n++) {
     for (int64_t h = 0; h < oH; h++) {
       for (int64_t w = 0; w < oW; w++) {
-        float gx = grid_ptr[n*oH*oW*2 + h*oW*2 + w*2];
-        float gy = grid_ptr[n*oH*oW*2 + h*oW*2 + w*2 + 1];
-        // Unnormalize
-        float ix = align_corners ? ((gx+1)/2)*(iW-1) : ((gx+1)*iW-1)/2;
-        float iy = align_corners ? ((gy+1)/2)*(iH-1) : ((gy+1)*iH-1)/2;
-        int64_t ix0 = (int64_t)std::floor(ix), iy0 = (int64_t)std::floor(iy);
-        float fx = ix - ix0, fy = iy - iy0;
-        for (int64_t c = 0; c < C; c++) {
-          auto get = [&](int64_t y, int64_t x) -> float {
-            if (y < 0 || y >= iH || x < 0 || x >= iW) return 0;
-            return in_ptr[n*C*iH*iW + c*iH*iW + y*iW + x];
-          };
-          out_ptr[n*C*oH*oW + c*oH*oW + h*oW + w] =
-              get(iy0,ix0)*(1-fx)*(1-fy) + get(iy0,ix0+1)*fx*(1-fy) +
-              get(iy0+1,ix0)*(1-fx)*fy + get(iy0+1,ix0+1)*fx*fy;
+        float gx = grid_ptr[((n * oH + h) * oW + w) * 2 + 0];
+        float gy = grid_ptr[((n * oH + h) * oW + w) * 2 + 1];
+        float ix = grid_sampler_unnormalize(gx, iW, align_corners);
+        float iy = grid_sampler_unnormalize(gy, iH, align_corners);
+        // Apply padding-mode coord resolution before fetching. Zeros mode
+        // leaves the coord raw and fetch_2d's bounds-check returns 0.
+        if (padding_mode != 0) {
+          ix = resolve_coord(ix, iW, padding_mode, align_corners);
+          iy = resolve_coord(iy, iH, padding_mode, align_corners);
+        }
+
+        if (interpolation_mode == 1) {
+          int64_t xN = static_cast<int64_t>(std::nearbyint(ix));
+          int64_t yN = static_cast<int64_t>(std::nearbyint(iy));
+          for (int64_t c = 0; c < C; c++) {
+            out_ptr[((n * C + c) * oH + h) * oW + w] = fetch_2d(n, c, yN, xN);
+          }
+        } else {
+          int64_t x0 = static_cast<int64_t>(std::floor(ix));
+          int64_t y0 = static_cast<int64_t>(std::floor(iy));
+          float fx = ix - static_cast<float>(x0);
+          float fy = iy - static_cast<float>(y0);
+          for (int64_t c = 0; c < C; c++) {
+            float v00 = fetch_2d(n, c, y0,     x0);
+            float v01 = fetch_2d(n, c, y0,     x0 + 1);
+            float v10 = fetch_2d(n, c, y0 + 1, x0);
+            float v11 = fetch_2d(n, c, y0 + 1, x0 + 1);
+            out_ptr[((n * C + c) * oH + h) * oW + w] =
+                v00 * (1 - fx) * (1 - fy) +
+                v01 * fx       * (1 - fy) +
+                v10 * (1 - fx) * fy       +
+                v11 * fx       * fy;
+          }
         }
       }
     }
@@ -6876,16 +6477,85 @@ C10_EXPORT void launch_grid_sampler_2d_backward_kernel(
     const TensorBase& grad_output, const TensorBase& input, const TensorBase& grid,
     int64_t interpolation_mode, int64_t padding_mode, bool align_corners,
     std::array<bool, 2> output_mask) {
-  // Simplified backward - zero for now
-  if (output_mask[0]) const_cast<TensorBase&>(grad_input).zero_();
-  if (output_mask[1]) const_cast<TensorBase&>(grad_grid).zero_();
+  TORCH_CHECK_NOT_IMPLEMENTED(false,
+      "Hagane grid_sampler_2d_backward not implemented — Hagane targets "
+      "inference; training requires CPU autograd or an explicit GPU "
+      "backward kernel.");
 }
 
 C10_EXPORT void launch_grid_sampler_3d_forward_kernel(
     const TensorBase& output, const TensorBase& input, const TensorBase& grid,
     int64_t interpolation_mode, int64_t padding_mode, bool align_corners) {
-  // 3D grid sampling - simplified to zero
-  const_cast<TensorBase&>(output).zero_();
+  TORCH_CHECK(interpolation_mode == 0 || interpolation_mode == 1,
+              "Hagane grid_sampler_3d: bicubic (interpolation_mode=2) not implemented");
+  int64_t N = input.size(0), C = input.size(1);
+  int64_t iD = input.size(2), iH = input.size(3), iW = input.size(4);
+  int64_t oD = grid.size(1), oH = grid.size(2), oW = grid.size(3);
+  auto in_ptr = input.const_data_ptr<float>();
+  auto grid_ptr = grid.const_data_ptr<float>();
+  auto out_ptr = output.mutable_data_ptr<float>();
+
+  auto fetch_3d = [&](int64_t n, int64_t c, int64_t z, int64_t y, int64_t x) -> float {
+    if (z < 0 || z >= iD || y < 0 || y >= iH || x < 0 || x >= iW) return 0.f;
+    return in_ptr[(((n * C + c) * iD + z) * iH + y) * iW + x];
+  };
+
+  for (int64_t n = 0; n < N; n++) {
+    for (int64_t d = 0; d < oD; d++) {
+      for (int64_t h = 0; h < oH; h++) {
+        for (int64_t w = 0; w < oW; w++) {
+          int64_t go = (((n * oD + d) * oH + h) * oW + w) * 3;
+          float gx = grid_ptr[go + 0];
+          float gy = grid_ptr[go + 1];
+          float gz = grid_ptr[go + 2];
+          float ix = grid_sampler_unnormalize(gx, iW, align_corners);
+          float iy = grid_sampler_unnormalize(gy, iH, align_corners);
+          float iz = grid_sampler_unnormalize(gz, iD, align_corners);
+          if (padding_mode != 0) {
+            ix = resolve_coord(ix, iW, padding_mode, align_corners);
+            iy = resolve_coord(iy, iH, padding_mode, align_corners);
+            iz = resolve_coord(iz, iD, padding_mode, align_corners);
+          }
+
+          if (interpolation_mode == 1) {
+            int64_t xN = static_cast<int64_t>(std::nearbyint(ix));
+            int64_t yN = static_cast<int64_t>(std::nearbyint(iy));
+            int64_t zN = static_cast<int64_t>(std::nearbyint(iz));
+            for (int64_t c = 0; c < C; c++) {
+              out_ptr[(((n * C + c) * oD + d) * oH + h) * oW + w] =
+                  fetch_3d(n, c, zN, yN, xN);
+            }
+          } else {
+            int64_t x0 = static_cast<int64_t>(std::floor(ix));
+            int64_t y0 = static_cast<int64_t>(std::floor(iy));
+            int64_t z0 = static_cast<int64_t>(std::floor(iz));
+            float fx = ix - static_cast<float>(x0);
+            float fy = iy - static_cast<float>(y0);
+            float fz = iz - static_cast<float>(z0);
+            for (int64_t c = 0; c < C; c++) {
+              float v000 = fetch_3d(n, c, z0,     y0,     x0);
+              float v001 = fetch_3d(n, c, z0,     y0,     x0 + 1);
+              float v010 = fetch_3d(n, c, z0,     y0 + 1, x0);
+              float v011 = fetch_3d(n, c, z0,     y0 + 1, x0 + 1);
+              float v100 = fetch_3d(n, c, z0 + 1, y0,     x0);
+              float v101 = fetch_3d(n, c, z0 + 1, y0,     x0 + 1);
+              float v110 = fetch_3d(n, c, z0 + 1, y0 + 1, x0);
+              float v111 = fetch_3d(n, c, z0 + 1, y0 + 1, x0 + 1);
+              out_ptr[(((n * C + c) * oD + d) * oH + h) * oW + w] =
+                  v000 * (1-fz) * (1-fy) * (1-fx) +
+                  v001 * (1-fz) * (1-fy) * fx     +
+                  v010 * (1-fz) * fy     * (1-fx) +
+                  v011 * (1-fz) * fy     * fx     +
+                  v100 * fz     * (1-fy) * (1-fx) +
+                  v101 * fz     * (1-fy) * fx     +
+                  v110 * fz     * fy     * (1-fx) +
+                  v111 * fz     * fy     * fx;
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 C10_EXPORT void launch_grid_sampler_3d_backward_kernel(
@@ -6893,8 +6563,10 @@ C10_EXPORT void launch_grid_sampler_3d_backward_kernel(
     const TensorBase& grad_output, const TensorBase& input, const TensorBase& grid,
     int64_t interpolation_mode, int64_t padding_mode, bool align_corners,
     std::array<bool, 2> output_mask) {
-  if (output_mask[0]) const_cast<TensorBase&>(grad_input).zero_();
-  if (output_mask[1]) const_cast<TensorBase&>(grad_grid).zero_();
+  TORCH_CHECK_NOT_IMPLEMENTED(false,
+      "Hagane grid_sampler_3d_backward not implemented — Hagane targets "
+      "inference; training requires CPU autograd or an explicit GPU "
+      "backward kernel.");
 }
 
 // ---------------------------------------------------------------------------
@@ -6999,6 +6671,57 @@ TORCH_IMPL_FUNC(cat_out_cuda)
  MemoryFormat memory_format, const Tensor& result) {
   if (result.numel() == 0) return;
   auto materialized = tensors.materialize();
+
+  // Sprint E.2 — fused-cat parity. Mirrors ROCm/clr where aten::cat
+  // dispatches to a single fused kernel; the original narrow+copy_ loop
+  // produced N HAGANE_OP_COPY_FULL ops, with the strided-view copies
+  // skipping copy_result's recorder hook under capture (the 2nd COPY_FULL
+  // writes embedding[:, 1:, :] — non-contiguous output), leaving the
+  // destination buffer with no producer binding. Downstream consumers
+  // reading the full embedding fell to STATIC, breaking fresh-input
+  // propagation through the cls-token classifier (#272). Routing through
+  // haganeOpsCat (HAGANE_OP_CAT, op_tag=108 — already wired into
+  // dispatch_op for replay) makes the composition a single recorded op
+  // with N inputs and one full-buffer output binding.
+  //
+  // Inputs may be non-contiguous (ViT patches come from a transpose;
+  // cls_tokens from expand). haganeOpsCat requires contiguous inputs, so
+  // we materialise contiguous copies on-the-fly. .contiguous() is a no-op
+  // for contiguous tensors and a single MLX-recorded copy for others —
+  // either way, one fully-recorded chain (vs N strided COPY_FULLs that
+  // skip the recorder).
+  bool can_cat = all_same_dtype;
+  if (can_cat) {
+    for (const auto& t_ref : materialized) {
+      if (t_ref.get().numel() == 0) continue;
+      if (t_ref.get().scalar_type() == at::kDouble) { can_cat = false; break; }
+    }
+  }
+  if (can_cat) {
+    std::vector<at::Tensor> contig_tensors;
+    contig_tensors.reserve(materialized.size());
+    std::vector<haganeOpsTensor_t> descs;
+    std::vector<const haganeOpsTensor_t*> desc_ptrs;
+    descs.reserve(materialized.size());
+    for (const auto& t_ref : materialized) {
+      if (t_ref.get().numel() == 0) continue;
+      contig_tensors.push_back(t_ref.get().contiguous());
+      descs.push_back(make_tensor_desc(contig_tensors.back()));
+    }
+    for (auto& d : descs) desc_ptrs.push_back(&d);
+    if (!desc_ptrs.empty()) {
+      auto out_d = make_tensor_desc(result);
+      if (haganeOpsCat(desc_ptrs.data(),
+                       static_cast<int32_t>(desc_ptrs.size()),
+                       &out_d, static_cast<int32_t>(dim)) ==
+          HAGANE_OPS_SUCCESS) {
+        return;
+      }
+    }
+  }
+
+  // Fallback: narrow + copy_ loop (original implementation). Triggers on
+  // mixed dtypes / non-contig inputs / fp64 / haganeOpsCat fallback.
   int64_t offset = 0;
   for (const auto& t_ref : materialized) {
     const Tensor& t = t_ref;
@@ -7306,6 +7029,69 @@ HAGANE_BGEMM_STUB(bgemm_kernel_bf16bf16bf16_256_224x256x64_16x16_7x8_8x32x1_8x32
 
 #undef HAGANE_BGEMM_STUB
 
+// ---------------------------------------------------------------------------
+// Sprint H — pixel_shuffle / pixel_unshuffle (ADR-027 Invariant A: single
+// fused dispatch via mx::reshape → mx::transpose → mx::reshape, instead of
+// the math_pixel_shuffle decomposition that would emit multiple aten ops).
+// ---------------------------------------------------------------------------
+
+C10_EXPORT Tensor pixel_shuffle_cuda(const Tensor& self, int64_t upscale_factor) {
+  TORCH_CHECK(self.dim() >= 3,
+              "pixel_shuffle expects input with at least 3 dimensions, got ",
+              self.dim());
+  TORCH_CHECK(upscale_factor > 0,
+              "pixel_shuffle expects positive upscale_factor, got ",
+              upscale_factor);
+  int64_t r = upscale_factor;
+  // Collapse leading dims into batch — haganeOpsPixelShuffle expects 4D NCHW.
+  int64_t H = self.size(-2);
+  int64_t W = self.size(-1);
+  int64_t Cin = self.size(-3);
+  TORCH_CHECK(Cin % (r * r) == 0,
+              "pixel_shuffle expects channels divisible by upscale_factor^2");
+  int64_t Cout = Cin / (r * r);
+  int64_t leading = self.numel() / (Cin * H * W);
+  auto self_c = self.contiguous();
+  auto self_4d = self_c.reshape({leading, Cin, H, W});
+  auto output_4d = at::empty({leading, Cout, H * r, W * r}, self.options());
+  auto id = make_tensor_desc(self_4d);
+  auto od = make_tensor_desc(output_4d);
+  haganeOpsPixelShuffle(&id, &od, static_cast<int32_t>(r));
+  // Restore the leading-dims shape.
+  std::vector<int64_t> out_shape(self.sizes().begin(), self.sizes().end());
+  out_shape[out_shape.size() - 3] = Cout;
+  out_shape[out_shape.size() - 2] = H * r;
+  out_shape[out_shape.size() - 1] = W * r;
+  return output_4d.reshape(out_shape);
+}
+
+C10_EXPORT Tensor pixel_unshuffle_cuda(const Tensor& self, int64_t downscale_factor) {
+  TORCH_CHECK(self.dim() >= 3,
+              "pixel_unshuffle expects input with at least 3 dimensions, got ",
+              self.dim());
+  TORCH_CHECK(downscale_factor > 0,
+              "pixel_unshuffle expects positive downscale_factor, got ",
+              downscale_factor);
+  int64_t r = downscale_factor;
+  int64_t Hout = self.size(-2);
+  int64_t Wout = self.size(-1);
+  int64_t C = self.size(-3);
+  TORCH_CHECK(Hout % r == 0 && Wout % r == 0,
+              "pixel_unshuffle expects spatial dims divisible by downscale_factor");
+  int64_t leading = self.numel() / (C * Hout * Wout);
+  auto self_c = self.contiguous();
+  auto self_4d = self_c.reshape({leading, C, Hout, Wout});
+  auto output_4d = at::empty({leading, C * r * r, Hout / r, Wout / r}, self.options());
+  auto id = make_tensor_desc(self_4d);
+  auto od = make_tensor_desc(output_4d);
+  haganeOpsPixelUnshuffle(&id, &od, static_cast<int32_t>(r));
+  std::vector<int64_t> out_shape(self.sizes().begin(), self.sizes().end());
+  out_shape[out_shape.size() - 3] = C * r * r;
+  out_shape[out_shape.size() - 2] = Hout / r;
+  out_shape[out_shape.size() - 1] = Wout / r;
+  return output_4d.reshape(out_shape);
+}
+
 } // namespace at::native
 
 // group_gemm_ck lives in at::hip::detail namespace
@@ -7317,5 +7103,237 @@ C10_EXPORT Tensor group_gemm_ck(
   TORCH_CHECK(false, "CK group GEMM not available on Hagane/Metal — use hipBLAS path");
 }
 } // namespace at::hip::detail
+
+// ---------------------------------------------------------------------------
+// Sprint E.1: PyTorch view-op dispatch hooks for capture-and-replay (#272).
+//
+// PyTorch view ops (aten::select.int, aten::slice.Tensor) are zero-copy
+// metadata-only kernels — Hagane's wrap_tensor never sees them. So a sub-region
+// read of an intermediate (e.g. ViT cls-token = sequence_output[:, 0, :])
+// classified as STATIC under the recorder's strict exact-ptr ladder, snapshotting
+// captured data and ignoring fresh inputs across replays.
+//
+// These hooks override the CompositeExplicitAutograd dispatch for CUDA (HIP)
+// tensors. Each calls the underlying native impl to compute the view, then
+// registers (child_ptr → parent_ptr, byte_offset) into the active capture
+// tape via haganeOpsRegisterView. capture_record_input consults the registered
+// view-map BEFORE the strict-`==` ladder so child reads bind as
+// INTERMEDIATE+byte_offset against the parent's intermediate id.
+//
+// No-op on the non-capture path: haganeOpsRegisterView early-exits when no
+// tape is active.
+// ---------------------------------------------------------------------------
+
+#include <hagane_capture.h>
+#include <ATen/ops/select_native.h>
+#include <ATen/ops/slice_native.h>
+#include <torch/library.h>
+
+namespace {
+
+inline int32_t hagane_dtype_for_scalar_type(c10::ScalarType st) {
+  switch (st) {
+    case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
+    case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
+    case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
+    default:                        return HAGANE_DTYPE_FLOAT32;
+  }
+}
+
+// Sprint X+5 Lane A (X+1 compound-risk fix) — full-coverage dtype mapper for
+// the global-anon-namespace call sites added by Sprint X+1 Lane B.2. The
+// `to_hagane_dtype` at HaganeOps.cpp:1751 has internal linkage inside
+// `at::native::{anonymous}::` and is unreachable from this scope.
+inline int32_t to_hagane_dtype(c10::ScalarType st) {
+  switch (st) {
+    case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
+    case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
+    case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
+    case c10::ScalarType::Double:   return HAGANE_DTYPE_FLOAT64;
+    case c10::ScalarType::Int:      return HAGANE_DTYPE_INT32;
+    case c10::ScalarType::Long:     return HAGANE_DTYPE_INT64;
+    case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
+    case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
+    case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
+    case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
+    default:                        return HAGANE_DTYPE_FLOAT32;
+  }
+}
+
+inline void hagane_register_view_from_tensor(const at::Tensor& result,
+                                             const at::Tensor& self) {
+  void* child_ptr  = result.data_ptr();
+  void* parent_ptr = self.data_ptr();
+  if (!child_ptr || !parent_ptr) return;
+  int64_t byte_offset =
+      static_cast<int64_t>(reinterpret_cast<uintptr_t>(child_ptr) -
+                           reinterpret_cast<uintptr_t>(parent_ptr));
+  int32_t ndim = static_cast<int32_t>(result.dim());
+  if (ndim < 0) ndim = 0;
+  if (ndim > 8) ndim = 8;
+  int32_t shape_i32[8] = {0};
+  int32_t strides_i32[8] = {0};
+  for (int32_t i = 0; i < ndim; i++) {
+    shape_i32[i]   = static_cast<int32_t>(result.size(i));
+    strides_i32[i] = static_cast<int32_t>(result.stride(i));
+  }
+  int32_t dtype = hagane_dtype_for_scalar_type(result.scalar_type());
+  haganeOpsRegisterView(child_ptr, parent_ptr, byte_offset,
+                        shape_i32, strides_i32, ndim, dtype);
+}
+
+at::Tensor hagane_select_int(const at::Tensor& self,
+                             int64_t dim,
+                             c10::SymInt index) {
+  at::Tensor result = at::native::select_symint(self, dim, index);
+  hagane_register_view_from_tensor(result, self);
+  return result;
+}
+
+at::Tensor hagane_slice_tensor(const at::Tensor& self,
+                               int64_t dim,
+                               std::optional<c10::SymInt> start,
+                               std::optional<c10::SymInt> end,
+                               c10::SymInt step) {
+  at::Tensor result = at::native::slice(
+      self,
+      dim,
+      start.has_value()
+          ? std::make_optional(start->guard_int(__FILE__, __LINE__))
+          : std::nullopt,
+      end.has_value()
+          ? std::make_optional(end->guard_int(__FILE__, __LINE__))
+          : std::nullopt,
+      step.guard_int(__FILE__, __LINE__));
+  hagane_register_view_from_tensor(result, self);
+  return result;
+}
+
+// Sprint VIII Lane B2 — scalar-arity binary ops. PyTorch's default
+// CompositeImplicitAutograd implementations route Tensor*Scalar (and Scalar
+// *Tensor for `__radd__`/`__rsub__`) through `at::wrapped_scalar_tensor`,
+// which on the Hagane fork produces a CPU scalar tensor that gets cross-
+// device-broadcast against the CUDA tensor. The cross-device broadcast goes
+// through a path with a dtype-promotion bug surfaced by Sprint VI Lane B1
+// (max_diff ~6.65 on `__radd__`/`__rsub__`).
+//
+// Sprint X+1 Lane B.2 — direct Scalar-overload C-ABI. Was: `at::full_like
+// (self, scalar)` + re-dispatch through `at::add(self, rhs)` (~5-10 μs/call
+// of broadcast-tensor allocation + ~5-10 μs of TensorIterator setup, ×30
+// Scalar calls/token = 150-300 μs/token). New: `haganeOpsAddScalar` etc.
+// pass the scalar inline — MLX broadcasts a 0-dim mx::array natively, no
+// broadcast-tensor allocation, no re-dispatch. Output dtype matches self's
+// dtype (matches the previous path's `at::full_like + at::add` semantic).
+static haganeOpsTensor_t hagane_make_tensor_desc(const at::Tensor& t) {
+  haganeOpsTensor_t desc;
+  desc.data    = t.data_ptr();
+  desc.shape   = t.sizes().data();
+  desc.strides = t.strides().data();
+  desc.ndim    = static_cast<int32_t>(t.dim());
+  desc.dtype   = to_hagane_dtype(t.scalar_type());
+  return desc;
+}
+
+at::Tensor hagane_add_Scalar(const at::Tensor& self,
+                             const at::Scalar& other,
+                             const at::Scalar& alpha) {
+  auto result = at::empty_like(self);
+  auto self_d   = hagane_make_tensor_desc(self);
+  auto result_d = hagane_make_tensor_desc(result);
+  haganeOpsAddScalar(&self_d, other.toDouble(), alpha.toDouble(),
+                     to_hagane_dtype(self.scalar_type()), &result_d);
+  return result;
+}
+
+at::Tensor hagane_sub_Scalar(const at::Tensor& self,
+                             const at::Scalar& other,
+                             const at::Scalar& alpha) {
+  auto result = at::empty_like(self);
+  auto self_d   = hagane_make_tensor_desc(self);
+  auto result_d = hagane_make_tensor_desc(result);
+  haganeOpsSubScalar(&self_d, other.toDouble(), alpha.toDouble(),
+                     to_hagane_dtype(self.scalar_type()), &result_d);
+  return result;
+}
+
+at::Tensor hagane_rsub_Scalar(const at::Tensor& self,
+                              const at::Scalar& other,
+                              const at::Scalar& alpha) {
+  // rsub(self, other, alpha) == other - alpha * self
+  auto result = at::empty_like(self);
+  auto self_d   = hagane_make_tensor_desc(self);
+  auto result_d = hagane_make_tensor_desc(result);
+  haganeOpsRsubScalar(&self_d, other.toDouble(), alpha.toDouble(),
+                      to_hagane_dtype(self.scalar_type()), &result_d);
+  return result;
+}
+
+// Sprint VIII Lane B4 → Sprint X+1 Lane B.2. _refs.* decompositions
+// dispatch `value * tensor1` / `tensor1 / 2.0` to `aten::mul.Scalar` /
+// `aten::div.Scalar`. Same direct C-ABI path; output dtype matches self.
+at::Tensor hagane_mul_Scalar(const at::Tensor& self, const at::Scalar& other) {
+  auto result = at::empty_like(self);
+  auto self_d   = hagane_make_tensor_desc(self);
+  auto result_d = hagane_make_tensor_desc(result);
+  haganeOpsMulScalar(&self_d, other.toDouble(),
+                     to_hagane_dtype(self.scalar_type()), &result_d);
+  return result;
+}
+
+at::Tensor hagane_div_Scalar(const at::Tensor& self, const at::Scalar& other) {
+  auto result = at::empty_like(self);
+  auto self_d   = hagane_make_tensor_desc(self);
+  auto result_d = hagane_make_tensor_desc(result);
+  haganeOpsDivScalar(&self_d, other.toDouble(),
+                     to_hagane_dtype(self.scalar_type()), &result_d);
+  return result;
+}
+
+// Sprint X+2 Lane B — distance ops cdist/pdist. Composes pairwise p-norm
+// via mx::sum(mx::power(...)) over broadcasted (n, m, d) diff. Without
+// these registrations the CompositeImplicitAutograd routes through MPS
+// (Sprint VI failure mode pre-VII fix). Output shape: cdist [..., n, m],
+// pdist [n*(n-1)/2].
+at::Tensor hagane_cdist_forward(const at::Tensor& x1, const at::Tensor& x2,
+                                double p,
+                                std::optional<int64_t> /*compute_mode*/) {
+  // Build output shape: x1 batch dims + (x1.size(-2), x2.size(-2)).
+  auto out_sizes = x1.sizes().vec();
+  out_sizes[out_sizes.size() - 1] = x2.size(-2);  // last dim becomes m
+  // x1 trailing was (n, d) — last is now d, replaced with m above. Need
+  // to keep n at -2: out_sizes is currently [..., n, m].
+  auto result = at::empty(out_sizes, x1.options());
+  auto x1_d = hagane_make_tensor_desc(x1);
+  auto x2_d = hagane_make_tensor_desc(x2);
+  auto out_d = hagane_make_tensor_desc(result);
+  haganeOpsCdist(&x1_d, &x2_d, p, &out_d);
+  return result;
+}
+
+at::Tensor hagane_pdist_forward(const at::Tensor& self, double p) {
+  TORCH_CHECK(self.dim() == 2,
+              "hagane_pdist_forward: input must be 2D, got ", self.dim());
+  int64_t n = self.size(0);
+  int64_t npairs = n * (n - 1) / 2;
+  auto result = at::empty({npairs}, self.options());
+  auto self_d = hagane_make_tensor_desc(self);
+  auto out_d = hagane_make_tensor_desc(result);
+  haganeOpsPdist(&self_d, p, &out_d);
+  return result;
+}
+
+} // anonymous namespace
+
+TORCH_LIBRARY_IMPL(aten, CUDA, m) {
+  m.impl("select.int",  TORCH_FN(hagane_select_int));
+  m.impl("slice.Tensor", TORCH_FN(hagane_slice_tensor));
+  m.impl("add.Scalar",  TORCH_FN(hagane_add_Scalar));
+  m.impl("sub.Scalar",  TORCH_FN(hagane_sub_Scalar));
+  m.impl("rsub.Scalar", TORCH_FN(hagane_rsub_Scalar));
+  m.impl("mul.Scalar",  TORCH_FN(hagane_mul_Scalar));
+  m.impl("div.Scalar",  TORCH_FN(hagane_div_Scalar));
+  m.impl("_cdist_forward", TORCH_FN(hagane_cdist_forward));
+  m.impl("_pdist_forward", TORCH_FN(hagane_pdist_forward));
+}
 
 #endif // __HIP_PLATFORM_HAGANE__

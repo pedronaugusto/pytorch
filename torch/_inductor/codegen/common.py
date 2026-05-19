@@ -541,6 +541,13 @@ def init_backend_registration() -> None:
             WrapperFxCodegen,
         )
 
+    # On the Hagane platform fork the "cuda" device-type is exposed by HIP=
+    # Hagane (not real CUDA / Triton), so swap in HaganeScheduling. No-op on
+    # vanilla builds where the Hagane runtime DSO is not loadable.
+    from .hagane import maybe_register_hagane_scheduling
+
+    maybe_register_hagane_scheduling()
+
     if get_scheduling_for_device("tpu") is None:
         register_backend_for_device(
             "tpu",
@@ -640,6 +647,13 @@ def _initialize_device_op_overrides():
     from .cuda import device_op_overrides  # noqa: F401
     from .mtia import device_op_overrides as mtia_op_overrides  # noqa: F401
     from .xpu import device_op_overrides as xpu_op_overrides  # noqa: F401
+
+    # On the Hagane platform fork (__HIP_PLATFORM_HAGANE__=1) replace the
+    # "cuda" registration with Hagane-specific overrides. No-op on vanilla
+    # PyTorch builds where the Hagane runtime DSO is not loadable.
+    from .hagane_device_op_overrides import maybe_register_hagane_device_op_overrides
+
+    maybe_register_hagane_device_op_overrides()
 
     # TPU uses Pallas for codegen and only needs no-op overrides
     register_device_op_overrides("tpu", CpuDeviceOpOverrides())

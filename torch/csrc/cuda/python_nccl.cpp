@@ -10,7 +10,7 @@
 #include <torch/csrc/cuda/nccl.h>
 #include <torch/csrc/utils/pybind.h>
 
-#include <c10/cuda/CUDAGuard.h>
+#include <c10/hip/HIPGuard.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 

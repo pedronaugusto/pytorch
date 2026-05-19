@@ -6,9 +6,9 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/python_numbers.h>
 
-#include <c10/cuda/CUDAGuard.h>
+#include <c10/hip/HIPGuard.h>
 
-#include <cuda_runtime_api.h>
+#include <hip/hip_runtime_api.h>
 #include <structmember.h>
 
 PyObject* THCPStreamClass = nullptr;
@@ -65,7 +65,7 @@ static PyObject* THCPStream_pynew(
             static_cast<c10::DeviceType>(device_type))
       : stream_ptr ? at::cuda::getStreamFromExternal(
                          // NOLINTNEXTLINE(performance-no-int-to-ptr)
-                         reinterpret_cast<cudaStream_t>(stream_ptr),
+                         reinterpret_cast<hipStream_t>(stream_ptr),
                          current_device)
                    : at::cuda::getStreamFromPool(priority);
 

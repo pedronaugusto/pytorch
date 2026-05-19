@@ -1,9 +1,10 @@
+#include "hip/hip_runtime.h"
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 
 #ifdef NCCL_HAS_SYMMEM_SUPPORT
 
 #include <algorithm>
-#include <vector_types.h>
+#include <hip/hip_vector_types.h>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
@@ -15,9 +16,9 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 
 #include <ATen/ceil_div.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPCachingAllocator.h>
+#include <c10/hip/HIPGuard.h>
 #include <c10/util/error.h>
 #include <mutex>
 #include <c10/util/flat_hash_map.h>
@@ -99,14 +100,14 @@ NCCLAllocMap::iterator find_allocation_covering(
   }
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
   auto driver_api = c10::cuda::DriverAPI::get();
-  CUdeviceptr base_ptr = 0;
+  hipDeviceptr_t base_ptr = 0;
   // Recover the CUDA allocation base for interior pointers before falling
   // back to the linear scan below when the direct lookup cannot help.
   auto status = driver_api->cuMemGetAddressRange_(
       &base_ptr,
       nullptr,
-      reinterpret_cast<CUdeviceptr>(ptr));
-  if (status == CUDA_SUCCESS) {
+      reinterpret_cast<hipDeviceptr_t>(ptr));
+  if (status == hipSuccess) {
     alloc_it = allocations.find(reinterpret_cast<void*>(base_ptr));
     if (alloc_it != allocations.end()) {
       return alloc_it;
@@ -198,23 +199,23 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
 #if NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0)
     // Lack of host-side API to get peer pointers, so we get them inside a
     // kernel and copy the result to host.
-    int threads = std::min(128, world_size_);
+    int threads = ::min(128, world_size_);
     auto stream = at::cuda::getCurrentCUDAStream();
     build_ptr_dev<<<1, threads, 0, stream>>>(buffer_win_, 0, buffers_dev_, world_size_);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     build_ptr_dev<<<1, threads, 0, stream>>>(signal_handle_, 0, signal_pads_dev_, world_size_);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
-    C10_CUDA_CHECK(cudaMemcpy(
+    C10_CUDA_CHECK(hipStreamSynchronize(stream));
+    C10_CUDA_CHECK(hipMemcpy(
       buffers_.data(),  // dst (host)
       buffers_dev_,  // src (device)
       arr_size,
-      cudaMemcpyDeviceToHost));
-    C10_CUDA_CHECK(cudaMemcpy(
+      hipMemcpyDeviceToHost));
+    C10_CUDA_CHECK(hipMemcpy(
       signal_pads_.data(),  // dst (host)
       signal_pads_dev_,  // src (device)
       arr_size,
-      cudaMemcpyDeviceToHost));
+      hipMemcpyDeviceToHost));
 #else
   // Starting from NCCL 2.29, we can use host-side APIs to get peer pointers.
   for (int i = 0; i < world_size_; i++) {
@@ -228,16 +229,16 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
       "ncclGetPeerDevicePointer failed");
   }
   // Copy the peer access pointers to device arrays.
-  C10_CUDA_CHECK(cudaMemcpy(
+  C10_CUDA_CHECK(hipMemcpy(
     buffers_dev_,  // dst (device)
     buffers_.data(),  // src (host)
     arr_size,
-    cudaMemcpyHostToDevice));
-  C10_CUDA_CHECK(cudaMemcpy(
+    hipMemcpyHostToDevice));
+  C10_CUDA_CHECK(hipMemcpy(
     signal_pads_dev_,  // dst (device)
     signal_pads_.data(),  // src (host)
     arr_size,
-    cudaMemcpyHostToDevice));
+    hipMemcpyHostToDevice));
 
   // Starting from NCCL 2.29, we can use `ncclGetLsaMultimemDevicePointer`
   // to get multicast address.

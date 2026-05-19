@@ -12,6 +12,15 @@
 #include <cstddef>
 #include <optional>
 
+#if defined(__HIP_PLATFORM_HAGANE__)
+// Sprint DD-B — auto slot-binding hook. Runs at capture_end before
+// cudaStreamEndCapture so the in-flight tape's user-visible reads/writes
+// flow through INPUT_SLOT / OUTPUT_SLOT bindings instead of falling
+// through to STATIC snapshots / tape-internal intermediates. See
+// hagane/include/hagane_capture.h for the contract.
+#include <hagane_capture.h>
+#endif
+
 namespace at::cuda {
 
 static bool _cuda_graphs_debug = false;
@@ -167,6 +176,19 @@ void CUDAGraph::capture_end() {
 
   TORCH_CHECK(stream.stream() == capture_stream_.stream(),
               "Capture must end on the same stream it began on.");
+
+#if defined(__HIP_PLATFORM_HAGANE__)
+  // Sprint DD-B — auto slot-binding. Walks the in-flight tape and converts
+  // STATIC inputs / INTERMEDIATE outputs whose backing pointer was NOT
+  // allocated in the graph_pool into INPUT_SLOT / OUTPUT_SLOT bindings.
+  // Pointer arrays are stashed on the per-stream capture state and
+  // propagated to the returned ICBGraph at cudaStreamEndCapture. Ignore
+  // the return code — failure here is observable downstream as a
+  // tainted-tape replay; we still want EndCapture to run so callers can
+  // tear down cleanly.
+  (void)haganeAutoBindCaptureSlots(static_cast<hagane_hipstream_t>(
+      static_cast<void*>(capture_stream_.stream())));
+#endif
 
   // Capture is over once cudaStreamEndCapture returns (success or failure).
   // Clear bookkeeping before propagating the return status so watchdog-side

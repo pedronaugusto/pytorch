@@ -925,6 +925,15 @@ if(USE_ROCM)
   if(HIP_PLATFORM STREQUAL "hagane" OR "$ENV{__HIP_PLATFORM_HAGANE__}" STREQUAL "1")
     list(APPEND ATen_HIP_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/hip/HaganeStubs.cpp")
     list(APPEND ATen_HIP_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/hip/HaganeOps.cpp")
+    # Sprint X+14/X+15 Path α — transition artifact (delete-candidate per ADR-036 §6).
+    # The bridge file body is wrapped in `#ifdef HAGANE_PATH_ALPHA`; X+15 promotes
+    # the gate from opt-in env-var to always-on whenever the outer Hagane block
+    # fires, since `hagane_abs_kernel` (the X+14 fallback) is now deleted from
+    # HaganeOps.cpp and the bridge owns abs_stub dispatch unconditionally.
+    list(APPEND ATen_HIP_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/hip/HaganeMetallibBridge.cpp")
+    set_source_files_properties(
+      "${CMAKE_CURRENT_SOURCE_DIR}/hip/HaganeMetallibBridge.cpp"
+      PROPERTIES COMPILE_DEFINITIONS HAGANE_PATH_ALPHA=1)
   endif()
   # caffe2_nvrtc's stubs to driver APIs are useful for HIP.
   # See NOTE [ ATen NVRTC Stub and HIP ]

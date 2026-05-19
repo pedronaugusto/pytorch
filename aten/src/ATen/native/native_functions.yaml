@@ -4721,6 +4721,7 @@
 - func: pixel_shuffle(Tensor self, int upscale_factor) -> Tensor
   dispatch:
     CPU: pixel_shuffle_cpu
+    CUDA: pixel_shuffle_cuda
     MPS: pixel_shuffle_mps
     CompositeExplicitAutogradNonFunctional: math_pixel_shuffle
   autogen: pixel_shuffle.out
@@ -4728,6 +4729,7 @@
 - func: pixel_unshuffle(Tensor self, int downscale_factor) -> Tensor
   dispatch:
     CPU: pixel_unshuffle_cpu
+    CUDA: pixel_unshuffle_cuda
     MPS: pixel_unshuffle_mps
     CompositeExplicitAutogradNonFunctional: math_pixel_unshuffle
   autogen: pixel_unshuffle.out

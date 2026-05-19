@@ -57,7 +57,15 @@ struct MPSHooks : public at::MPSHooksInterface {
       const override;
 
   bool isBuilt() const override {
+#if defined(__HIP_PLATFORM_HAGANE__)
+    // Hagane HIP build IS the active accelerator for this fork; surfacing MPS
+    // in parallel trips at::accelerator::getAccelerator()'s
+    // "Cannot have both CUDA and MPS" assertion (DeviceAccelerator.cpp).
+    // See kura/decisions/037-rccl-jaccl-mapping.md and Sprint VII Lane 0.
+    return false;
+#else
     return true;
+#endif
   }
   bool isAvailable() const override {
     return hasMPS();

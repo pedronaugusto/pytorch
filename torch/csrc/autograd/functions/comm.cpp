@@ -7,7 +7,7 @@
 #include <torch/csrc/cuda/comm.h>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 
 #include <memory>
 #include <vector>

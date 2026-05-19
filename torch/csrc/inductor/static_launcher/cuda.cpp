@@ -1,8 +1,8 @@
-#if defined(USE_CUDA)
+#if defined(USE_ROCM)
 
 #include <ATen/Context.h>
-#include <ATen/cuda/Exceptions.h>
-#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
+#include <ATen/hip/Exceptions.h>
+#include <ATen/hip/nvrtc_stub/ATenNVRTC.h>
 #include <torch/csrc/inductor/static_launcher/cuda.h>
 #include <cstdint>
 
@@ -52,8 +52,8 @@ const at::cuda::NVRTC& nvrtc() {
 // 120 max args + 1 for global scratch size
 #define MAX_ARGS 121
 
-CUdeviceptr getPointer(PyObject* obj) {
-  CUdeviceptr data_ptr = 0;
+hipDeviceptr_t getPointer(PyObject* obj) {
+  hipDeviceptr_t data_ptr = 0;
 
   if (THPUtils_checkLong(obj)) {
 #if defined(USE_ROCM)
@@ -87,13 +87,13 @@ CUdeviceptr getPointer(PyObject* obj) {
   if (!data_ptr)
     return data_ptr;
 
-  CUdeviceptr dev_ptr = 0;
+  hipDeviceptr_t dev_ptr = 0;
 #if defined(USE_ROCM)
   AT_CUDA_DRIVER_CHECK(hipPointerGetAttribute(
       &dev_ptr, HIP_POINTER_ATTRIBUTE_DEVICE_POINTER, data_ptr));
 #else
-  AT_CUDA_DRIVER_CHECK(nvrtc().cuPointerGetAttribute(
-      &dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, data_ptr));
+  AT_CUDA_DRIVER_CHECK(nvrtc().hipPointerGetAttribute(
+      &dev_ptr, hipPointerAttributeDevicePointer, data_ptr));
 #endif
 
   return dev_ptr;
@@ -101,19 +101,19 @@ CUdeviceptr getPointer(PyObject* obj) {
 
 #define SHARED_MEM_STATIC_MAX 49152 // 48 KB
 
-CUfunction loadKernel(
+hipFunction_t loadKernel(
     std::string filePath,
     const std::string& funcName,
     uint32_t sharedMemBytes,
-    CUdevice device,
+    hipDevice_t device,
     const std::optional<std::string>& cubinDir = std::nullopt) {
   if (cubinDir) {
     std::filesystem::path p1{*cubinDir};
     std::filesystem::path p2{filePath};
     filePath = (p1 / p2.filename()).string();
   }
-  CUmodule mod = nullptr;
-  CUfunction func = nullptr;
+  hipModule_t mod = nullptr;
+  hipFunction_t func = nullptr;
 
 #if defined(USE_ROCM)
   AT_CUDA_DRIVER_CHECK(hipModuleLoad(&mod, filePath.c_str()));
@@ -123,11 +123,11 @@ CUfunction loadKernel(
       &shared_optin, hipDeviceAttributeMaxSharedMemoryPerBlock, device));
 
 #else
-  AT_CUDA_DRIVER_CHECK(nvrtc().cuModuleLoad(&mod, filePath.c_str()));
+  AT_CUDA_DRIVER_CHECK(nvrtc().hipModuleLoad(&mod, filePath.c_str()));
   AT_CUDA_DRIVER_CHECK(
-      nvrtc().cuModuleGetFunction(&func, mod, funcName.c_str()));
+      nvrtc().hipModuleGetFunction(&func, mod, funcName.c_str()));
   int shared_optin = 0;
-  AT_CUDA_DRIVER_CHECK(nvrtc().cuDeviceGetAttribute(
+  AT_CUDA_DRIVER_CHECK(nvrtc().hipDeviceGetAttribute(
       &shared_optin,
       CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
       device));
@@ -185,17 +185,17 @@ CUfunction loadKernel(
 
 #else
     AT_CUDA_DRIVER_CHECK(
-        nvrtc().cuFuncSetCacheConfig(func, CU_FUNC_CACHE_PREFER_SHARED));
+        nvrtc().hipFuncSetCacheConfig(func, hipFuncCachePreferShared));
     int shared_total = 0, shared_static = 0;
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuDeviceGetAttribute(
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipDeviceGetAttribute(
         &shared_total,
-        CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+        hipDeviceAttributeMaxSharedMemoryPerMultiprocessor,
         device));
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuFuncGetAttribute(
-        &shared_static, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, func));
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuFuncSetAttribute(
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipFuncGetAttribute(
+        &shared_static, hipFuncAttributeSharedSizeBytes, func));
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipFuncSetAttribute(
         func,
-        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        hipFuncAttributeMaxDynamicSharedMemorySize,
         shared_optin - shared_static));
 #endif
   }
@@ -203,14 +203,14 @@ CUfunction loadKernel(
 }
 
 inline void launchKernel(
-    CUfunction func,
+    hipFunction_t func,
     uint32_t gridX,
     uint32_t gridY,
     uint32_t gridZ,
     uint32_t numWarps,
     uint32_t sharedMemBytes,
     void** args,
-    cudaStream_t stream) {
+    hipStream_t stream) {
   // cta_args is always 1 for inductor generated triton kernels,
   // so we don't need to figure out grid dimension here
 #if defined(USE_ROCM)
@@ -234,7 +234,7 @@ inline void launchKernel(
       nullptr));
 
 #else
-  AT_CUDA_DRIVER_CHECK(nvrtc().cuLaunchKernel(
+  AT_CUDA_DRIVER_CHECK(nvrtc().hipModuleLaunchKernel(
       func,
       gridX,
       gridY,
@@ -319,8 +319,8 @@ void parseKernelArgs(
         break;
       case 'O': { // pointer; using helper getPointer() (which may call
                   // data_ptr() if needed)
-        CUdeviceptr ptr = getPointer(item);
-        *reinterpret_cast<CUdeviceptr*>(slot) = ptr;
+        hipDeviceptr_t ptr = getPointer(item);
+        *reinterpret_cast<hipDeviceptr_t*>(slot) = ptr;
         break;
       }
       default:
@@ -349,10 +349,10 @@ PyObject* load_kernel(PyObject* self, PyObject* args) {
           args, "ssii", &filePath, &funcName, &sharedMemBytes, &device_ptr)) {
     return nullptr;
   }
-  CUdevice device = static_cast<CUdevice>(device_ptr); // NOLINT
+  hipDevice_t device = static_cast<hipDevice_t>(device_ptr); // NOLINT
 
   // Ensure CUDA context is initialized before loading kernel
-  CUcontext pctx = nullptr;
+  hipCtx_t pctx = nullptr;
 
 #if defined(USE_ROCM)
   AT_CUDA_DRIVER_CHECK(hipCtxGetCurrent(&pctx));
@@ -361,14 +361,14 @@ PyObject* load_kernel(PyObject* self, PyObject* args) {
     AT_CUDA_DRIVER_CHECK(hipCtxSetCurrent(pctx));
   }
 #else
-  AT_CUDA_DRIVER_CHECK(nvrtc().cuCtxGetCurrent(&pctx));
+  AT_CUDA_DRIVER_CHECK(nvrtc().hipCtxGetCurrent(&pctx));
   if (!pctx) {
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuDevicePrimaryCtxRetain(&pctx, device));
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuCtxSetCurrent(pctx));
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipDevicePrimaryCtxRetain(&pctx, device));
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipCtxSetCurrent(pctx));
   }
 #endif
 
-  CUfunction func = nullptr;
+  hipFunction_t func = nullptr;
   func = loadKernel(filePath, funcName, sharedMemBytes, device);
 
 #if defined(USE_ROCM)
@@ -379,9 +379,9 @@ PyObject* load_kernel(PyObject* self, PyObject* args) {
 
 #else
   AT_CUDA_DRIVER_CHECK(
-      nvrtc().cuFuncGetAttribute(&n_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, func));
-  AT_CUDA_DRIVER_CHECK(nvrtc().cuFuncGetAttribute(
-      &n_spills, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, func));
+      nvrtc().hipFuncGetAttribute(&n_regs, hipFuncAttributeNumRegs, func));
+  AT_CUDA_DRIVER_CHECK(nvrtc().hipFuncGetAttribute(
+      &n_spills, hipFuncAttributeLocalSizeBytes, func));
 
 #endif
   n_spills /= 4;
@@ -392,7 +392,7 @@ PyObject* load_kernel(PyObject* self, PyObject* args) {
 }
 
 PyObject* launch_kernel_inner(
-    CUfunction func,
+    hipFunction_t func,
     int gridX,
     int gridY,
     int gridZ,
@@ -400,7 +400,7 @@ PyObject* launch_kernel_inner(
     int sharedMemBytes,
     const char* argTypes,
     PyObject* varArgs,
-    cudaStream_t cudaStream) {
+    hipStream_t cudaStream) {
   // Launch the kernel
   // Prepare the arguments for the kernel
   // We allocate 8 bytes per argument on the stack. We then allocate 8 more
@@ -422,7 +422,7 @@ PyObject* launch_kernel_inner(
 }
 
 PyObject* launch_kernel_slow(
-    CUfunction func,
+    hipFunction_t func,
     int gridX,
     int gridY,
     int gridZ,
@@ -430,7 +430,7 @@ PyObject* launch_kernel_slow(
     int sharedMemBytes,
     const char* argTypes,
     PyObject* varArgs,
-    cudaStream_t cudaStream) {
+    hipStream_t cudaStream) {
   /* For the slow case, allocate memory on the stack instead of the heap */
   size_t numArgs = std::strlen(argTypes);
   std::vector<uint64_t> argStorage(numArgs);
@@ -453,7 +453,7 @@ PyObject* launch_kernel_slow(
 /**
 *  Main entrypoint function called at runtime; called like this in python land:
     launcher(
-      function, # CUfunction returned by load_kernel()
+      function, # hipFunction_t returned by load_kernel()
       grid_x,
       grid_y,
       grid_z,
@@ -467,7 +467,7 @@ PyObject* launch_kernel_slow(
 */
 PyObject* launch_kernel(PyObject* self, PyObject* args) {
   HANDLE_TH_ERRORS
-  // Pointer to CUfunction generated by load_kernel()
+  // Pointer to hipFunction_t generated by load_kernel()
   uint64_t func_ptr = 0;
   int gridX = 0, gridY = 0, gridZ = 0, numWarps = 0, sharedMemBytes = 0;
   // stream here should be the raw stream gotten from
@@ -494,31 +494,31 @@ PyObject* launch_kernel(PyObject* self, PyObject* args) {
     // No need to do any work if we're outside of grid bounds
     Py_RETURN_NONE;
   }
-  CUcontext pctx = nullptr;
+  hipCtx_t pctx = nullptr;
 #if defined(USE_ROCM)
   AT_CUDA_DRIVER_CHECK(hipCtxGetCurrent(&pctx));
 #else
-  AT_CUDA_DRIVER_CHECK(nvrtc().cuCtxGetCurrent(&pctx));
+  AT_CUDA_DRIVER_CHECK(nvrtc().hipCtxGetCurrent(&pctx));
 #endif
 
   if (!pctx) {
     // Ensure device context exists
-    CUdevice device = 0;
+    hipDevice_t device = 0;
 #if defined(USE_ROCM)
     AT_CUDA_DRIVER_CHECK(hipDeviceGet(&device, 0));
     AT_CUDA_DRIVER_CHECK(hipDevicePrimaryCtxRetain(&pctx, device));
     AT_CUDA_DRIVER_CHECK(hipCtxSetCurrent(pctx));
 #else
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuDeviceGet(&device, 0));
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuDevicePrimaryCtxRetain(&pctx, device));
-    AT_CUDA_DRIVER_CHECK(nvrtc().cuCtxSetCurrent(pctx));
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipDeviceGet(&device, 0));
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipDevicePrimaryCtxRetain(&pctx, device));
+    AT_CUDA_DRIVER_CHECK(nvrtc().hipCtxSetCurrent(pctx));
 
 #endif
   }
-  CUfunction func = reinterpret_cast<CUfunction>(func_ptr); // NOLINT
-  cudaStream_t cudaStream = reinterpret_cast<cudaStream_t>(stream); // NOLINT
+  hipFunction_t func = reinterpret_cast<hipFunction_t>(func_ptr); // NOLINT
+  hipStream_t cudaStream = reinterpret_cast<hipStream_t>(stream); // NOLINT
   auto num_args = std::strlen(argTypes);
-  // Kernels with no arguments should just pass nullptr to cuLaunchKernel
+  // Kernels with no arguments should just pass nullptr to hipModuleLaunchKernel
   if (num_args == 0) {
     launchKernel(
         func,
