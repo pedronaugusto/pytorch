@@ -26,6 +26,7 @@
 #include <ATen/native/Distance.h>
 #include <ATen/native/UpSample.h>  // X+30 Lane C — for upsample_nearest2d_backward_kernel stub.
 #include <ATen/native/Pool.h>      // X+31 Lane C — for avg_pool/max_pool backward stubs.
+#include <ATen/native/AdaptivePooling.h>  // X+42 Lane B — for adaptive_avg_pool{2,3}d_kernel + _backward_kernel DispatchStub symbols.
 #include <ATen/native/cpu/CatKernel.h>
 #include <ATen/native/hip/Sort.h>
 #include <ATen/native/hip/SortStable.h>
@@ -3432,71 +3433,62 @@ C10_EXPORT Tensor log_softmax_backward_sparse_cuda(const Tensor& grad, const Ten
 // Batch 6: Average Pooling (structured kernels)
 // ---------------------------------------------------------------------------
 
+// X+44 Lane B — avg_pool2d_out_cuda routed via DispatchStub (ADR-036 row 122).
+// C-ABI haganeOpsAvgPool2d is now invoked through
+// hagane_avg_pool2d_forward_bridge<kAvgPool2dForwardCfg> in
+// HaganeMetallibBridge.cpp instead of direct call.
 TORCH_IMPL_FUNC(avg_pool2d_out_cuda)
 (const Tensor& input_, int64_t kH_, int64_t kW_, int64_t dH_, int64_t dW_,
  int64_t padH_, int64_t padW_, bool ceil_mode, bool count_include_pad,
  std::optional<int64_t> divisor_override, const Tensor& output) {
   auto input = input_.contiguous();
-  auto id = make_tensor_desc(input);
-  auto od = make_tensor_desc(output);
-  haganeOpsAvgPool2d(&id, &od, (int)kH_, (int)kW_, (int)dH_, (int)dW_,
-                     (int)padH_, (int)padW_, count_include_pad ? 1 : 0,
-                     divisor_override.value_or(0));
+  at::native::avg_pool2d_kernel(kCUDA, output, input,
+      kW_, kH_, dW_, dH_, padW_, padH_,
+      count_include_pad, divisor_override);
 }
 
-TORCH_IMPL_FUNC(avg_pool2d_backward_out_cuda)
-(const Tensor& gradOutput, const Tensor& input, IntArrayRef kernel_size,
- IntArrayRef stride, IntArrayRef padding, bool ceil_mode, bool count_include_pad,
- std::optional<int64_t> divisor_override, const Tensor& gradInput) {
-  // X+31 Lane C — stub-redirect via DispatchStub → bridge → C-ABI.
-  int kH = kernel_size[0], kW = kernel_size.size() > 1 ? kernel_size[1] : kH;
-  int dH = stride.empty() ? kH : stride[0], dW = stride.empty() ? kW : (stride.size() > 1 ? stride[1] : dH);
-  int padH = padding[0], padW = padding.size() > 1 ? padding[1] : padH;
-  gradInput.zero_();
-  at::native::avg_pool2d_backward_kernel(kCUDA, gradInput, gradOutput,
-      kW, kH, dW, dH, padW, padH, count_include_pad, divisor_override);
-}
+// X+36 Lane B.1 — avg_pool2d_backward_out_cuda stub-trampoline deleted via
+// .cu-patch admission of AveragePool2d.cu (HAGANE_ADMIT sentinel). Bridge RD
+// ownership unchanged (HaganeMetallibBridge:247 owns kAvgPool2dBackwardCfg).
 
+// X+44 Lane B — avg_pool3d_out_cuda routed via DispatchStub (ADR-036 row 123).
+// C-ABI haganeOpsAvgPool3d is now invoked through
+// hagane_avg_pool3d_forward_bridge<kAvgPool3dForwardCfg> in
+// HaganeMetallibBridge.cpp. IntArrayRef kernel_size/stride/padding unpacked
+// into per-axis int64_t scalars matching avg_pool3d_fn (Pool.h:30) signature.
 TORCH_IMPL_FUNC(avg_pool3d_out_cuda)
 (const Tensor& input_, IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding,
  bool ceil_mode, bool count_include_pad, std::optional<int64_t> divisor_override, const Tensor& output) {
   auto input = input_.contiguous();
-  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
-  int dD = stride.empty() ? kD : stride[0], dH = stride.empty() ? kH : stride[1], dW = stride.empty() ? kW : stride[2];
-  int padD = padding[0], padH = padding[1], padW = padding[2];
-  auto id = make_tensor_desc(input);
-  auto od = make_tensor_desc(output);
-  haganeOpsAvgPool3d(&id, &od, kD, kH, kW, dD, dH, dW, padD, padH, padW,
-                     count_include_pad ? 1 : 0, divisor_override.value_or(0));
+  int64_t kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
+  int64_t dD = stride.empty() ? kD : stride[0],
+          dH = stride.empty() ? kH : stride[1],
+          dW = stride.empty() ? kW : stride[2];
+  int64_t padD = padding[0], padH = padding[1], padW = padding[2];
+  at::native::avg_pool3d_kernel(kCUDA, output, input,
+      kW, kH, kD, dW, dH, dD, padW, padH, padD,
+      count_include_pad, divisor_override);
 }
 
-TORCH_IMPL_FUNC(avg_pool3d_backward_out_cuda)
-(const Tensor& gradOutput_, const Tensor& input_, IntArrayRef kernel_size,
- IntArrayRef stride, IntArrayRef padding, bool ceil_mode, bool count_include_pad,
- std::optional<int64_t> divisor_override, const Tensor& gradInput) {
-  // X+31 Lane C — NOT retired: upstream avg_pool3d_backward_kernel has
-  // DECLARE_DISPATCH (Pool.h:40) but NO DEFINE_DISPATCH (verified via grep).
-  // The stub symbol doesn't exist at link time; routing through it produces
-  // symbol-not-found at runtime. Defer until upstream gap closes.
-  auto gradOutput = gradOutput_.contiguous();
-  int kD = kernel_size[0], kH = kernel_size[1], kW = kernel_size[2];
-  int dD = stride.empty() ? kD : stride[0], dH = stride.empty() ? kH : stride[1], dW = stride.empty() ? kW : stride[2];
-  int padD = padding[0], padH = padding[1], padW = padding[2];
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  haganeOpsAvgPool3dBackward(&gd, &gid, kD, kH, kW, dD, dH, dW, padD, padH, padW,
-                             count_include_pad ? 1 : 0, divisor_override.value_or(0));
-}
+// X+38 Lane A — avg_pool3d_backward_out_cuda stub deleted via .cu-patch
+// admission of AveragePool3d.cu (HAGANE_ADMIT sentinel). The X+31 Lane C
+// upstream DEFINE_DISPATCH gap closed in X+38 Lane A.1 (single-line patch
+// to AveragePool3d.cpp:516-517 parallel to AveragePool2d.cpp:254-255).
+// Bridge now owns dispatch via REGISTER_DISPATCH(avg_pool3d_backward_kernel)
+// + hagane_avg_pool3d_backward_bridge<kAvgPool3dBackwardCfg> (template +
+// Cfg existed from X+31 Lane C, were never wired up).
 
 // Adaptive avg pool (C10_EXPORT)
+// X+42 Lane B — adaptive_avg_pool2d{_out,}_cuda routed via DispatchStub
+// (ADR-036 row 120). C-ABI haganeOpsAdaptiveAvgPool2d is now invoked through
+// hagane_adaptive_avg_pool_forward_bridge<kAdaptiveAvgPool2dForwardCfg> in
+// HaganeMetallibBridge.cpp instead of direct call. Proves forward retirement
+// viability for Tier 2 cohort.
 C10_EXPORT Tensor& adaptive_avg_pool2d_out_cuda(const Tensor& input, IntArrayRef output_size, Tensor& output) {
   auto sizes = input.sizes();
-  int64_t oH = output_size[0], oW = output_size[1];
-  output.resize_({sizes[0], sizes[1], oH, oW});
+  output.resize_({sizes[0], sizes[1], output_size[0], output_size[1]});
   auto input_c = input.contiguous();
-  auto id = make_tensor_desc(input_c);
-  auto od = make_tensor_desc(output);
-  haganeOpsAdaptiveAvgPool2d(&id, &od);
+  at::native::adaptive_avg_pool2d_kernel(kCUDA, output, input_c, output_size);
   return output;
 }
 
@@ -3506,20 +3498,25 @@ C10_EXPORT Tensor adaptive_avg_pool2d_cuda(const Tensor& input, IntArrayRef outp
   return output;
 }
 
+// X+40 Lane A — adaptive_avg_pool2d_backward_cuda + _out_cuda routed via
+// DispatchStub (ADR-036 row 118). C-ABI haganeOpsAdaptiveAvgPool2dBackward
+// is now invoked through hagane_adaptive_avg_pool_backward_bridge<kAdaptiveAvgPool2dBackwardCfg>
+// in HaganeMetallibBridge.cpp instead of direct call. Forward entry points
+// (adaptive_avg_pool2d_out_cuda + _cuda) retain direct C-ABI for fast-path.
 C10_EXPORT Tensor adaptive_avg_pool2d_backward_cuda(const Tensor& gradOutput, const Tensor& input) {
   auto gradInput = at::zeros_like(input);
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  haganeOpsAdaptiveAvgPool2dBackward(&gd, &gid);
+  at::native::adaptive_avg_pool2d_backward_kernel(kCUDA, gradInput, gradOutput);
   return gradInput;
 }
 
+// X+42 Lane B — adaptive_avg_pool3d{_out,}_cuda routed via DispatchStub
+// (ADR-036 row 121). C-ABI haganeOpsAdaptiveAvgPool3d is now invoked through
+// hagane_adaptive_avg_pool_forward_bridge<kAdaptiveAvgPool3dForwardCfg> in
+// HaganeMetallibBridge.cpp.
 C10_EXPORT Tensor& adaptive_avg_pool3d_out_cuda(const Tensor& input, IntArrayRef output_size, Tensor& output) {
   output.resize_({input.size(0), input.size(1), output_size[0], output_size[1], output_size[2]});
   auto input_c = input.contiguous();
-  auto id = make_tensor_desc(input_c);
-  auto od = make_tensor_desc(output);
-  haganeOpsAdaptiveAvgPool3d(&id, &od);
+  at::native::adaptive_avg_pool3d_kernel(kCUDA, output, input_c, output_size);
   return output;
 }
 
@@ -3529,20 +3526,21 @@ C10_EXPORT Tensor adaptive_avg_pool3d_cuda(const Tensor& input, IntArrayRef outp
   return output;
 }
 
+// X+40 Lane A — adaptive_avg_pool3d_backward_cuda + _out_cuda routed via
+// DispatchStub (ADR-036 row 119). Bridge owns dispatch through
+// REGISTER_DISPATCH(adaptive_avg_pool3d_backward_kernel) + hagane_adaptive_avg_pool_backward_bridge
+// in HaganeMetallibBridge.cpp. The X+39 Lane A upstream DEFINE_DISPATCH at
+// AdaptiveAveragePooling.cpp:160 emits the symbol storage.
 C10_EXPORT Tensor adaptive_avg_pool3d_backward_cuda(const Tensor& gradOutput, const Tensor& input) {
   auto gradInput = at::zeros_like(input);
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  haganeOpsAdaptiveAvgPool3dBackward(&gd, &gid);
+  at::native::adaptive_avg_pool3d_backward_kernel(kCUDA, gradInput, gradOutput);
   return gradInput;
 }
 
 C10_EXPORT Tensor& adaptive_avg_pool3d_backward_out_cuda(const Tensor& gradOutput, const Tensor& input, Tensor& gradInput) {
   gradInput.resize_as_(input);
   gradInput.zero_();
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  haganeOpsAdaptiveAvgPool3dBackward(&gd, &gid);
+  at::native::adaptive_avg_pool3d_backward_kernel(kCUDA, gradInput, gradOutput);
   return gradInput;
 }
 
@@ -3565,15 +3563,10 @@ TORCH_IMPL_FUNC(max_pool2d_with_indices_out_cuda)
   haganeOpsMaxPool2d(&id, &od, &iid, kH, kW, dH, dW, padH, padW, dilH, dilW);
 }
 
-TORCH_IMPL_FUNC(max_pool2d_with_indices_backward_out_cuda)
-(const Tensor& gradOutput, const Tensor& input, IntArrayRef kernel_size,
- IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation, bool ceil_mode,
- const Tensor& indices, const Tensor& gradInput) {
-  // X+32 Lane A — stub-redirect retirement (ADR-036 row 111). Bridge owns the
-  // dispatch via REGISTER_DISPATCH(max_pool2d_backward_kernel) in
-  // HaganeMetallibBridge.cpp; C-ABI carries X+29 fix template.
-  at::native::max_pool2d_backward_kernel(kCUDA, gradInput, gradOutput, indices);
-}
+// X+37 Lane A — max_pool2d_with_indices_backward_out_cuda stub-trampoline
+// deleted via .cu-patch admission of DilatedMaxPool2d.cu (HAGANE_ADMIT
+// sentinel). Bridge RD ownership unchanged (HaganeMetallibBridge:257 owns
+// kMaxPool2dBackwardCfg).
 
 // Max pool 3D (C10_EXPORT)
 C10_EXPORT std::tuple<Tensor&, Tensor&> max_pool3d_with_indices_out_cuda(
@@ -3638,13 +3631,10 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_out_cuda)
   haganeOpsAdaptiveMaxPool2d(&id, &od, &iid);
 }
 
-TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
-(const Tensor& gradOutput, const Tensor& input, const Tensor& indices, const Tensor& gradInput) {
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  auto iid = make_tensor_desc(indices);
-  haganeOpsAdaptiveMaxPool2dBackward(&gd, &gid, &iid);
-}
+// X+37 Lane B — adaptive_max_pool2d_backward_out_cuda stub deleted via .cu-patch
+// admission of AdaptiveMaxPooling2d.cu (HAGANE_ADMIT sentinel). Bridge owns
+// dispatch via new REGISTER_DISPATCH(adaptive_max_pool2d_backward_kernel) +
+// hagane_max_pool2d_backward_bridge<kAdaptiveMaxPool2dBackwardCfg>.
 
 TORCH_IMPL_FUNC(adaptive_max_pool3d_out_cuda)
 (const Tensor& input, IntArrayRef output_size, const Tensor& output, const Tensor& indices) {
@@ -3655,13 +3645,11 @@ TORCH_IMPL_FUNC(adaptive_max_pool3d_out_cuda)
   haganeOpsAdaptiveMaxPool3d(&id, &od, &iid);
 }
 
-TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cuda)
-(const Tensor& gradOutput, const Tensor& input, const Tensor& indices, const Tensor& gradInput) {
-  auto gd = make_tensor_desc(gradOutput);
-  auto gid = make_tensor_desc(gradInput);
-  auto iid = make_tensor_desc(indices);
-  haganeOpsAdaptiveMaxPool3dBackward(&gd, &gid, &iid);
-}
+// X+37 Lane B — adaptive_max_pool3d_backward_out_cuda stub deleted via .cu-patch
+// admission of AdaptiveMaxPooling3d.cu (HAGANE_ADMIT sentinel). Bridge owns
+// dispatch via new REGISTER_DISPATCH(adaptive_max_pool3d_backward_kernel) +
+// hagane_max_pool2d_backward_bridge<kAdaptiveMaxPool3dBackwardCfg> (template
+// reused since signatures match).
 
 // Fractional max pool (structured)
 TORCH_IMPL_FUNC(fractional_max_pool2d_out_cuda)
@@ -3817,65 +3805,26 @@ TORCH_IMPL_FUNC(name##_backward_out_cuda)( \
 
 UPSAMPLE_NEAREST_FWD(upsample_nearest1d, 1)
 UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact1d, 1)
-// X+30 Lane D — `upsample_nearest1d_backward` retired via stub-redirect
-// mechanism (ADR-036 row 100); see Lane C comment below.
-TORCH_IMPL_FUNC(upsample_nearest1d_backward_out_cuda)(
-    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
-    std::optional<double> scales, const Tensor& grad_input) {
-  at::native::upsample_nearest1d_backward_kernel(
-      kCUDA, grad_input, grad_output, scales);
-}
-// X+31 Lane B — stub-redirect retirement.
-TORCH_IMPL_FUNC(_upsample_nearest_exact1d_backward_out_cuda)(
-    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
-    std::optional<double> scales, const Tensor& grad_input) {
-  at::native::_upsample_nearest_exact1d_backward_kernel(
-      kCUDA, grad_input, grad_output, scales);
-}
+// X+33 Lane B — `upsample_nearest1d_backward` + `_upsample_nearest_exact1d_backward`
+// TIF stub-trampolines (formerly X+30 Lane D / X+31 Lane B stub-redirects) deleted.
+// The .cu-patch mechanism now admits UpSampleNearest1d.hip directly under
+// Hagane via the `// HAGANE_ADMIT` sentinel + cmake override (ADR-036 §X+33).
+// The admitted .hip's backward TIFs route through the same DispatchStubs the
+// bridge already RDs (HaganeMetallibBridge.cpp:214,236).
 
 UPSAMPLE_NEAREST_FWD(upsample_nearest2d, 2)
 UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact2d, 2)
-// X+30 Lane C — `upsample_nearest2d_backward` no longer expanded from the
-// UPSAMPLE_NEAREST_BWD macro; the explicit form below routes the
-// TORCH_IMPL_FUNC body through `upsample_nearest2d_backward_kernel` (the
-// stub HaganeMetallibBridge.cpp REGISTER_DISPATCHes — ADR-036 row 99). The
-// C-ABI haganeOpsUpsampleNearest2dBackward is no longer called from
-// HaganeOps.cpp; the bridge owns the kernel.
-TORCH_IMPL_FUNC(upsample_nearest2d_backward_out_cuda)(
-    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
-    std::optional<double> scales_h, std::optional<double> scales_w,
-    const Tensor& grad_input) {
-  at::native::upsample_nearest2d_backward_kernel(
-      kCUDA, grad_input, grad_output, scales_h, scales_w);
-}
-// X+31 Lane B — stub-redirect retirement.
-TORCH_IMPL_FUNC(_upsample_nearest_exact2d_backward_out_cuda)(
-    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
-    std::optional<double> scales_h, std::optional<double> scales_w,
-    const Tensor& grad_input) {
-  at::native::_upsample_nearest_exact2d_backward_kernel(
-      kCUDA, grad_input, grad_output, scales_h, scales_w);
-}
+// X+35 Lane A.1 — 2d backward stub-trampolines deleted via .cu-patch admission
+// of UpSampleNearest2d.hip (ADR-036 §X+35). Backward TIFs now live in the
+// admitted .hip file's HAGANE branch which routes through the same DispatchStubs
+// the bridge RDs (HaganeMetallibBridge.cpp:216,238).
 
 UPSAMPLE_NEAREST_FWD(upsample_nearest3d, 3)
 UPSAMPLE_NEAREST_FWD(_upsample_nearest_exact3d, 3)
-// X+30 Lane D — `upsample_nearest3d_backward` retired via stub-redirect
-// mechanism (ADR-036 row 101); see Lane C comment above.
-TORCH_IMPL_FUNC(upsample_nearest3d_backward_out_cuda)(
-    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
-    std::optional<double> scales_d, std::optional<double> scales_h,
-    std::optional<double> scales_w, const Tensor& grad_input) {
-  at::native::upsample_nearest3d_backward_kernel(
-      kCUDA, grad_input, grad_output, scales_d, scales_h, scales_w);
-}
-// X+31 Lane B — stub-redirect retirement.
-TORCH_IMPL_FUNC(_upsample_nearest_exact3d_backward_out_cuda)(
-    const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
-    std::optional<double> scales_d, std::optional<double> scales_h,
-    std::optional<double> scales_w, const Tensor& grad_input) {
-  at::native::_upsample_nearest_exact3d_backward_kernel(
-      kCUDA, grad_input, grad_output, scales_d, scales_h, scales_w);
-}
+// X+35 Lane A.2 — 3d backward stub-trampolines deleted via .cu-patch admission
+// of UpSampleNearest3d.hip (ADR-036 §X+35). Backward TIFs now live in the
+// admitted .hip file's HAGANE branch which routes through the same DispatchStubs
+// the bridge RDs (HaganeMetallibBridge.cpp:218,240).
 
 #undef UPSAMPLE_NEAREST_SCALES_1
 #undef UPSAMPLE_NEAREST_SCALES_2
@@ -3890,13 +3839,11 @@ TORCH_IMPL_FUNC(upsample_linear1d_out_cuda)
   haganeOpsUpsampleLinear1d(&id, &od, align_corners ? 1 : 0);
 }
 
-TORCH_IMPL_FUNC(upsample_linear1d_backward_out_cuda)
-(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
- bool align_corners, std::optional<double> scales, const Tensor& grad_input) {
-  // X+31 Lane A — stub-redirect via DispatchStub → bridge → C-ABI.
-  at::native::upsample_linear1d_backward_kernel(
-      kCUDA, grad_input, grad_output, align_corners, scales);
-}
+// X+36 Lane A.1 — upsample_linear1d_backward_out_cuda stub-trampoline deleted
+// via .cu-patch admission of UpSampleLinear1d.cu (HAGANE_ADMIT sentinel). The
+// admitted .cu's backward TIF body now calls upsample_linear1d_backward_kernel
+// directly under HAGANE; bridge RD ownership unchanged (HaganeMetallibBridge
+// REGISTER_DISPATCH at line 226 owns kUpsampleLinear1dBackwardCfg dispatch).
 
 TORCH_IMPL_FUNC(upsample_bilinear2d_out_cuda)
 (const Tensor& input, IntArrayRef output_size, bool align_corners,
@@ -3907,14 +3854,10 @@ TORCH_IMPL_FUNC(upsample_bilinear2d_out_cuda)
   haganeOpsUpsampleBilinear2d(&id, &od, align_corners ? 1 : 0);
 }
 
-TORCH_IMPL_FUNC(upsample_bilinear2d_backward_out_cuda)
-(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
- bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
- const Tensor& grad_input) {
-  // X+31 Lane A — stub-redirect via DispatchStub → bridge → C-ABI.
-  at::native::upsample_bilinear2d_backward_kernel(
-      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
-}
+// X+36 Lane A.2 — upsample_bilinear2d_backward_out_cuda stub-trampoline
+// deleted via .cu-patch admission of UpSampleBilinear2d.cu (HAGANE_ADMIT
+// sentinel). Bridge RD ownership unchanged (HaganeMetallibBridge:228 owns
+// kUpsampleBilinear2dBackwardCfg).
 
 // Bilinear AA and Bicubic AA: same as non-AA for now (AA is a subtle quality difference)
 TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_out_cuda)
@@ -3926,17 +3869,10 @@ TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_out_cuda)
   haganeOpsUpsampleBilinear2d(&id, &od, align_corners ? 1 : 0);
 }
 
-TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_backward_out_cuda)
-(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
- bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
- const Tensor& grad_input) {
-  // X+32 Lane C — stub-redirect retirement (ADR-036 row 112). Bridge owns
-  // dispatch via REGISTER_DISPATCH(_upsample_bilinear2d_aa_backward_kernel)
-  // in HaganeMetallibBridge.cpp. C-ABI haganeOpsUpsampleBilinear2dAABackward
-  // implements PIL-style anti-aliased downsample with X+29 fix template.
-  at::native::_upsample_bilinear2d_aa_backward_kernel(
-      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
-}
+// X+36 Lane A.2 — _upsample_bilinear2d_aa_backward_out_cuda stub-trampoline
+// deleted via .cu-patch admission of UpSampleBilinear2d.cu (HAGANE_ADMIT
+// sentinel). Bridge RD ownership unchanged (HaganeMetallibBridge:264 owns
+// kUpsampleBilinear2dAABackwardCfg).
 
 TORCH_IMPL_FUNC(upsample_bicubic2d_out_cuda)
 (const Tensor& input, IntArrayRef output_size, bool align_corners,
@@ -3947,18 +3883,11 @@ TORCH_IMPL_FUNC(upsample_bicubic2d_out_cuda)
   haganeOpsUpsampleBicubic2d(&id, &od, align_corners ? 1 : 0);
 }
 
-TORCH_IMPL_FUNC(upsample_bicubic2d_backward_out_cuda)
-(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
- bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
- const Tensor& grad_input) {
-  // X+32 Lane D — stub-redirect retirement (ADR-036 row 114). Bridge owns
-  // dispatch via REGISTER_DISPATCH(upsample_bicubic2d_backward_kernel). The
-  // DispatchStub for this op is an upstream patch (X+32 Lane D): UpSample.h
-  // + UpSampleBicubic2d.cpp converted the free-function kernel into a
-  // proper DispatchStub.
-  at::native::upsample_bicubic2d_backward_kernel(
-      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
-}
+// X+36 Lane A.3 — upsample_bicubic2d_backward_out_cuda stub-trampoline
+// deleted via .cu-patch admission of UpSampleBicubic2d.cu (HAGANE_ADMIT
+// sentinel). Bridge RD ownership unchanged (HaganeMetallibBridge:272 owns
+// kUpsampleBicubic2dBackwardCfg). Upstream X+32 Lane D DECLARE_DISPATCH
+// in UpSample.h + REGISTER_ARCH_DISPATCH in UpSampleBicubic2d.cpp remain.
 
 TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_out_cuda)
 (const Tensor& input, IntArrayRef output_size, bool align_corners,
@@ -3969,17 +3898,11 @@ TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_out_cuda)
   haganeOpsUpsampleBicubic2d(&id, &od, align_corners ? 1 : 0);
 }
 
-TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_backward_out_cuda)
-(const Tensor& grad_output, IntArrayRef output_size, IntArrayRef input_size,
- bool align_corners, std::optional<double> scales_h, std::optional<double> scales_w,
- const Tensor& grad_input) {
-  // X+32 Lane C — stub-redirect retirement (ADR-036 row 113). Bridge owns
-  // dispatch via REGISTER_DISPATCH(_upsample_bicubic2d_aa_backward_kernel)
-  // in HaganeMetallibBridge.cpp. C-ABI haganeOpsUpsampleBicubic2dAABackward
-  // uses PIL Keys A=-0.5 (vs A=-0.75 in non-AA) with X+29 fix template.
-  at::native::_upsample_bicubic2d_aa_backward_kernel(
-      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
-}
+// X+36 Lane A.2 — _upsample_bicubic2d_aa_backward_out_cuda stub-trampoline
+// deleted via .cu-patch admission of UpSampleBilinear2d.cu (the bicubic AA
+// TIFs live in that file via the shared upsample_gen2d_aa template). Bridge
+// RD ownership unchanged (HaganeMetallibBridge:266 owns
+// kUpsampleBicubic2dAABackwardCfg).
 
 TORCH_IMPL_FUNC(upsample_trilinear3d_out_cuda)
 (const Tensor& input, IntArrayRef output_size, bool align_corners,

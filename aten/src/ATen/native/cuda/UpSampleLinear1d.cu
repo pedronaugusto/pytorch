@@ -1,5 +1,11 @@
 // Adapted from interp.cpp from Caffe util by Pauline Luc
 // Originally developed by George Papandreou
+//
+// HAGANE_ADMIT — Sprint X+36 Lane A.1 (ADR-036 §X+36). Under Hagane the anon
+// namespace + forward TIF are guarded out; the backward TIF routes via the
+// upsample_linear1d_backward_kernel DispatchStub registered in
+// HaganeMetallibBridge.cpp. Sentinel honored by caffe2/CMakeLists.txt's
+// `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -7,9 +13,13 @@
 #include <ATen/Dispatch.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/Utils.h>
-#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#if defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/native/UpSample.h>
+#else
+#include <ATen/cuda/Atomic.cuh>
 #include <ATen/native/cuda/UpSample.cuh>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -20,6 +30,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 template <typename scalar_t, typename accscalar_t>
@@ -203,7 +215,9 @@ static void upsample_linear1d_backward_out_cuda_template(
 }
 
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(upsample_linear1d_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -213,6 +227,7 @@ TORCH_IMPL_FUNC(upsample_linear1d_out_cuda) (
 ) {
   upsample_linear1d_out_cuda_template(output, input, output_size, align_corners, scales);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(upsample_linear1d_backward_out_cuda) (
     const Tensor& grad_output,
@@ -222,11 +237,16 @@ TORCH_IMPL_FUNC(upsample_linear1d_backward_out_cuda) (
     std::optional<double> scales,
     const Tensor& grad_input
 ) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage
   globalContext().alertNotDeterministic("upsample_linear1d_backward_out_cuda");
   upsample_linear1d_backward_out_cuda_template(
       grad_input, grad_output, output_size, input_size, align_corners, scales);
+#else
+  upsample_linear1d_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales);
+#endif
 }
 
 } // namespace at::native

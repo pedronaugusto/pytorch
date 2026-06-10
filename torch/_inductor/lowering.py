@@ -3320,6 +3320,7 @@ make_fallback(aten._histogramdd_from_bin_cts.default)
 # Need templated kernel
 make_fallback(aten.addbmm)
 make_fallback(aten._addmm_activation, warn=False)
+make_fallback(aten.mv, override_decomp=True)
 
 make_fallback(aten._grouped_mm, require_dense)
 
@@ -8136,6 +8137,24 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
 
 make_fallback(auto_functionalized)
+
+# Hagane MVP: indirect indexing in fused Pointwise kernels is unsupported by
+# HaganeKernel.load() (whole-tensor semantics). Force embedding through
+# FallbackKernel so the gather dispatches via aten -> HaganeOps.cpp at runtime.
+make_fallback(aten.embedding, override_decomp=True)
+
+# Hagane MVP: pointwise_cat lowers cat as fused Pointwise with masked loads,
+# which HaganeKernel cannot codegen (no `masked` or `indirect_indexing` overrides).
+# Force aten.cat through FallbackKernel -> HaganeOps.cpp aten dispatch.
+make_fallback(aten.cat, override_decomp=True)
+
+# Hagane MVP X+63: aten.neg on rotary half-slice (rotate_half's -x2) emits a
+# Pointwise that reads from a strided slice view. HaganeKernel.load() returns
+# the whole tensor regardless of index, causing numel mismatch at store. Force
+# aten.neg through FallbackKernel so the slice realizes before dispatch.
+# (4th member of the universal indirect-indexing fix family: mv X+58,
+# embedding X+60+X+62, cat X+61+X+62, neg X+63.)
+make_fallback(aten.neg, override_decomp=True)
 
 
 @register_lowering(triton_kernel_wrapper_mutation)

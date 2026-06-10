@@ -1,3 +1,6 @@
+// HAGANE_ADMIT — Sprint X+33/X+35 .cu-patch admission. Mutual-exclusive
+// .cuh/.h includes + anonymous-namespace HAGANE guard pattern (see
+// kura/runbooks/hagane-cu-patch-admission.md).
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -6,10 +9,14 @@
 #include <ATen/TensorUtils.h>
 #include <ATen/Utils.h>
 #include <ATen/cuda/CUDAContext.h>
+#if defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/native/UpSample.h>
+#else
 #include <ATen/native/cuda/LaunchUtils.h>
 #include <ATen/native/cuda/UpSample.cuh>
 #include <ATen/native/cuda/KernelUtils.cuh>
 #include <ATen/cuda/detail/KernelUtils.h>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -23,6 +30,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 #define MAX_THREADS 512
@@ -440,7 +449,9 @@ static void upsample_nearest2d_backward_out_cuda_template(
 }
 
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(upsample_nearest2d_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -460,6 +471,7 @@ TORCH_IMPL_FUNC(_upsample_nearest_exact2d_out_cuda) (
   upsample_nearest2d_out_cuda_template<nearest_neighbor_exact_compute_source_index>(
       output, input, output_size, scales_h, scales_w);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(upsample_nearest2d_backward_out_cuda) (
     const Tensor& grad_output,
@@ -468,8 +480,13 @@ TORCH_IMPL_FUNC(upsample_nearest2d_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   upsample_nearest2d_backward_out_cuda_template<nearest_neighbor_bw_compute_source_index>(
       grad_input, grad_output, output_size, input_size, scales_h, scales_w);
+#else
+  upsample_nearest2d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_h, scales_w);
+#endif
 }
 
 TORCH_IMPL_FUNC(_upsample_nearest_exact2d_backward_out_cuda) (
@@ -479,8 +496,13 @@ TORCH_IMPL_FUNC(_upsample_nearest_exact2d_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   upsample_nearest2d_backward_out_cuda_template<nearest_neighbor_exact_bw_compute_source_index>(
       grad_input, grad_output, output_size, input_size, scales_h, scales_w);
+#else
+  _upsample_nearest_exact2d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_h, scales_w);
+#endif
 }
 
 } // namespace at::native

@@ -1217,7 +1217,7 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
 
     @classmethod
     def _initialize_pointwise_overrides(cls, target: str) -> None:
-        assert target in ("triton", "cpp", "cppvec", "halide", "mps"), target
+        assert target in ("triton", "cpp", "cppvec", "halide", "mps", "hagane"), target
 
         for funcname, data in pointwise_overrides_data.items():
             impl = getattr(data, target)
@@ -1245,6 +1245,7 @@ class OverridesData:
     )
     halide: Callable[..., str] | None = None
     mps: Callable[..., str] | None = None
+    hagane: Callable[..., str] | None = None
 
 
 # NB: if you add a new special function, don't forget to update

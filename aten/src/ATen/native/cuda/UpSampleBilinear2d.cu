@@ -1,5 +1,13 @@
 // Adapted from interp.cpp from Caffe util by Pauline Luc
 // Originally developed by George Papandreou
+//
+// HAGANE_ADMIT — Sprint X+36 Lane A.2 (ADR-036 §X+36). Under Hagane the anon
+// namespace + forward TIFs (bilinear2d, _bilinear2d_aa, _bicubic2d_aa) are
+// guarded out; the 3 backward TIFs (bilinear2d, _bilinear2d_aa, _bicubic2d_aa)
+// route via DispatchStubs (upsample_bilinear2d_backward_kernel,
+// _upsample_bilinear2d_aa_backward_kernel, _upsample_bicubic2d_aa_backward_kernel)
+// registered in HaganeMetallibBridge.cpp. Sentinel honored by
+// caffe2/CMakeLists.txt's `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -8,10 +16,14 @@
 #include <ATen/TensorUtils.h>
 #include <ATen/Utils.h>
 #include <ATen/cuda/CUDAContext.h>
+#if defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/native/UpSample.h>
+#else
 #include <ATen/native/cuda/UpSample.cuh>
 #include <ATen/native/cuda/KernelUtils.cuh>
 #include <ATen/cuda/detail/KernelUtils.h>
 #include <ATen/native/cuda/LaunchUtils.h>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -28,6 +40,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 template <typename scalar_t, typename accscalar_t>
@@ -942,7 +956,9 @@ static void upsample_gen2d_aa_backward_out_cuda_template(
 }
 
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(upsample_bilinear2d_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -952,6 +968,7 @@ TORCH_IMPL_FUNC(upsample_bilinear2d_out_cuda) (
     const Tensor& output) {
   upsample_bilinear2d_out_cuda_template(output, input, output_size, align_corners, scales_h, scales_w);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(upsample_bilinear2d_backward_out_cuda) (
     const Tensor& grad_output,
@@ -961,13 +978,19 @@ TORCH_IMPL_FUNC(upsample_bilinear2d_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage
   globalContext().alertNotDeterministic("upsample_bilinear2d_backward_out_cuda");
   upsample_bilinear2d_backward_out_cuda_template(
       grad_input, grad_output, output_size, input_size, align_corners, scales_h, scales_w);
+#else
+  upsample_bilinear2d_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
+#endif
 }
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -979,6 +1002,7 @@ TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_out_cuda) (
   upsample_gen2d_aa_out_cuda_template<upsample_antialias::BilinearFilterFunctor>(
       output, input, output_size, align_corners, scales_h, scales_w);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_backward_out_cuda) (
     const Tensor& grad_output,
@@ -988,15 +1012,21 @@ TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage
   globalContext().alertNotDeterministic("upsample_bilinear2d_aa_backward_out_cuda");
   upsample_gen2d_aa_backward_out_cuda_template<upsample_antialias::BilinearFilterFunctor>(
       grad_input, grad_output, output_size, input_size, align_corners, scales_h, scales_w);
+#else
+  _upsample_bilinear2d_aa_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
+#endif
 }
 
 // We define bicubic anti-alias function implementations in this file instead of
 // UpSampleBicubic2d.cu as we are using a single generic implementation
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -1007,6 +1037,7 @@ TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_out_cuda) (
   upsample_gen2d_aa_out_cuda_template<upsample_antialias::BicubicFilterFunctor>(
       output, input, output_size, align_corners, scales_h, scales_w);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_backward_out_cuda) (
     const Tensor& grad_output,
@@ -1016,11 +1047,16 @@ TORCH_IMPL_FUNC(_upsample_bicubic2d_aa_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage
   globalContext().alertNotDeterministic("upsample_bicubic2d_aa_backward_out_cuda");
   upsample_gen2d_aa_backward_out_cuda_template<upsample_antialias::BicubicFilterFunctor>(
       grad_input, grad_output, output_size, input_size, align_corners, scales_h, scales_w);
+#else
+  _upsample_bicubic2d_aa_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
+#endif
 }
 
 } // namespace at::native

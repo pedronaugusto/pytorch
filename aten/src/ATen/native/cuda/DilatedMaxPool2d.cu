@@ -1,3 +1,8 @@
+// HAGANE_ADMIT — Sprint X+37 Lane A (ADR-036 §X+37). Under Hagane the anon
+// namespace + forward TIF are guarded out; the backward TIF routes via the
+// max_pool2d_backward_kernel DispatchStub registered in
+// HaganeMetallibBridge.cpp:257. Sentinel honored by caffe2/CMakeLists.txt's
+// `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -7,12 +12,16 @@
 #include <ATen/NumericUtils.h>
 #include <ATen/native/Pool.h>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(__HIP_PLATFORM_HAGANE__)
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/cuda/detail/TensorInfo.cuh>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/cuda/detail/KernelUtils.h>
+#endif
 #include <c10/macros/Macros.h>
+#if !defined(__HIP_PLATFORM_HAGANE__)
 #include <ATen/native/cuda/LaunchUtils.h>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/NativeFunctions.h>
@@ -22,6 +31,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 __device__ inline int min(int a, int b) {
@@ -447,7 +458,9 @@ __global__ void max_pool_backward_nhwc(const scalar_t* top_diff,
 }
 
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(max_pool2d_with_indices_out_cuda)
 (const Tensor& input_,
 IntArrayRef kernel_size,
@@ -624,6 +637,7 @@ const Tensor& indices) {
     }
   );
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(max_pool2d_with_indices_backward_out_cuda)
 (const Tensor& gradOutput_,
@@ -635,6 +649,10 @@ IntArrayRef dilation,
 bool ceil_mode,
 const Tensor& indices_,
 const Tensor& gradInput) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  max_pool2d_backward_kernel(kCUDA, gradInput, gradOutput_, indices_);
+  return;
+#else
   NoNamesGuard guard;
 
   TensorArg gradInput_arg{ gradInput, "gradInput", 1 };
@@ -791,6 +809,7 @@ const Tensor& gradInput) {
       }
     }
   );
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 }
 
 } // at::native

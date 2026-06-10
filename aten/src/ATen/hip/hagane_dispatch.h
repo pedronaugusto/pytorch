@@ -1002,9 +1002,16 @@ struct MaxPool3dBackwardOpConfig {
                     const haganeOpsTensor_t*);
     max_pool3d_backward_fn cpu_fallback;
 };
-// X+31 Lane D — max_pool2d_backward signature: (const Tensor& grad_input,
-// const Tensor& grad_output, const Tensor& indices) — see Pool.h:15.
-struct MaxPool2dBackwardOpConfig {
+// X+31 Lane D / X+39 Lane B rename — pool-with-indices backward signature
+// shared across max_pool2d_backward + adaptive_max_pool{2,3}d_backward:
+// `void(*)(const Tensor& grad_input, const Tensor& grad_output, const Tensor& indices)`.
+// All 3 DispatchStubs typedef to the identical function-pointer type, so a
+// single struct + template serves all 3 ops. Originally named
+// MaxPool2dBackwardOpConfig (X+31 Lane D) — renamed X+39 Lane B once it
+// served >1 op (X+37 added the 2 adaptive ops). cpu_fallback uses
+// `max_pool2d_backward_fn` typedef name out of historical preference; the
+// type is identical to `adaptive_max_pooling{2,3}d_backward_fn`.
+struct PoolBackwardWithIndicesOpConfig {
     const char* op_name;
     int (*c_abi_fn)(const haganeOpsTensor_t*, const haganeOpsTensor_t*,
                     const haganeOpsTensor_t*);
@@ -1020,9 +1027,77 @@ inline constexpr AvgPool3dOpConfig kAvgPool3dBackwardCfg = {
 inline constexpr MaxPool3dBackwardOpConfig kMaxPool3dBackwardCfg = {
     "max_pool3d_backward", &haganeOpsMaxPool3dBackward,
     &cpu_dispatch_max_pool3d_backward};
-inline constexpr MaxPool2dBackwardOpConfig kMaxPool2dBackwardCfg = {
+inline constexpr PoolBackwardWithIndicesOpConfig kMaxPool2dBackwardCfg = {
     "max_pool2d_backward", &haganeOpsMaxPool2dBackward,
     &cpu_dispatch_max_pool2d_backward};
+// X+37 Lane B — adaptive_max_pool{2,3}d_backward Cfg constants. Reuse
+// PoolBackwardWithIndicesOpConfig + hagane_pool_backward_with_indices_bridge template;
+// the C-ABI + DispatchStub + cpu_fallback signatures all match exactly
+// (Tensor& gradInput, gradOutput, indices). Bridge RDs land at
+// HaganeMetallibBridge.cpp via REGISTER_DISPATCH(adaptive_max_pool{2,3}d_backward_kernel).
+inline constexpr PoolBackwardWithIndicesOpConfig kAdaptiveMaxPool2dBackwardCfg = {
+    "adaptive_max_pool2d_backward", &haganeOpsAdaptiveMaxPool2dBackward,
+    &cpu_dispatch_adaptive_max_pool2d_backward};
+inline constexpr PoolBackwardWithIndicesOpConfig kAdaptiveMaxPool3dBackwardCfg = {
+    "adaptive_max_pool3d_backward", &haganeOpsAdaptiveMaxPool3dBackward,
+    &cpu_dispatch_adaptive_max_pool3d_backward};
+
+// X+40 Lane A — AdaptiveAvgPool backward shape (2-arg, no indices). Shared
+// across 2D + 3D variants per AdaptivePooling.h:12,22 typedefs. C-ABIs:
+// haganeOpsAdaptiveAvgPool{2,3}dBackward(grad_output, grad_input) — note
+// arg order is swapped vs DispatchStub typedef but the bridge template
+// re-orders them.
+struct AdaptiveAvgPoolBackwardOpConfig {
+    const char* op_name;
+    int (*c_abi_fn)(const haganeOpsTensor_t*, const haganeOpsTensor_t*);
+    adaptive_avg_pooling2d_backward_fn cpu_fallback;  // identical to 3d_backward_fn
+};
+inline constexpr AdaptiveAvgPoolBackwardOpConfig kAdaptiveAvgPool2dBackwardCfg = {
+    "adaptive_avg_pool2d_backward", &haganeOpsAdaptiveAvgPool2dBackward,
+    &cpu_dispatch_adaptive_avg_pool2d_backward};
+inline constexpr AdaptiveAvgPoolBackwardOpConfig kAdaptiveAvgPool3dBackwardCfg = {
+    "adaptive_avg_pool3d_backward", &haganeOpsAdaptiveAvgPool3dBackward,
+    &cpu_dispatch_adaptive_avg_pool3d_backward};
+
+// X+42 Lane B — AdaptiveAvgPool forward shape (3-arg with output_size). Shared
+// across 2D + 3D per AdaptivePooling.h:11,21 typedefs. C-ABIs:
+// haganeOpsAdaptiveAvgPool{2,3}d(input, output) — bridge re-orders into the
+// DispatchStub-typed (output, input) shape. output_size is implicit in
+// `output`'s shape (set by the entry point before dispatch).
+struct AdaptiveAvgPoolForwardOpConfig {
+    const char* op_name;
+    int (*c_abi_fn)(const haganeOpsTensor_t*, const haganeOpsTensor_t*);
+    adaptive_avg_pooling2d_fn cpu_fallback;  // identical to 3d_fn
+};
+inline constexpr AdaptiveAvgPoolForwardOpConfig kAdaptiveAvgPool2dForwardCfg = {
+    "adaptive_avg_pool2d", &haganeOpsAdaptiveAvgPool2d,
+    &cpu_dispatch_adaptive_avg_pool2d};
+inline constexpr AdaptiveAvgPoolForwardOpConfig kAdaptiveAvgPool3dForwardCfg = {
+    "adaptive_avg_pool3d", &haganeOpsAdaptiveAvgPool3d,
+    &cpu_dispatch_adaptive_avg_pool3d};
+
+// X+44 Lane B — AvgPool forward shapes. C-ABI signature is identical to the
+// backward variants (8 ints + int64_t divisor for 2D; 11 ints + int64_t for
+// 3D) so the existing AvgPool{2,3}dOpConfig c_abi_fn type fits. However
+// `avg_pool{2,3}d_fn` (Pool.h:21,30) uses int64_t args while
+// `avg_pool{2,3}d_backward_fn` (Pool.h:23,34) uses int args — so the
+// cpu_fallback field type differs, requiring a distinct struct.
+struct AvgPool2dForwardOpConfig {
+    const char* op_name;
+    int (*c_abi_fn)(const haganeOpsTensor_t*, const haganeOpsTensor_t*,
+                    int, int, int, int, int, int, int, int64_t);
+    avg_pool2d_fn cpu_fallback;
+};
+struct AvgPool3dForwardOpConfig {
+    const char* op_name;
+    int (*c_abi_fn)(const haganeOpsTensor_t*, const haganeOpsTensor_t*,
+                    int, int, int, int, int, int, int, int, int, int, int64_t);
+    avg_pool3d_fn cpu_fallback;
+};
+inline constexpr AvgPool2dForwardOpConfig kAvgPool2dForwardCfg = {
+    "avg_pool2d", &haganeOpsAvgPool2d, &cpu_dispatch_avg_pool2d};
+inline constexpr AvgPool3dForwardOpConfig kAvgPool3dForwardCfg = {
+    "avg_pool3d", &haganeOpsAvgPool3d, &cpu_dispatch_avg_pool3d};
 
 template <const AvgPool2dOpConfig& Cfg>
 inline void hagane_avg_pool2d_backward_bridge(
@@ -1066,8 +1141,8 @@ inline void hagane_max_pool3d_backward_bridge(
         Cfg.cpu_fallback(gradInput, gradOutput, indices);
     }
 }
-template <const MaxPool2dBackwardOpConfig& Cfg>
-inline void hagane_max_pool2d_backward_bridge(
+template <const PoolBackwardWithIndicesOpConfig& Cfg>
+inline void hagane_pool_backward_with_indices_bridge(
     const Tensor& gradInput, const Tensor& gradOutput, const Tensor& indices) {
     auto gi  = make_ops_tensor_local_t(gradInput);
     auto go  = make_ops_tensor_local_t(gradOutput);
@@ -1075,6 +1150,74 @@ inline void hagane_max_pool2d_backward_bridge(
     if (Cfg.c_abi_fn(&go, &gi, &idx) != HAGANE_OPS_SUCCESS) {
         ::haganeOpsFlush();
         Cfg.cpu_fallback(gradInput, gradOutput, indices);
+    }
+}
+// X+40 Lane A — adaptive avg-pool backward bridge (2-arg, no indices).
+// Serves both 2D and 3D variants. DispatchStub signature passes Tensor&
+// grad_input (non-const) since the backward kernel writes into it; the
+// bridge template signature mirrors that.
+template <const AdaptiveAvgPoolBackwardOpConfig& Cfg>
+inline void hagane_adaptive_avg_pool_backward_bridge(
+    Tensor& gradInput, const Tensor& gradOutput) {
+    auto gi = make_ops_tensor_local_t(gradInput);
+    auto go = make_ops_tensor_local_t(gradOutput);
+    if (Cfg.c_abi_fn(&go, &gi) != HAGANE_OPS_SUCCESS) {
+        ::haganeOpsFlush();
+        Cfg.cpu_fallback(gradInput, gradOutput);
+    }
+}
+// X+42 Lane B — adaptive avg-pool forward bridge (3-arg with output_size).
+// DispatchStub signature passes Tensor& output + const Tensor& input +
+// IntArrayRef output_size; the C-ABI's (input, output) ordering is swapped at
+// the call site. output_size is implicit in output's shape (caller has already
+// resized output before dispatch).
+template <const AdaptiveAvgPoolForwardOpConfig& Cfg>
+inline void hagane_adaptive_avg_pool_forward_bridge(
+    Tensor& output, const Tensor& input, IntArrayRef output_size) {
+    auto i = make_ops_tensor_local_t(input);
+    auto o = make_ops_tensor_local_t(output);
+    if (Cfg.c_abi_fn(&i, &o) != HAGANE_OPS_SUCCESS) {
+        ::haganeOpsFlush();
+        Cfg.cpu_fallback(output, input, output_size);
+    }
+}
+// X+44 Lane B — avg_pool forward bridges. DispatchStub passes (output, input,
+// kW, kH, ...) with int64_t args; C-ABI takes (input, output, kH, kW, ...) so
+// the bridge re-orders args + downcasts to int at the call site (matches the
+// pattern of hagane_avg_pool{2,3}d_backward_bridge at lines 1079+1094).
+template <const AvgPool2dForwardOpConfig& Cfg>
+inline void hagane_avg_pool2d_forward_bridge(
+    const Tensor& output, const Tensor& input,
+    int64_t kW, int64_t kH, int64_t dW, int64_t dH,
+    int64_t padW, int64_t padH, bool count_include_pad,
+    std::optional<int64_t> divisor_override) {
+    auto i = make_ops_tensor_local_t(input);
+    auto o = make_ops_tensor_local_t(output);
+    if (Cfg.c_abi_fn(&i, &o, (int)kH, (int)kW, (int)dH, (int)dW,
+                     (int)padH, (int)padW,
+                     count_include_pad ? 1 : 0,
+                     divisor_override.value_or(0)) != HAGANE_OPS_SUCCESS) {
+        ::haganeOpsFlush();
+        Cfg.cpu_fallback(output, input, kW, kH, dW, dH, padW, padH,
+                         count_include_pad, divisor_override);
+    }
+}
+template <const AvgPool3dForwardOpConfig& Cfg>
+inline void hagane_avg_pool3d_forward_bridge(
+    const Tensor& output, const Tensor& input,
+    int64_t kW, int64_t kH, int64_t kD, int64_t dW, int64_t dH, int64_t dD,
+    int64_t padW, int64_t padH, int64_t padD, bool count_include_pad,
+    std::optional<int64_t> divisor_override) {
+    auto i = make_ops_tensor_local_t(input);
+    auto o = make_ops_tensor_local_t(output);
+    if (Cfg.c_abi_fn(&i, &o, (int)kD, (int)kH, (int)kW,
+                     (int)dD, (int)dH, (int)dW,
+                     (int)padD, (int)padH, (int)padW,
+                     count_include_pad ? 1 : 0,
+                     divisor_override.value_or(0)) != HAGANE_OPS_SUCCESS) {
+        ::haganeOpsFlush();
+        Cfg.cpu_fallback(output, input, kW, kH, kD, dW, dH, dD,
+                         padW, padH, padD, count_include_pad, divisor_override);
     }
 }
 

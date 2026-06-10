@@ -140,9 +140,48 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten._foreach_addcdiv_,
     aten.lerp,
     aten.lerp_,
+    aten.mv,  # Hagane: avoid mul+sum decomp that the Pointwise codegen path cannot express
 ]
 
 remove_decompositions(decompositions, decomps_to_exclude)
+
+
+# Hagane (X+67): route the SDPA composite to the math path during AOT capture.
+# The C++ CompositeImplicitAutograd kernel decomposes SDPA at the Autograd
+# dispatch slot via _fused_sdp_choice, picking flash and dropping the
+# attn_mask + is_causal kwargs Dynamo recorded — dense attention vs eager's
+# causal-masked. The decomp table cannot intercept (the composite never
+# reaches __torch_dispatch__), so register a py_impl that the Python
+# dispatcher prefers during AOT tracing. Must run at import time: backend
+# init in codegen/hagane.py is too late, AOT capture precedes it. Normal
+# eager dispatch is unaffected.
+def _register_hagane_sdpa_math() -> None:
+    try:
+        import hagane.inductor_backend._target_marker  # noqa: F401
+    except Exception:
+        return
+
+    def _hagane_sdpa_math(query, key, value, attn_mask=None, dropout_p=0.0,
+                          is_causal=False, scale=None, enable_gqa=False):
+        # convert_boolean_attn_mask lives in the C++ composite this kernel
+        # replaces; math adds the mask raw (bool would promote to 0/1).
+        if attn_mask is not None and attn_mask.dtype == torch.bool:
+            attn_mask = torch.zeros_like(attn_mask, dtype=query.dtype).masked_fill(
+                attn_mask.logical_not(), float("-inf")
+            )
+        out, _ = aten._scaled_dot_product_attention_math.default(
+            query, key, value,
+            attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal,
+            dropout_mask=None, scale=scale, enable_gqa=enable_gqa,
+        )
+        return out
+
+    aten.scaled_dot_product_attention.default.py_impl(
+        torch._C.DispatchKey.CompositeImplicitAutograd
+    )(_hagane_sdpa_math)
+
+
+_register_hagane_sdpa_math()
 
 
 def register_decomposition(

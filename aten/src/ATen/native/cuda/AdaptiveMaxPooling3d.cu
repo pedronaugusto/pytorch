@@ -1,8 +1,15 @@
+// HAGANE_ADMIT — Sprint X+37 Lane B (ADR-036 §X+37). Under Hagane the anon
+// namespace + forward TIF are guarded out; the backward TIF routes via the
+// new adaptive_max_pool3d_backward_kernel DispatchStub (X+37 Lane B bridge RD).
+// Sentinel honored by caffe2/CMakeLists.txt's `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
-#include <ATen/cuda/Atomic.cuh>
+#include <ATen/native/AdaptivePooling.h>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/NumericLimits.cuh>
+#endif
 #include <ATen/Dispatch.h>
 #include <ATen/NumericUtils.h>
 #include <ATen/TensorUtils.h>
@@ -25,6 +32,7 @@
 
 namespace at::native {
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 __device__ inline int64_t start_index(int64_t a, int64_t b, int64_t c) {
@@ -299,9 +307,11 @@ void atomicadaptivemaxgradinput_loop(
   }
 }
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 // 5d tensor B x D x T x H x W
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(adaptive_max_pool3d_out_cuda)
 (const Tensor& input,
  IntArrayRef output_size,
@@ -387,6 +397,10 @@ TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cuda)
  const Tensor& input,
  const Tensor& indices,
  const Tensor& gradInput) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  adaptive_max_pool3d_backward_kernel(kCUDA, gradInput, gradOutput, indices);
+  return;
+#else
   TensorArg grad_input_arg{gradInput, "gradInput", 1};
   TensorArg grad_output_arg{gradOutput, "gradOutput", 2};
   TensorArg input_arg{input, "input", 3};
@@ -484,5 +498,6 @@ TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cuda)
               osizeW);
         });
   }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
  }
 } // namespace at::native

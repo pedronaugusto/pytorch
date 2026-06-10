@@ -1,5 +1,10 @@
+// HAGANE_ADMIT — Sprint X+33/X+35 .cu-patch admission.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#if defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/native/UpSample.h>
+#else
 #include <ATen/native/cuda/UpSample.cuh>
+#endif
 
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -25,6 +30,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 #define MAX_THREADS 512
@@ -291,7 +298,9 @@ static void upsample_nearest3d_backward_out_cuda_template(
 }
 
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(upsample_nearest3d_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -312,6 +321,7 @@ TORCH_IMPL_FUNC(_upsample_nearest_exact3d_out_cuda) (
     const Tensor& output) {
   upsample_nearest3d_out_cuda_template<nearest_neighbor_exact_compute_source_index>(output, input, output_size, scales_d, scales_h, scales_w);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(upsample_nearest3d_backward_out_cuda) (
     const Tensor& grad_output,
@@ -321,8 +331,13 @@ TORCH_IMPL_FUNC(upsample_nearest3d_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   upsample_nearest3d_backward_out_cuda_template<nearest_neighbor_bw_compute_source_index>(
       grad_input, grad_output, output_size, input_size, scales_d, scales_h, scales_w);
+#else
+  upsample_nearest3d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_d, scales_h, scales_w);
+#endif
 }
 
 TORCH_IMPL_FUNC(_upsample_nearest_exact3d_backward_out_cuda) (
@@ -333,11 +348,18 @@ TORCH_IMPL_FUNC(_upsample_nearest_exact3d_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   upsample_nearest3d_backward_out_cuda_template<nearest_neighbor_exact_bw_compute_source_index>(
       grad_input, grad_output, output_size, input_size, scales_d, scales_h, scales_w);
+#else
+  _upsample_nearest_exact3d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales_d, scales_h, scales_w);
+#endif
 }
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 using at::native::upsample::compute_output_size;
 using at::native::upsample_cuda::get_scale_value;
+#endif
 
 } // namespace at::native

@@ -1,3 +1,8 @@
+// HAGANE_ADMIT — Sprint X+36 Lane B.1 (ADR-036 §X+36). Under Hagane the anon
+// namespace + forward TIF (avg_pool2d_out_cuda) are guarded out; the backward
+// TIF routes via the avg_pool2d_backward_kernel DispatchStub registered in
+// HaganeMetallibBridge.cpp. Sentinel honored by caffe2/CMakeLists.txt's
+// `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -5,9 +10,11 @@
 #include <ATen/Dispatch.h>
 #include <ATen/native/Pool.h>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(__HIP_PLATFORM_HAGANE__)
 #include <ATen/cuda/detail/TensorInfo.cuh>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/cuda/detail/KernelUtils.h>
+#endif
 #include <c10/macros/Macros.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
@@ -19,6 +26,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 __device__ inline int min(int a, int b) {
@@ -239,7 +248,9 @@ __global__ void avg_pool2d_backward_out_cuda_frame_nhwc(const index_t nthreads,
 }
 
 } // anonymous namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(avg_pool2d_out_cuda)
 (const Tensor& input_,
  int64_t kH_,
@@ -353,6 +364,7 @@ TORCH_IMPL_FUNC(avg_pool2d_out_cuda)
     );
   }
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(avg_pool2d_backward_out_cuda) (
   const Tensor& gradOutput_,
@@ -365,6 +377,19 @@ TORCH_IMPL_FUNC(avg_pool2d_backward_out_cuda) (
   std::optional<int64_t> divisor_override,
   const Tensor& gradInput
 ) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  const int kH = safe_downcast<int, int64_t>(kernel_size[0]);
+  const int kW = kernel_size.size() == 1 ? kH : safe_downcast<int, int64_t>(kernel_size[1]);
+  const int dH = stride.empty() ? kH : safe_downcast<int, int64_t>(stride[0]);
+  const int dW = stride.empty() ? kW :
+                 stride.size() == 1 ? dH : safe_downcast<int, int64_t>(stride[1]);
+  const int padH = safe_downcast<int, int64_t>(padding[0]);
+  const int padW = padding.size() == 1 ? padH : safe_downcast<int, int64_t>(padding[1]);
+  gradInput.zero_();
+  avg_pool2d_backward_kernel(kCUDA, gradInput, gradOutput_,
+      kW, kH, dW, dH, padW, padH, count_include_pad, divisor_override);
+  return;
+#else
   TensorArg gradInput_arg{ gradInput, "gradInput", 1 };
   TensorArg gradOutput_arg{ gradOutput_, "gradOutput_", 2 };
   TensorArg input_arg{ input_, "input_", 3 };
@@ -465,6 +490,7 @@ TORCH_IMPL_FUNC(avg_pool2d_backward_out_cuda) (
               }
             });
         });
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 }
 
 } // namespace at::native

@@ -443,4 +443,15 @@ TORCH_IMPL_FUNC(adaptive_max_pool3d_backward_out_cpu)
         });
   }
 }
+
+// X+37 Lane B — DEFINE_DISPATCH for adaptive_max_pool{2,3}d's 3D variant
+// (mirrors AdaptiveMaxPooling2d.cpp:88-89). The 2D file has DEFINE_DISPATCH
+// for both fwd + bwd; the 3D file was missing both — symbol storage was
+// never emitted, so the CPU REGISTER_DISPATCH at
+// cpu/AdaptiveMaxPoolKernel.cpp:983,986 was dead. Adding the storage here
+// activates the dispatch path used by the Hagane bridge RD + the existing
+// CPU registration alike. Conservative parallel-to-2D fix.
+DEFINE_DISPATCH(adaptive_max_pool3d_kernel);
+DEFINE_DISPATCH(adaptive_max_pool3d_backward_kernel);
+
 } // namespace at::native

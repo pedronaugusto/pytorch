@@ -255,7 +255,7 @@ REGISTER_DISPATCH(max_pool3d_backward_kernel,
 // mirroring the 3D sibling at line 3367). Resolves the X+31 Lane D lazy-stash
 // race (regression FAIL 2.875 from bridge route).
 REGISTER_DISPATCH(max_pool2d_backward_kernel,
-                  &hagane_max_pool2d_backward_bridge<kMaxPool2dBackwardCfg>)
+                  &hagane_pool_backward_with_indices_bridge<kMaxPool2dBackwardCfg>)
 
 // X+32 Lane C — anti-aliased upsample backward retirements (ADR-036 rows 112-113).
 // New C-ABIs in hagane_ops.cpp implement the CPU AA scatter formula directly
@@ -271,5 +271,70 @@ REGISTER_DISPATCH(_upsample_bicubic2d_aa_backward_kernel,
 // upsample_bicubic2d_backward_kernel as a DispatchStub (was a free function).
 REGISTER_DISPATCH(upsample_bicubic2d_backward_kernel,
                   &hagane_upsample_scale_alignc_2d_bridge<kUpsampleBicubic2dBackwardCfg>)
+
+// X+37 Lane B — adaptive_max_pool{2,3}d_backward retirements (ADR-036 rows
+// 115-116). C-ABIs haganeOpsAdaptiveMaxPool{2,3}dBackward already exist in
+// libhagane-runtime; signatures match PoolBackwardWithIndicesOpConfig (Tensor& +
+// gradOutput + indices), so the existing hagane_pool_backward_with_indices_bridge
+// template instantiates cleanly with the new Cfg constants in
+// hagane_dispatch.h. HaganeOps.cpp's adaptive_max_pool{2,3}d_backward_out_cuda
+// TIFs migrated from direct-C-ABI to .cu-patch admission (per X+37 Lane B
+// admission of AdaptiveMaxPool{2,3}d.hip).
+REGISTER_DISPATCH(adaptive_max_pool2d_backward_kernel,
+                  &hagane_pool_backward_with_indices_bridge<kAdaptiveMaxPool2dBackwardCfg>)
+REGISTER_DISPATCH(adaptive_max_pool3d_backward_kernel,
+                  &hagane_pool_backward_with_indices_bridge<kAdaptiveMaxPool3dBackwardCfg>)
+
+// X+38 Lane A — avg_pool3d_backward retirement (ADR-036 row 117). Bridge
+// infrastructure (AvgPool3dOpConfig + kAvgPool3dBackwardCfg + template)
+// existed from X+31 Lane C; was held back by the missing upstream
+// DEFINE_DISPATCH(avg_pool3d_backward_kernel). X+38 Lane A.1 added the
+// DEFINE in AveragePool3d.cpp (parallel to AveragePool2d.cpp:254-255 + the
+// X+37 adaptive_max_pool3d pattern). Now wired up.
+REGISTER_DISPATCH(avg_pool3d_backward_kernel,
+                  &hagane_avg_pool3d_backward_bridge<kAvgPool3dBackwardCfg>)
+
+// X+40 Lane A — adaptive_avg_pool{2,3}d_backward retirements (ADR-036 rows
+// 118-119). C-ABIs haganeOpsAdaptiveAvgPool{2,3}dBackward exist in
+// libhagane-runtime; DispatchStub typedefs share the 2-arg signature
+// `void(*)(Tensor& grad_input, const Tensor& grad_output)`. Single OpConfig
+// (AdaptiveAvgPoolBackwardOpConfig) + single bridge template
+// (hagane_adaptive_avg_pool_backward_bridge) reused across 2D + 3D. The 3D
+// DEFINE_DISPATCH was activated by X+39 Lane A (AdaptiveAveragePooling.cpp:160);
+// the 2D DEFINE_DISPATCH pre-existed (AdaptiveAveragePooling.cpp:148-149).
+// No .cu admission — AdaptiveAveragePooling{,3d}.cu is C10_EXPORT-style;
+// HaganeOps.cpp retains the C10_EXPORT entry points (now thin DispatchStub
+// callers instead of direct C-ABI invokers).
+REGISTER_DISPATCH(adaptive_avg_pool2d_backward_kernel,
+                  &hagane_adaptive_avg_pool_backward_bridge<kAdaptiveAvgPool2dBackwardCfg>)
+REGISTER_DISPATCH(adaptive_avg_pool3d_backward_kernel,
+                  &hagane_adaptive_avg_pool_backward_bridge<kAdaptiveAvgPool3dBackwardCfg>)
+
+// X+42 Lane B — adaptive_avg_pool{2,3}d forward retirement POC (ADR-036 rows
+// 120-121). C-ABIs haganeOpsAdaptiveAvgPool{2,3}d exist in libhagane-runtime
+// (forward variants, previously invoked direct in HaganeOps.cpp). DispatchStub
+// typedefs share the 3-arg signature
+// `void(*)(Tensor& output, const Tensor& input, IntArrayRef output_size)`.
+// Single OpConfig (AdaptiveAvgPoolForwardOpConfig) + single bridge template
+// (hagane_adaptive_avg_pool_forward_bridge) reused across 2D + 3D. The
+// HaganeOps.cpp entry points (adaptive_avg_pool{2,3}d_out_cuda + _cuda) become
+// thin DispatchStub callers — proves Tier 2 forward retirement viability.
+REGISTER_DISPATCH(adaptive_avg_pool2d_kernel,
+                  &hagane_adaptive_avg_pool_forward_bridge<kAdaptiveAvgPool2dForwardCfg>)
+REGISTER_DISPATCH(adaptive_avg_pool3d_kernel,
+                  &hagane_adaptive_avg_pool_forward_bridge<kAdaptiveAvgPool3dForwardCfg>)
+
+// X+44 Lane B — avg_pool{2,3}d forward retirement (ADR-036 rows 122-123).
+// Mirrors X+42 Lane B pattern. C-ABIs haganeOpsAvgPool{2,3}d exist in
+// libhagane-runtime. DispatchStub typedefs (Pool.h:21,30) use int64_t args.
+// HaganeOps.cpp TIF entry points at lines 3436 + 3452 become thin
+// DispatchStub callers — second forward-cohort retirement after X+42's
+// adaptive_avg_pool pair. The .cu forward TIFs (AveragePool{2,3}d.cu:253+)
+// are already gated by `#if !defined(__HIP_PLATFORM_HAGANE__)` so only
+// HaganeOps.cpp's TIF is active under Hagane.
+REGISTER_DISPATCH(avg_pool2d_kernel,
+                  &hagane_avg_pool2d_forward_bridge<kAvgPool2dForwardCfg>)
+REGISTER_DISPATCH(avg_pool3d_kernel,
+                  &hagane_avg_pool3d_forward_bridge<kAvgPool3dForwardCfg>)
 
 } // namespace at::native

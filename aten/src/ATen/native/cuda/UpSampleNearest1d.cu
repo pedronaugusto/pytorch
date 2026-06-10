@@ -1,3 +1,9 @@
+// HAGANE_ADMIT — Sprint X+33 Lane B (ADR-036 §X+33). <<<>>> launch sites and
+// CUDA-template forward TIFs are guarded with __HIP_PLATFORM_HAGANE__; under
+// Hagane the backward TIFs route through DispatchStubs registered by
+// HaganeMetallibBridge.cpp, and forward TIFs are entirely guarded out (the
+// haganeOps runtime fast-path in HaganeOps.cpp is preserved). Sentinel
+// honored by caffe2/CMakeLists.txt's `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -6,7 +12,14 @@
 #include <ATen/TensorUtils.h>
 #include <ATen/Utils.h>
 #include <ATen/cuda/CUDAContext.h>
+#if defined(__HIP_PLATFORM_HAGANE__)
+// HAGANE_ADMIT path: UpSample.h's DispatchStub declarations are needed for
+// the backward TIF bodies (route through bridge RDs). UpSample.cuh would
+// otherwise conflict on compute_scales_value et al.
+#include <ATen/native/UpSample.h>
+#else
 #include <ATen/native/cuda/UpSample.cuh>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -19,6 +32,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 #define MAX_THREADS 512
@@ -137,9 +152,11 @@ static void upsample_nearest1d_out_cuda_template(
 
         const float scale_factor = compute_scales_value<float>(scales, input_width, output_width);
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
         upsample_nearest1d_out_frame<scalar_t, nn_compute_source_index_fn><<<gdim, bdim, 0, stream>>>(
             idata, nbatch, channels, input_width, output_width, odata, scale_factor);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
       });
 }
 
@@ -188,15 +205,19 @@ static void upsample_nearest1d_backward_out_cuda_template(
 
         const float scale_factor = compute_scales_value_backwards<float>(scales, output_width, input_width);
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
         upsample_nearest1d_backward_out_frame<scalar_t, accscalar_t, nn_bw_compute_source_index_fn>
             <<<gdim, bdim, 0, stream>>>(
                 odata, nbatch, channels, output_width, input_width, idata, scale_factor);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
       });
 }
 
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(upsample_nearest1d_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -215,6 +236,7 @@ TORCH_IMPL_FUNC(_upsample_nearest_exact1d_out_cuda) (
 ) {
   upsample_nearest1d_out_cuda_template<nearest_neighbor_exact_compute_source_index>(output, input, output_size, scales);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(upsample_nearest1d_backward_out_cuda) (
     const Tensor& grad_output,
@@ -223,8 +245,13 @@ TORCH_IMPL_FUNC(upsample_nearest1d_backward_out_cuda) (
     std::optional<double> scales,
     const Tensor& grad_input
 ) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   upsample_nearest1d_backward_out_cuda_template<nearest_neighbor_bw_compute_source_index>(
       grad_input, grad_output, output_size, input_size, scales);
+#else
+  upsample_nearest1d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales);
+#endif
 }
 
 TORCH_IMPL_FUNC(_upsample_nearest_exact1d_backward_out_cuda) (
@@ -234,8 +261,13 @@ TORCH_IMPL_FUNC(_upsample_nearest_exact1d_backward_out_cuda) (
     std::optional<double> scales,
     const Tensor& grad_input
 ) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   upsample_nearest1d_backward_out_cuda_template<nearest_neighbor_exact_bw_compute_source_index>(
       grad_input, grad_output, output_size, input_size, scales);
+#else
+  _upsample_nearest_exact1d_backward_kernel(
+      kCUDA, grad_input, grad_output, scales);
+#endif
 }
 
 } // namespace at::native

@@ -6634,7 +6634,11 @@ class Scheduler:
             raise RuntimeError(f"Unsupported device type: {device.type}")
 
         if not has_triton():
-            if (
+            from .codegen.hagane import HaganeScheduling
+
+            if device_scheduling is HaganeScheduling:
+                pass  # Hagane fork routes "cuda" through HIP/Metal; no Triton needed.
+            elif (
                 device.type == "cuda"
                 and (device_props := torch.cuda.get_device_properties(device)).major < 7
             ):

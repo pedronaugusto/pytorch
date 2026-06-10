@@ -148,4 +148,16 @@ namespace {
 DEFINE_DISPATCH(adaptive_avg_pool2d_kernel);
 DEFINE_DISPATCH(adaptive_avg_pool2d_backward_kernel);
 
+// X+39 Lane A — DEFINE_DISPATCH for the 3D variants. The 3D dispatch was
+// DECLARE'd in AdaptivePooling.h:23-24 with a CPU REGISTER_DISPATCH at
+// cpu/AdaptiveAvgPoolKernel.cpp:860, but the storage was never emitted —
+// orphaned CPU registration in the upstream tree. X+39 closes this gap
+// parallel to X+37 (adaptive_max_pool3d) + X+38 (avg_pool3d) patterns.
+// AdaptiveAveragePooling.cpp owns the 3D dispatch storage (file already
+// contains both the meta TIFs and 2D DEFINE_DISPATCHes). Pure upstream
+// hygiene; no Hagane bridge wiring this sprint (AdaptiveAveragePooling3d.cu
+// is C10_EXPORT-style, requires X+40+ mechanism).
+DEFINE_DISPATCH(adaptive_avg_pool3d_kernel);
+DEFINE_DISPATCH(adaptive_avg_pool3d_backward_kernel);
+
 } // namespace at::native

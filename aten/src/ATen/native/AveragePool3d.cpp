@@ -507,4 +507,13 @@ TORCH_IMPL_FUNC(avg_pool3d_backward_out_cpu) (
   }
 }
 
+// X+38 Lane A — DEFINE_DISPATCH for avg_pool3d's 2 kernels (mirrors
+// AveragePool2d.cpp:254-255). The 2D file emits storage for both fwd + bwd;
+// the 3D file was missing both — CPU REGISTER_DISPATCH at
+// cpu/AvgPoolKernel.cpp:1136 was dead. Same upstream-gap fix pattern as
+// X+37 (adaptive_max_pool3d). Activates the dispatch path used by the
+// Hagane bridge RD + the existing CPU registration alike.
+DEFINE_DISPATCH(avg_pool3d_kernel);
+DEFINE_DISPATCH(avg_pool3d_backward_kernel);
+
 } // namespace at::native

@@ -1,8 +1,15 @@
+// HAGANE_ADMIT — Sprint X+37 Lane B (ADR-036 §X+37). Under Hagane the anon
+// namespace + forward TIF are guarded out; the backward TIF routes via the
+// new adaptive_max_pool2d_backward_kernel DispatchStub (X+37 Lane B bridge RD).
+// Sentinel honored by caffe2/CMakeLists.txt's `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
-#include <ATen/cuda/Atomic.cuh>
+#include <ATen/native/AdaptivePooling.h>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/NumericLimits.cuh>
+#endif
 #include <ATen/Dispatch.h>
 #include <ATen/NumericUtils.h>
 #include <ATen/TensorUtils.h>
@@ -25,6 +32,7 @@
 
 namespace at::native {
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 __device__ inline int64_t start_index(int64_t a, int64_t b, int64_t c) {
@@ -198,9 +206,11 @@ __global__ void atomicadaptivemaxgradinput(
   }
 }
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 // 4d tensor B x D x H x W
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(adaptive_max_pool2d_out_cuda)
 (const Tensor& input,
 IntArrayRef output_size,
@@ -319,12 +329,17 @@ const Tensor& indices) {
     indices.copy_(indices_c);
   }
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
 (const Tensor& gradOutput,
  const Tensor& input,
  const Tensor& indices,
  const Tensor& gradInput) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  adaptive_max_pool2d_backward_kernel(kCUDA, gradInput, gradOutput, indices);
+  return;
+#else
   globalContext().alertNotDeterministic(
       "adaptive_max_pool2d_backward_cuda");
 
@@ -474,5 +489,6 @@ TORCH_IMPL_FUNC(adaptive_max_pool2d_backward_out_cuda)
   if (!gradInput.is_contiguous()) {
     gradInput.copy_(gradInput_c);
   }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
  }
 } // namespace at::native

@@ -1,15 +1,22 @@
+// HAGANE_ADMIT — Sprint X+38 Lane A (ADR-036 §X+38). Under Hagane the anon
+// namespace + forward TIF are guarded out; the backward TIF routes via the
+// avg_pool3d_backward_kernel DispatchStub (new bridge RD in X+38 Lane A,
+// gated by the X+38 upstream DEFINE_DISPATCH fix in AveragePool3d.cpp).
+// Sentinel honored by caffe2/CMakeLists.txt's `_hagane_*` filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
 #include <ATen/ceil_div.h>
 #include <ATen/Dispatch.h>
 #include <ATen/native/Pool.h>
-#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/detail/TensorInfo.cuh>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/cuda/detail/KernelUtils.h>
 #include <ATen/native/cuda/KernelUtils.cuh>
+#endif
 #include <c10/macros/Macros.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
@@ -22,6 +29,8 @@
 
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 __device__ inline int min(int a, int b) {
@@ -329,7 +338,9 @@ __global__ void avg_pool3d_cuda_update_grad_input(
 }
 
 } // anonymous namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 #define LAUNCH_UPDATE_OUTPUT_KERNEL_WIDTH(KW) case KW:      \
   avg_pool3d_cuda_update_output<KW, scalar_t, accscalar_t>  \
     <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>( \
@@ -441,6 +452,7 @@ TORCH_IMPL_FUNC(avg_pool3d_out_cuda) (
 }
 
 #undef LAUNCH_UPDATE_OUTPUT_KERNEL_WIDTH
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 
 TORCH_IMPL_FUNC(avg_pool3d_backward_out_cuda) (
@@ -454,6 +466,21 @@ TORCH_IMPL_FUNC(avg_pool3d_backward_out_cuda) (
   std::optional<int64_t> divisor_override,
   const Tensor& gradInput
 ) {
+#if defined(__HIP_PLATFORM_HAGANE__)
+  const int kT = safe_downcast<int, int64_t>(kernel_size[0]);
+  const int kH = kernel_size.size() == 1 ? kT : safe_downcast<int, int64_t>(kernel_size[1]);
+  const int kW = kernel_size.size() == 1 ? kT : safe_downcast<int, int64_t>(kernel_size[2]);
+  const int dT = stride.empty() ? kT : safe_downcast<int, int64_t>(stride[0]);
+  const int dH = stride.empty() ? kH : (stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[1]));
+  const int dW = stride.empty() ? kW : (stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[2]));
+  const int padT = safe_downcast<int, int64_t>(padding[0]);
+  const int padH = padding.size() == 1 ? padT : safe_downcast<int, int64_t>(padding[1]);
+  const int padW = padding.size() == 1 ? padT : safe_downcast<int, int64_t>(padding[2]);
+  gradInput.zero_();
+  avg_pool3d_backward_kernel(kCUDA, gradInput, gradOutput,
+      kW, kH, kT, dW, dH, dT, padW, padH, padT, count_include_pad, divisor_override);
+  return;
+#else
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage
   globalContext().alertNotDeterministic("avg_pool3d_backward_cuda");
@@ -596,6 +623,7 @@ TORCH_IMPL_FUNC(avg_pool3d_backward_out_cuda) (
       }
     );
   }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 }
 
 } // at::native

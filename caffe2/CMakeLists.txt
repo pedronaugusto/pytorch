@@ -1016,6 +1016,14 @@ if(USE_ROCM)
               endif()
             endforeach()
           endif()
+          # X+33: HAGANE_ADMIT sentinel — explicit override for .hip files
+          # whose <<<>>> sites and bad-header references are all guarded with
+          # `#if !defined(__HIP_PLATFORM_HAGANE__)`. cmake's regex check cannot
+          # verify preprocessor-level guards, so we trust the sentinel; the
+          # developer owns guard correctness. See kura/decisions/036 §X+33.
+          if(_exclude AND "${_content}" MATCHES "// HAGANE_ADMIT")
+            set(_exclude FALSE)
+          endif()
         endif()
       endif()
       if(_exclude)

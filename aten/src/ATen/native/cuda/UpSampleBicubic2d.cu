@@ -1,3 +1,9 @@
+// HAGANE_ADMIT — Sprint X+36 Lane A.3 (ADR-036 §X+36). Under Hagane the anon
+// namespace + forward TIF are guarded out; the backward TIF routes via the
+// upsample_bicubic2d_backward_kernel DispatchStub (an upstream patch from
+// X+32 Lane D that converted the free-function kernel into a proper
+// DispatchStub) registered in HaganeMetallibBridge.cpp. Sentinel honored by
+// caffe2/CMakeLists.txt's `_hagane_*` admission filter.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
@@ -6,7 +12,11 @@
 #include <ATen/TensorUtils.h>
 #include <ATen/Utils.h>
 #include <ATen/cuda/CUDAContext.h>
+#if defined(__HIP_PLATFORM_HAGANE__)
+#include <ATen/native/UpSample.h>
+#else
 #include <ATen/native/cuda/UpSample.cuh>
+#endif
 #include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
@@ -18,6 +28,8 @@
 #endif
 
 namespace at::native {
+
+#if !defined(__HIP_PLATFORM_HAGANE__)
 namespace {
 
 template <typename scalar_t, typename accscalar_t>
@@ -367,7 +379,9 @@ static void upsample_bicubic2d_backward_out_cuda_template(
 }
 
 } // namespace
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
+#if !defined(__HIP_PLATFORM_HAGANE__)
 TORCH_IMPL_FUNC(upsample_bicubic2d_out_cuda) (
     const Tensor& input,
     IntArrayRef output_size,
@@ -377,6 +391,7 @@ TORCH_IMPL_FUNC(upsample_bicubic2d_out_cuda) (
     const Tensor& output) {
   upsample_bicubic2d_out_cuda_template(output, input, output_size, align_corners, scales_h, scales_w);
 }
+#endif // !defined(__HIP_PLATFORM_HAGANE__)
 
 TORCH_IMPL_FUNC(upsample_bicubic2d_backward_out_cuda) (
     const Tensor& grad_output,
@@ -386,11 +401,16 @@ TORCH_IMPL_FUNC(upsample_bicubic2d_backward_out_cuda) (
     std::optional<double> scales_h,
     std::optional<double> scales_w,
     const Tensor& grad_input) {
+#if !defined(__HIP_PLATFORM_HAGANE__)
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage
   globalContext().alertNotDeterministic("upsample_bicubic2d_backward_out_cuda");
   upsample_bicubic2d_backward_out_cuda_template(
       grad_input, grad_output, output_size, input_size, align_corners, scales_h, scales_w);
+#else
+  upsample_bicubic2d_backward_kernel(
+      kCUDA, grad_input, grad_output, align_corners, scales_h, scales_w);
+#endif
 }
 
 } // namespace at::native

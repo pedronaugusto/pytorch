@@ -37,6 +37,7 @@
 #include <ATen/native/DispatchStub.h>
 #include <ATen/native/UnaryOps.h>
 #include <ATen/native/BinaryOps.h>
+#include <ATen/native/AdaptivePooling.h>
 #include <ATen/native/Pool.h>
 #include <ATen/native/Pow.h>
 #include <ATen/native/ReduceOps.h>
@@ -493,6 +494,74 @@ inline void cpu_dispatch_max_pool2d_backward(
     const Tensor& gradInput, const Tensor& gradOutput, const Tensor& indices) {
     max_pool2d_backward_kernel(c10::DeviceType::CPU,
         gradInput, gradOutput, indices);
+}
+// X+37 Lane B — cpu_fallback trampolines for adaptive_max_pool{2,3}d_backward.
+// Signatures match max_pool2d_backward_kernel exactly (Tensor& gradInput,
+// gradOutput, indices) so they share MaxPool2dBackwardOpConfig.
+inline void cpu_dispatch_adaptive_max_pool2d_backward(
+    const Tensor& gradInput, const Tensor& gradOutput, const Tensor& indices) {
+    adaptive_max_pool2d_backward_kernel(c10::DeviceType::CPU,
+        gradInput, gradOutput, indices);
+}
+inline void cpu_dispatch_adaptive_max_pool3d_backward(
+    const Tensor& gradInput, const Tensor& gradOutput, const Tensor& indices) {
+    adaptive_max_pool3d_backward_kernel(c10::DeviceType::CPU,
+        gradInput, gradOutput, indices);
+}
+// X+40 Lane A — cpu_fallback trampolines for adaptive_avg_pool{2,3}d_backward.
+// Signature: `void(*)(Tensor& grad_input, const Tensor& grad_output)` — 2-arg
+// (no indices); shared by both 2D and 3D variants per AdaptivePooling.h:12,22.
+// DEFINE_DISPATCH landed in X+39 Lane A (3D) + AdaptiveAveragePooling.cpp:148-149
+// (2D, pre-existing). Bridge wiring lands X+40 Lane A.
+inline void cpu_dispatch_adaptive_avg_pool2d_backward(
+    Tensor& gradInput, const Tensor& gradOutput) {
+    adaptive_avg_pool2d_backward_kernel(c10::DeviceType::CPU,
+        gradInput, gradOutput);
+}
+inline void cpu_dispatch_adaptive_avg_pool3d_backward(
+    Tensor& gradInput, const Tensor& gradOutput) {
+    adaptive_avg_pool3d_backward_kernel(c10::DeviceType::CPU,
+        gradInput, gradOutput);
+}
+// X+42 Lane B — cpu_fallback trampolines for adaptive_avg_pool{2,3}d forward.
+// Signature: `void(*)(Tensor& output, const Tensor& input, IntArrayRef output_size)`
+// — 3-arg shared by both 2D and 3D variants per AdaptivePooling.h:11,21.
+// DEFINE_DISPATCH(adaptive_avg_pool2d_kernel) at AdaptiveAveragePooling.cpp:148;
+// DEFINE_DISPATCH(adaptive_avg_pool3d_kernel) at AdaptiveAveragePooling.cpp:160
+// (X+39 Lane A). CPU REGISTER_DISPATCH at cpu/AdaptiveAvgPoolKernel.cpp:857,859.
+inline void cpu_dispatch_adaptive_avg_pool2d(
+    Tensor& output, const Tensor& input, IntArrayRef output_size) {
+    adaptive_avg_pool2d_kernel(c10::DeviceType::CPU,
+        output, input, output_size);
+}
+inline void cpu_dispatch_adaptive_avg_pool3d(
+    Tensor& output, const Tensor& input, IntArrayRef output_size) {
+    adaptive_avg_pool3d_kernel(c10::DeviceType::CPU,
+        output, input, output_size);
+}
+// X+44 Lane B — cpu_fallback trampolines for avg_pool{2,3}d forward.
+// Signature `avg_pool2d_fn` / `avg_pool3d_fn` (Pool.h:21-22, 30-33) uses
+// int64_t args — distinct from `avg_pool2d_backward_fn` (int args) so this
+// trampoline pair is separate from the X+31 Lane C backward trampolines.
+// DEFINE_DISPATCH at AveragePool2d.cpp:254 + AveragePool3d.cpp:516; CPU
+// REGISTER at cpu/AvgPoolKernel.cpp:1133, 1135.
+inline void cpu_dispatch_avg_pool2d(
+    const Tensor& output, const Tensor& input,
+    int64_t kW, int64_t kH, int64_t dW, int64_t dH,
+    int64_t padW, int64_t padH, bool count_include_pad,
+    std::optional<int64_t> divisor_override) {
+    avg_pool2d_kernel(c10::DeviceType::CPU,
+        output, input, kW, kH, dW, dH, padW, padH,
+        count_include_pad, divisor_override);
+}
+inline void cpu_dispatch_avg_pool3d(
+    const Tensor& output, const Tensor& input,
+    int64_t kW, int64_t kH, int64_t kD, int64_t dW, int64_t dH, int64_t dD,
+    int64_t padW, int64_t padH, int64_t padD, bool count_include_pad,
+    std::optional<int64_t> divisor_override) {
+    avg_pool3d_kernel(c10::DeviceType::CPU,
+        output, input, kW, kH, kD, dW, dH, dD, padW, padH, padD,
+        count_include_pad, divisor_override);
 }
 
 // X+31 Lane A — align-corners upsample backward CPU-fallback trampolines.

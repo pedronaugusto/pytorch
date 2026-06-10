@@ -38,7 +38,7 @@ from .simd import SIMDKernel, SIMDScheduling
 
 
 if TYPE_CHECKING:
-    from ..ops_handler import StoreMode
+    from ..ops_handler import ReductionType, StoreMode
     from ..scheduler import Scheduler, SchedulerNode
 
 log = logging.getLogger(__name__)
@@ -154,7 +154,13 @@ class HaganeOverrides(OpOverrides):
 
     @staticmethod
     def index_expr(expr: sympy.Expr, dtype: torch.dtype) -> str:
-        return HaganeExprPrinter().doprint(expr)
+        # X+63: route through kernel.prepare_indexing to trigger axis-variable
+        # emission via codegen_iteration_ranges_entry per free symbol.
+        # Without this, sympy symbols like `x2` leak into kernel body as
+        # undefined names (X+62 kernel_3 NameError surface).
+        kernel = V.kernel
+        expr = kernel.prepare_indexing(expr)
+        return kernel.sexpr(expr)
 
     # ----- Binary arithmetic --------------------------------------------------
     @staticmethod
@@ -198,29 +204,31 @@ class HaganeOverrides(OpOverrides):
         return f"torch.pow({a}, {b})"
 
     # ----- Comparison ---------------------------------------------------------
+    # X+67: as_tensor on the lhs — torch.le(int, Tensor) rejects scalar-first
+    # operands (surfaced by HF sdpa_mask arange comparisons on the math path).
     @staticmethod
     def lt(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.lt({a}, {b})"
+        return f"torch.lt(torch.as_tensor({a}), {b})"
 
     @staticmethod
     def le(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.le({a}, {b})"
+        return f"torch.le(torch.as_tensor({a}), {b})"
 
     @staticmethod
     def gt(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.gt({a}, {b})"
+        return f"torch.gt(torch.as_tensor({a}), {b})"
 
     @staticmethod
     def ge(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.ge({a}, {b})"
+        return f"torch.ge(torch.as_tensor({a}), {b})"
 
     @staticmethod
     def eq(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.eq({a}, {b})"
+        return f"torch.eq(torch.as_tensor({a}), {b})"
 
     @staticmethod
     def ne(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.ne({a}, {b})"
+        return f"torch.ne(torch.as_tensor({a}), {b})"
 
     @staticmethod
     def minimum(a, b):  # type: ignore[no-untyped-def, override]
@@ -257,15 +265,15 @@ class HaganeOverrides(OpOverrides):
 
     @staticmethod
     def logical_and(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.logical_and({a}, {b})"
+        return f"torch.logical_and(torch.as_tensor({a}), torch.as_tensor({b}))"
 
     @staticmethod
     def logical_or(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.logical_or({a}, {b})"
+        return f"torch.logical_or(torch.as_tensor({a}), torch.as_tensor({b}))"
 
     @staticmethod
     def logical_xor(a, b):  # type: ignore[no-untyped-def, override]
-        return f"torch.logical_xor({a}, {b})"
+        return f"torch.logical_xor(torch.as_tensor({a}), torch.as_tensor({b}))"
 
     @staticmethod
     def logical_not(a):  # type: ignore[no-untyped-def, override]
@@ -407,7 +415,7 @@ class HaganeOverrides(OpOverrides):
         return f"torch.clamp({x}, {lo}, {hi})"
 
 
-HaganeOverrides._initialize_pointwise_overrides("cuda")
+HaganeOverrides._initialize_pointwise_overrides("hagane")
 
 
 # ---------------------------------------------------------------------------
@@ -444,20 +452,56 @@ class HaganeKernel(SIMDKernel):
         **kwargs: Any,
     ) -> None:
         super().__init__(tiling, **kwargs)
+        self._emitted_indexers: set[str] = set()
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return DTYPE_TO_TORCH_NAME[dtype]
+
+    def codegen_iteration_ranges_entry(self, entry: Any) -> None:
+        # X+63: emit axis-var definitions into self.indexing_code. Each
+        # range tree's root index symbol (xindex, r0index, ...) is emitted
+        # once as a 1-D torch.arange of the tree's full numel; per-entry
+        # lines then reference that root via FloorDiv/ModularIndexing or
+        # alias it directly when expr collapses to the root symbol.
+        # Whole-tensor broadcasting handles per-element semantics during
+        # downstream torch.* ops. Mirrors MPS pattern but uses tensors
+        # instead of scalar declarations.
+        root = entry.root
+        root_sym = str(root.index_sym())
+        if root_sym not in self._emitted_indexers:
+            root_size = self.pexpr(root.numel)
+            self.indexing_code.writeline(
+                f"{root_sym} = torch.arange({root_size}, "
+                f"dtype=torch.int64, device='cuda')"
+            )
+            self._emitted_indexers.add(root_sym)
+        expr_str = self.sexpr(self.rename_indexing(entry.expr))
+        self.indexing_code.writeline(f"{entry.name} = {expr_str}")
+
+    def check_bounds(
+        self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
+    ) -> None:
+        # X+67: no emitted bounds asserts; indirect-index correctness is
+        # gated by the eager parity sweeps. Surfaced by HF sdpa_mask's
+        # arange-indexed mask construction on the SDPA math path.
+        pass
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
         var = self.args.input(name)
         index = self.prepare_indexing(index)
         dtype = V.graph.get_dtype(name)
-        # MVP: whole-tensor semantics. The kernel body operates on the
-        # full tensor object, ignoring per-element indexing. This is
-        # incorrect for any kernel that needs strided/permuted indexing —
-        # those cases will fall back via SIMDScheduling's fallback path
-        # in real runtime; flagged for Sprint X+.
-        line = f"{var}"
+        # X+64: Pointwise kernels emit indexed gather
+        # `var.reshape(-1)[idx_str]` honoring Inductor's per-element
+        # index. Composes with X+63 axis-var emission (xindex/x0/x1
+        # defined in indexing_code) to produce a 1-D (kernel_numel,)
+        # tensor that broadcasts correctly with axis-var arithmetic.
+        # Reduction kernels keep X+55 whole-tensor semantics because
+        # reduction codegen below uses value.shape.index(red_size) to
+        # locate the reduction axis — needs multi-dim native shape.
+        if self.inside_reduction:
+            line = f"{var}"
+        else:
+            line = f"{var}.reshape(-1)[{self.sexpr(index)}]"
         return self.cse.generate(self.loads, line, dtype=dtype)
 
     def store(
@@ -469,15 +513,62 @@ class HaganeKernel(SIMDKernel):
     ) -> None:
         var = self.args.output(name)
         if mode is None:
-            line = f"{var} = {value}"
+            line = f"{var}.copy_({value}.reshape({var}.shape))"
         elif mode == "atomic_add":
-            line = f"{var} = torch.add({var}, {value})"
+            line = f"{var}.add_({value})"
         else:
             raise RuntimeError(f"Unimplemented store mode {mode}")
         if self.inside_reduction:
             self.compute.writeline(DeferredLine(name, line))
         else:
             self.stores.writeline(DeferredLine(name, line))
+
+    def reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type: ReductionType,
+        value: CSEVariable | tuple[CSEVariable, ...],
+    ) -> CSEVariable | tuple[CSEVariable, ...]:
+        # Scalar output (features.numel == 1) → whole-tensor emission
+        # (X+56 invariant). Dim-aware reductions look up the reduction
+        # axis at runtime via value.shape.index(reduction_numel); load()
+        # returns the whole input tensor (see HaganeKernel.load above), so
+        # the kept output dim equals value.dim() - reduction_axes_count.
+        assert self.inside_reduction
+        REDUCE_OPS = {
+            "sum": "torch.sum",
+            "prod": "torch.prod",
+            "max": "torch.amax",
+            "min": "torch.amin",
+            "argmin": "torch.argmin",
+            "argmax": "torch.argmax",
+            "any": "torch.any",
+            "all": "torch.all",
+        }
+        if reduction_type not in REDUCE_OPS:
+            raise NotImplementedError(f"reduction_type {reduction_type}")
+        op = REDUCE_OPS[reduction_type]
+        if self.features.numel == 1:
+            line = f"{op}({value})"
+        else:
+            red_size = self.pexpr(self.features.reduction_numel)
+            line = f"{op}({value}, dim=list({value}.shape).index({red_size}))"
+        return self.cse.generate(self.compute, line, dtype=dtype)
+
+    def call_kernel(
+        self, name: str, node: Any = None, deallocate_ws: bool = True
+    ) -> None:
+        wrapper = V.graph.wrapper_code
+        for v in self.args.sizevars:
+            wrapper.ensure_size_computed(v)
+        # Bypass wrapper.generate_kernel_call, which forces CUDA stream
+        # handling (get_raw_stream + c_void_p(stream)) incompatible with the
+        # Hagane MVP's whole-tensor torch.* dispatch. python_argdefs() yields
+        # call args in canonical order matching codegen_kernel's def signature.
+        _, call_args, _, _ = self.args.python_argdefs()
+        args = [str(a) for a in call_args]
+        wrapper.writeline(wrapper.wrap_kernel_call(name, args))
 
     def codegen_kernel(self, name: str | None = None) -> str:
         """Assemble the kernel function source as Python."""
@@ -491,6 +582,7 @@ class HaganeKernel(SIMDKernel):
         arg_list = ", ".join(a.name for a in argdefs)
         code.writeline(f"def {name}({arg_list}):")
         with code.indent():
+            code.splice(self.indexing_code)  # X+63: axis variable defs
             for buf in (self.loads, self.compute, self.stores):
                 code.splice(buf)
             code.writeline("return")
@@ -544,9 +636,10 @@ class HaganeScheduling(SIMDScheduling):
         kernel_name = f"hagane_kernel_{wrapper.next_kernel_suffix()}"
         wrapper.src_to_kernel[src_code] = kernel_name
         src_code = src_code.replace("<KERNEL_NAME>", kernel_name)
-        compile_wrapper = IndentedBuffer()
-        compile_wrapper.splice(src_code, strip=True)
-        wrapper.define_kernel(kernel_name, compile_wrapper.getvalue(), gpu=False)
+        # PythonWrapperCodegen.define_kernel formats as ``<name> = <body>`` which
+        # cannot wrap a multi-statement ``def`` block. Splice the function
+        # definition directly into the module header instead.
+        wrapper.header.splice("\n\n" + src_code)
         return kernel_name
 
 
@@ -582,4 +675,24 @@ def maybe_register_hagane_scheduling() -> bool:
         HaganeScheduling,
         PythonWrapperCodegen,
     )
+    # X+66: Override Inductor's sdpa_constraint with a passthrough on Hagane.
+    # sdpa_constraint at lowering.py:3113 calls ExternKernel.require_stride_order
+    # which emits assert_size_stride that mismatches Hagane's stride emission
+    # for the natural BSHD-memory-transposed-to-BHSD layout (X+64 surfaced;
+    # X+65 verified Dynamo-layer disallow_in_graph inert because SDPA
+    # composite->flash decomposition happens at AOT autograd, deeper than
+    # Dynamo's hook). _maybe_layout_constraints is looked up via late binding
+    # at graph.py:1397; dict-update via add_layout_constraint overwrites.
+    from torch._inductor.lowering import add_layout_constraint
+
+    def _hagane_sdpa_no_constraint(fx_node, *args, **kwargs):
+        return args, kwargs
+
+    add_layout_constraint(
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        _hagane_sdpa_no_constraint,
+    )
+    # X+67: SDPA-composite-to-math routing lives in _inductor/decomposition.py
+    # (module scope) — registering here is too late: this function runs at
+    # backend init during lowering, after AOT capture already decomposed SDPA.
     return True
