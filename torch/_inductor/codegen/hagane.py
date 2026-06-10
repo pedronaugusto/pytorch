@@ -470,10 +470,19 @@ class HaganeKernel(SIMDKernel):
         root_sym = str(root.index_sym())
         if root_sym not in self._emitted_indexers:
             root_size = self.pexpr(root.numel)
-            self.indexing_code.writeline(
-                f"{root_sym} = torch.arange({root_size}, "
-                f"dtype=torch.int64, device='cuda')"
+            arange = (
+                f"torch.arange({root_size}, dtype=torch.int64, device='cuda')"
             )
+            # X+68: tiled kernels (>1 pointwise tree, e.g. GPT-2 Conv1D
+            # transposes) view each root arange on its own broadcast dim so
+            # cross-tree index arithmetic forms the outer product. Single-tree
+            # kernels keep the flat 1-D form.
+            prefixes = [t.prefix for t in self.range_trees if not t.is_reduction]
+            if len(prefixes) > 1 and root.prefix in prefixes:
+                view = ["1"] * len(prefixes)
+                view[prefixes.index(root.prefix)] = "-1"
+                arange = f"{arange}.view({', '.join(view)})"
+            self.indexing_code.writeline(f"{root_sym} = {arange}")
             self._emitted_indexers.add(root_sym)
         expr_str = self.sexpr(self.rename_indexing(entry.expr))
         self.indexing_code.writeline(f"{entry.name} = {expr_str}")
@@ -501,7 +510,13 @@ class HaganeKernel(SIMDKernel):
         if self.inside_reduction:
             line = f"{var}"
         else:
-            line = f"{var}.reshape(-1)[{self.sexpr(index)}]"
+            # X+68: memory-linear alias — index exprs compute MEMORY
+            # offsets; reshape(-1) copies transpose-strided inputs into
+            # logical order, silently decoupling the two (GPT-2 Conv1D).
+            line = (
+                f"torch.as_strided({var}, ({var}.numel(),), (1,))"
+                f"[{self.sexpr(index)}]"
+            )
         return self.cse.generate(self.loads, line, dtype=dtype)
 
     def store(
@@ -513,7 +528,19 @@ class HaganeKernel(SIMDKernel):
     ) -> None:
         var = self.args.output(name)
         if mode is None:
-            line = f"{var}.copy_({value}.reshape({var}.shape))"
+            if self.inside_reduction:
+                line = f"{var}.copy_({value}.reshape({var}.shape))"
+            else:
+                # X+68: honor the store index via a memory-linear alias.
+                # The copy_(value.reshape(shape)) form assumed iteration
+                # order == logical row-major order, which breaks on
+                # transpose-strided outputs (GPT-2 Conv1D) and tiled
+                # (multi-tree) kernels.
+                idx = self.prepare_indexing(index)
+                line = (
+                    f"torch.as_strided({var}, ({var}.numel(),), (1,))"
+                    f"[{self.sexpr(idx)}] = {value}"
+                )
         elif mode == "atomic_add":
             line = f"{var}.add_({value})"
         else:

@@ -6825,10 +6825,15 @@ def var_mean_helper_(x, *, axis, correction, keepdim, return_mean):
         keepdim=keepdim,
         return_mean=return_mean,
     )
+    # Hagane (X+68): HaganeKernel.reduction() has no welford_reduce support;
+    # force the two-pass path (mirrors the mtia opt-out above).
+    from .codegen.hagane import _hagane_runtime_available
+
     output = (
         var_mean_sum_(**kwargs)
         if (
             config.mtia.disable_welford_reduction
+            or _hagane_runtime_available()
             or use_two_step_variance(x, axis=axis, keepdim=keepdim)
         )
         else var_mean_welford_(**kwargs)
