@@ -416,11 +416,16 @@ def prepare_softmax_extra_check(match):
     """
     We only have triton online softmax kernels currently.
     """
+    # Hagane (X+69): HaganeKernel.reduction() has no online_softmax_reduce;
+    # keep the decomposed amax/exp/sum form (mirrors the X+68 welford gate).
+    from ..codegen.hagane import _hagane_runtime_available
+
     device_type = match.kwargs["x"].meta["val"].device.type
     return (
         config.online_softmax
         and device_type in ["cuda", "xpu"]
         and getattr(config, f"{device_type}_backend") == "triton"
+        and not _hagane_runtime_available()
     )
 
 

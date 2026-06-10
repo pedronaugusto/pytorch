@@ -158,9 +158,12 @@ class HaganeOverrides(OpOverrides):
         # emission via codegen_iteration_ranges_entry per free symbol.
         # Without this, sympy symbols like `x2` leak into kernel body as
         # undefined names (X+62 kernel_3 NameError surface).
+        # X+69: rename_indexing registers free sizevars (dynamic-shape
+        # symbols like s1) as kernel args; without it they leak into the
+        # body as undefined names under automatic_dynamic_shapes.
         kernel = V.kernel
         expr = kernel.prepare_indexing(expr)
-        return kernel.sexpr(expr)
+        return kernel.sexpr(kernel.rename_indexing(expr))
 
     # ----- Binary arithmetic --------------------------------------------------
     @staticmethod
@@ -469,7 +472,7 @@ class HaganeKernel(SIMDKernel):
         root = entry.root
         root_sym = str(root.index_sym())
         if root_sym not in self._emitted_indexers:
-            root_size = self.pexpr(root.numel)
+            root_size = self.pexpr(self.rename_indexing(root.numel))
             arange = (
                 f"torch.arange({root_size}, dtype=torch.int64, device='cuda')"
             )
@@ -515,7 +518,7 @@ class HaganeKernel(SIMDKernel):
             # logical order, silently decoupling the two (GPT-2 Conv1D).
             line = (
                 f"torch.as_strided({var}, ({var}.numel(),), (1,))"
-                f"[{self.sexpr(index)}]"
+                f"[{self.sexpr(self.rename_indexing(index))}]"
             )
         return self.cse.generate(self.loads, line, dtype=dtype)
 
@@ -537,9 +540,18 @@ class HaganeKernel(SIMDKernel):
                 # transpose-strided outputs (GPT-2 Conv1D) and tiled
                 # (multi-tree) kernels.
                 idx = self.prepare_indexing(index)
+                val = f"{value}"
+                ptrees = [t for t in self.range_trees if not t.is_reduction]
+                if self.features.reduction_numel != 1 and len(ptrees) == 1:
+                    # X+69: reduction results stored under disable_reduction
+                    # may keep collapsed dims (e.g. (32,1) vs flat (32,));
+                    # only flatten in true reduction kernels with a flat
+                    # pointwise side — tiled pointwise kernels carry a
+                    # numel-1 reduction tree and must keep their 2-D value.
+                    val = f"{value}.reshape(-1)"
                 line = (
                     f"torch.as_strided({var}, ({var}.numel(),), (1,))"
-                    f"[{self.sexpr(idx)}] = {value}"
+                    f"[{self.sexpr(self.rename_indexing(idx))}] = {val}"
                 )
         elif mode == "atomic_add":
             line = f"{var}.add_({value})"
@@ -579,7 +591,7 @@ class HaganeKernel(SIMDKernel):
         if self.features.numel == 1:
             line = f"{op}({value})"
         else:
-            red_size = self.pexpr(self.features.reduction_numel)
+            red_size = self.pexpr(self.rename_indexing(self.features.reduction_numel))
             line = f"{op}({value}, dim=list({value}.shape).index({red_size}))"
         return self.cse.generate(self.compute, line, dtype=dtype)
 
