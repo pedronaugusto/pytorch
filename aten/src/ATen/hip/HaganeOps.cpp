@@ -240,6 +240,14 @@ C10_EXPORT Tensor empty_cuda(
     std::optional<Device> device_opt,
     std::optional<bool> pin_memory_opt,
     std::optional<c10::MemoryFormat> memory_format_opt) {
+  // Arm the allocator FREE hook at the earliest universal entry. Every
+  // device tensor (empty/empty_like/randn/zeros) bottoms out in a factory,
+  // so registering here guarantees the hook is live before ANY buffer this
+  // process allocates can be freed + reused — without it (X+70 registered
+  // lazily in hagane_copy_kernel) the deferred-read flush misses every free
+  // that happens before the first copy, corrupting reductions over lazy
+  // temporaries (Tatara 0023). Guarded; one-time cost.
+  hagane_register_allocator_hook();
   Tensor result = at::detail::empty_cuda(
       size, dtype_opt, layout_opt, device_opt, pin_memory_opt, memory_format_opt);
   if (C10_UNLIKELY(
@@ -257,6 +265,7 @@ C10_EXPORT Tensor empty_strided_cuda(
     std::optional<Layout> layout_opt,
     std::optional<Device> device_opt,
     std::optional<bool> pin_memory_opt) {
+  hagane_register_allocator_hook();  // see empty_cuda — arm FREE hook early
   Tensor result = at::detail::empty_strided_cuda(
       size, stride, dtype_opt, layout_opt, device_opt, pin_memory_opt);
   if (C10_UNLIKELY(
