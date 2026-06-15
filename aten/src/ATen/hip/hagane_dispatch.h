@@ -69,6 +69,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 
 // X+29 TU split: helpers + per-op cpu-dispatch + fp64 trampolines + scalar
@@ -90,9 +91,13 @@ struct OpConfig {
     Tensor (*at_fp64_fn)(const Tensor&);  // nullptr → no fp64 round-trip.
 };
 
+// X+73 M3b: metallib_kernel now holds the kernel BASE name (the bridge appends
+// _<dtypeTag>[_shape]_unrolled_contig per dispatch). abs ships float-only —
+// the int/bool/bfloat AbsFunctor arms hit an MSL `abs`-overload gap, so only
+// abs.metallib's float arm exists; other dtypes fall back to the MLX c_abi.
 inline constexpr OpConfig kAbsCfg = {
     "abs",
-    "hagane_AbsFunctor_float_unrolled_contig",
+    "hagane_AbsFunctor",
     &haganeOpsAbs,
     &cpu_dispatch_abs,
     &fp64_abs,
@@ -102,14 +107,17 @@ inline constexpr OpConfig kNegCfg  = {"neg",  nullptr, &haganeOpsNeg,  &cpu_disp
 inline constexpr OpConfig kSignCfg = {"sign", nullptr, &haganeOpsSign, &cpu_dispatch_sign, nullptr };
 inline constexpr OpConfig kSgnCfg  = {"sgn",  nullptr, nullptr,        &cpu_dispatch_sgn,  nullptr };
 
-inline constexpr OpConfig kExpCfg     = {"exp",     nullptr, &haganeOpsExp,     &cpu_dispatch_exp,     nullptr};
-inline constexpr OpConfig kLogCfg     = {"log",     nullptr, &haganeOpsLog,     &cpu_dispatch_log,     nullptr};
-inline constexpr OpConfig kSqrtCfg    = {"sqrt",    nullptr, &haganeOpsSqrt,    &cpu_dispatch_sqrt,    nullptr};
+// X+73 M3d: unary math wired onto the native metallib path (base name; the
+// bridge appends _<dtypeTag>_unrolled_contig). All emit float/half/bfloat16
+// arms; other dtypes fall back to the MLX c_abi_fn.
+inline constexpr OpConfig kExpCfg     = {"exp",     "hagane_exp_kernel_cuda",   &haganeOpsExp,     &cpu_dispatch_exp,     nullptr};
+inline constexpr OpConfig kLogCfg     = {"log",     "hagane_log_kernel_cuda",   &haganeOpsLog,     &cpu_dispatch_log,     nullptr};
+inline constexpr OpConfig kSqrtCfg    = {"sqrt",    "hagane_sqrt_kernel_cuda",  &haganeOpsSqrt,    &cpu_dispatch_sqrt,    nullptr};
 inline constexpr OpConfig kSinCfg     = {"sin",     nullptr, &haganeOpsSin,     &cpu_dispatch_sin,     nullptr};
 inline constexpr OpConfig kCosCfg     = {"cos",     nullptr, &haganeOpsCos,     &cpu_dispatch_cos,     nullptr};
 inline constexpr OpConfig kCeilCfg    = {"ceil",    nullptr, &haganeOpsCeil,    &cpu_dispatch_ceil,    nullptr};
 inline constexpr OpConfig kFloorCfg   = {"floor",   nullptr, &haganeOpsFloor,   &cpu_dispatch_floor,   nullptr};
-inline constexpr OpConfig kTanhCfg    = {"tanh",    nullptr, &haganeOpsTanh,    &cpu_dispatch_tanh,    nullptr};
+inline constexpr OpConfig kTanhCfg    = {"tanh",    "hagane_tanh_kernel_cuda",  &haganeOpsTanh,    &cpu_dispatch_tanh,    nullptr};
 inline constexpr OpConfig kSigmoidCfg = {"sigmoid", nullptr, &haganeOpsSigmoid, &cpu_dispatch_sigmoid, nullptr};
 
 inline constexpr OpConfig kReciprocalCfg = {"reciprocal", nullptr, &haganeOpsReciprocal, &cpu_dispatch_reciprocal, nullptr};
@@ -117,8 +125,8 @@ inline constexpr OpConfig kRsqrtCfg      = {"rsqrt",      nullptr, &haganeOpsRsq
 inline constexpr OpConfig kRoundCfg      = {"round",      nullptr, &haganeOpsRound,      &cpu_dispatch_round,      nullptr};
 inline constexpr OpConfig kTruncCfg      = {"trunc",      nullptr, &haganeOpsTrunc,      &cpu_dispatch_trunc,      nullptr};
 inline constexpr OpConfig kErfCfg        = {"erf",        nullptr, &haganeOpsErf,        &cpu_dispatch_erf,        nullptr};
-inline constexpr OpConfig kLog2Cfg       = {"log2",       nullptr, &haganeOpsLog2,       &cpu_dispatch_log2,       nullptr};
-inline constexpr OpConfig kLog10Cfg      = {"log10",      nullptr, &haganeOpsLog10,      &cpu_dispatch_log10,      nullptr};
+inline constexpr OpConfig kLog2Cfg       = {"log2",       "hagane_log2_kernel_cuda",  &haganeOpsLog2,       &cpu_dispatch_log2,       nullptr};
+inline constexpr OpConfig kLog10Cfg      = {"log10",      "hagane_log10_kernel_cuda", &haganeOpsLog10,      &cpu_dispatch_log10,      nullptr};
 inline constexpr OpConfig kLog1pCfg      = {"log1p",      nullptr, &haganeOpsLog1p,      &cpu_dispatch_log1p,      nullptr};
 inline constexpr OpConfig kExp2Cfg       = {"exp2",       nullptr, &haganeOpsExp2,       &cpu_dispatch_exp2,       nullptr};
 
@@ -144,9 +152,9 @@ inline constexpr OpConfig kFracCfg   = {"frac",   nullptr, &haganeOpsFrac,   &cp
 // path (float-contiguous fast path in hagane_kernel_bridge; MLX c_abi_fn still
 // covers half/bfloat/non-contiguous). Kernels harvested by the AST corpus
 // engine from the GPU_LAMBDA activations; numerics verified vs CPU at atol=1e-5.
-inline constexpr OpConfig kHardsigmoidCfg = {"hardsigmoid", "hagane_hardsigmoid_kernel_float_unrolled_contig", &haganeOpsHardsigmoid, &cpu_dispatch_hardsigmoid, nullptr};
+inline constexpr OpConfig kHardsigmoidCfg = {"hardsigmoid", "hagane_hardsigmoid_kernel", &haganeOpsHardsigmoid, &cpu_dispatch_hardsigmoid, nullptr};
 inline constexpr OpConfig kMishCfg        = {"mish",        nullptr, &haganeOpsMish,        &cpu_dispatch_mish,        nullptr};
-inline constexpr OpConfig kSiluCfg        = {"silu",        "hagane_silu_kernel_float_unrolled_contig", &haganeOpsSilu,        &cpu_dispatch_silu,        nullptr};
+inline constexpr OpConfig kSiluCfg        = {"silu",        "hagane_silu_kernel", &haganeOpsSilu,        &cpu_dispatch_silu,        nullptr};
 
 // X+24 Lane B — sinc / signbit via new pure-MLX runtime C-ABIs.
 inline constexpr OpConfig kSincCfg    = {"sinc",    nullptr, &haganeOpsSinc,    &cpu_dispatch_sinc,    nullptr};
@@ -170,13 +178,13 @@ inline constexpr BinaryOpConfig kLtCfg  = {"lt",  nullptr, &haganeOpsLt,  &cpu_d
 inline constexpr BinaryOpConfig kGtCfg  = {"gt",  nullptr, &haganeOpsGt,  &cpu_dispatch_gt,  &fp64_gt };
 inline constexpr BinaryOpConfig kLeCfg  = {"le",  nullptr, &haganeOpsLe,  &cpu_dispatch_le,  &fp64_le };
 inline constexpr BinaryOpConfig kGeCfg  = {"ge",  nullptr, &haganeOpsGe,  &cpu_dispatch_ge,  &fp64_ge };
-inline constexpr BinaryOpConfig kMulCfg = {"mul", nullptr, &haganeOpsMul, &cpu_dispatch_mul, &fp64_mul};
+inline constexpr BinaryOpConfig kMulCfg = {"mul", "hagane_MulFunctor", &haganeOpsMul, &cpu_dispatch_mul, &fp64_mul};
 
 inline constexpr BinaryOpConfig kPowTtCfg     = {"pow_tt",    nullptr, &haganeOpsPow,       &cpu_dispatch_pow_tt,    nullptr  };
 inline constexpr BinaryOpConfig kAtan2Cfg     = {"atan2",     nullptr, &haganeOpsAtan2,     &cpu_dispatch_atan2,     nullptr  };
 inline constexpr BinaryOpConfig kRemainderCfg = {"remainder", nullptr, &haganeOpsRemainder, &cpu_dispatch_remainder, nullptr  };
 inline constexpr BinaryOpConfig kFmodCfg      = {"fmod",      nullptr, &haganeOpsFmod,      &cpu_dispatch_fmod,      nullptr  };
-inline constexpr BinaryOpConfig kDivTrueCfg   = {"div_true",  nullptr, &haganeOpsDiv,       &cpu_dispatch_div_true,  &fp64_div};
+inline constexpr BinaryOpConfig kDivTrueCfg   = {"div_true",  "hagane_DivFunctor", &haganeOpsDiv,       &cpu_dispatch_div_true,  &fp64_div};
 inline constexpr BinaryOpConfig kDivFloorCfg  = {"div_floor", nullptr, &haganeOpsDivFloor,  &cpu_dispatch_div_floor, nullptr  };
 inline constexpr BinaryOpConfig kDivTruncCfg  = {"div_trunc", nullptr, &haganeOpsDivTrunc,  &cpu_dispatch_div_trunc, nullptr  };
 
@@ -360,27 +368,62 @@ struct UnaryScalarOpConfig {
 };
 
 inline constexpr UnaryScalarOpConfig kPowTsCfg      = {"pow_ts",     nullptr, &pow_scalar_wrap,     &cpu_dispatch_pow_ts,     nullptr};
-inline constexpr UnaryScalarOpConfig kLeakyReluCfg  = {"leaky_relu", nullptr, &haganeOpsLeakyRelu,  &cpu_dispatch_leaky_relu, nullptr};
+inline constexpr UnaryScalarOpConfig kLeakyReluCfg  = {"leaky_relu", "hagane_leaky_relu_kernel", &haganeOpsLeakyRelu,  &cpu_dispatch_leaky_relu, nullptr};
 inline constexpr UnaryScalarOpConfig kHardshrinkCfg = {"hardshrink", nullptr, &haganeOpsHardshrink, &cpu_dispatch_hardshrink, nullptr};
 inline constexpr UnaryScalarOpConfig kSoftshrinkCfg = {"softshrink", nullptr, &haganeOpsSoftshrink, &cpu_dispatch_softshrink, nullptr};
 inline constexpr UnaryScalarOpConfig kLogitCfg      = {"logit",      nullptr, &haganeOpsLogit,      &cpu_dispatch_logit,      nullptr};
 
-// Drains both the MLX lazy graph and the Hagane Metal command queue. Used after
-// a metallib launch so the kernel's write is visible to a cross-queue MLX read.
+// Drains both the MLX lazy graph and the Hagane Metal command queue. (M3c moved
+// the post-launch drain to the MLX read boundary — see haganeOpsMarkMetallibWrite
+// — so this is no longer called per metallib launch; kept for the contract.)
 extern "C" hipError_t hipDeviceSynchronize();
 
-// ---- Lazy metallib registration --------------------------------------------
-// Per-instantiation state. Each Cfg gets its own MetallibState<Cfg> with
-// its own once_flag + availability bool. Only instantiated for Cfgs with
-// metallib_kernel != nullptr (the `if constexpr` in the bridge gates it).
+// ---- Native metallib dispatch (X+73 M3b) -----------------------------------
+// The corpus engine names harvested kernels
+// `hagane_<base>_<dtypeTag><shape>_unrolled_contig`. <Config>.metallib_kernel
+// holds the <base> (e.g. "hagane_silu_kernel"); the bridge computes the
+// per-dtype name at dispatch, so one metallib (every dtype arm of the op,
+// loaded at once via haganeRegisterMetallibAll) serves float/half/bfloat16/…
+// The <shape> is implicit in the bridge arity ("" unary, "_a2" binary,
+// "_a1_s1" captured-scalar) — matching the transpiler's disambiguation.
 
-template <const OpConfig& Cfg>
+// Torch dtype → transpiler dtype tag (see ast_transpiler msl_type_for). nullptr
+// for dtypes with no Metal kernel (float64/complex) → handled host-side.
+inline const char* metallib_dtype_tag(c10::ScalarType st) {
+    switch (st) {
+        case c10::ScalarType::Float:    return "float";
+        case c10::ScalarType::Half:     return "half";
+        case c10::ScalarType::BFloat16: return "bfloat16";
+        case c10::ScalarType::Byte:     return "uint8";
+        case c10::ScalarType::Char:     return "int8";
+        case c10::ScalarType::Short:    return "int16";
+        case c10::ScalarType::Int:      return "int32";
+        case c10::ScalarType::Long:     return "int64";
+        case c10::ScalarType::Bool:     return "bool";
+        default:                        return nullptr;
+    }
+}
+
+inline std::string metallib_kernel_name(const char* base, c10::ScalarType st,
+                                        const char* shape) {
+    const char* tag = metallib_dtype_tag(st);
+    if (!tag) return {};
+    return std::string(base) + "_" + tag + shape + "_unrolled_contig";
+}
+
+// ---- Lazy metallib registration --------------------------------------------
+// Per-(config) state. `auto&` so one template serves OpConfig / BinaryOpConfig
+// / UnaryScalarOpConfig — all expose op_name + metallib_kernel. Each Cfg gets
+// its own MetallibState<Cfg> (once_flag + availability); only instantiated for
+// Cfgs whose metallib_kernel != nullptr (the bridge `if constexpr` gates it).
+
+template <auto& Cfg>
 struct MetallibState {
     static inline bool available = false;
     static inline std::once_flag once;
 };
 
-template <const OpConfig& Cfg>
+template <auto& Cfg>
 inline void maybe_register_metallib() {
     if (!std::getenv("HAGANE_USE_METALLIB_ROUTE")) {
         std::fprintf(stderr,
@@ -389,9 +432,11 @@ inline void maybe_register_metallib() {
                      Cfg.op_name);
         return;
     }
+    // Load EVERY dtype arm in one library open (fatbin equivalent). The bridge
+    // computes the exact per-dtype name at dispatch; an absent arm fails the
+    // launch cleanly and falls back to the MLX c_abi path.
     std::string path = metallib_dir() + "/" + Cfg.op_name + ".metallib";
-    const char* names[] = {Cfg.metallib_kernel};
-    hipError_t rc = haganeRegisterMetallib(path.c_str(), names, 1);
+    hipError_t rc = haganeRegisterMetallibAll(path.c_str());
     if (rc != hipSuccess) {
         std::fprintf(stderr,
                      "[hagane-path-alpha] failed to register %s (%d); "
@@ -401,49 +446,98 @@ inline void maybe_register_metallib() {
     }
     MetallibState<Cfg>::available = true;
     std::fprintf(stderr,
-                 "[hagane-path-alpha] %s metallib registered (%s); "
+                 "[hagane-path-alpha] %s metallib registered (all dtype arms); "
                  "%s_stub owned by bridge (metallib=on)\n",
-                 Cfg.op_name, Cfg.metallib_kernel, Cfg.op_name);
+                 Cfg.op_name, Cfg.op_name);
 }
 
-template <const OpConfig& Cfg>
-inline bool try_launch_via_metallib(TensorIteratorBase& iter) {
+// Log the first native dispatch of each distinct kernel name (one line per
+// dtype arm). Confirms from the bridge log which dtypes actually route native
+// vs fall back to MLX — e.g. silu_kernel_half_/bfloat16_ appearing here proves
+// half/bf16 run on the harvested kernel, not the MLX c_abi path.
+inline void note_native_launch(const std::string& kname) {
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> g(mu);
+    if (seen.insert(kname).second)
+        std::fprintf(stderr, "[hagane-path-alpha] native dispatch: %s\n", kname.c_str());
+}
+
+// ---- Launch helpers (one per arity) ----------------------------------------
+// Each flushes pending MLX writes to the input buffer(s), dispatches the named
+// kernel, then drains the Hagane queue so the shared MTLBuffer is coherent
+// before the cross-queue MLX read (X+72 fix). Return false on launch failure
+// so the caller falls back to the MLX c_abi path.
+//
+// M3b: the per-launch drain costs the X+71 async win for routed ops; M3c
+// replaces it with a deferred drain fired only at the actual MLX/host read
+// boundary, so native→native chains run drain-free.
+
+inline bool try_launch_unary_metallib(const std::string& kname,
+                                      TensorIteratorBase& iter) {
     void* d_out = iter.data_ptr(0);
-    void* d_in = iter.data_ptr(1);
+    void* d_in  = iter.data_ptr(1);
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
-
-    // Force MLX to evaluate pending writes to the input buffer before the
-    // metallib kernel reads raw bytes via the device pointer (bypasses MLX's
-    // lazy graph).
     ::haganeOpsFlush();
-
-    dim3 block(256, 1, 1);
-    dim3 grid((N + 255) / 256, 1, 1);
+    dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &N};
     int    arg_types[] = {0, 0, 1};
     size_t arg_sizes[] = {0, 0, sizeof(int)};
-
-    hipError_t rc = hagane_launch_kernel_mixed(
-        Cfg.metallib_kernel, grid, block, /*shared_mem=*/0,
-        /*stream=*/nullptr, args, arg_types, arg_sizes, /*arg_count=*/3);
-    if (rc != hipSuccess) {
-        std::fprintf(stderr,
-                     "[hagane-path-alpha] %s metallib launch failed (%d); "
-                     "falling back to direct path\n",
-                     Cfg.op_name, static_cast<int>(rc));
+    if (hagane_launch_kernel_mixed(kname.c_str(), grid, block, 0, nullptr,
+                                   args, arg_types, arg_sizes, 3) != hipSuccess)
         return false;
-    }
-    // X+72: the output buffer is consumed by MLX on its OWN MTLCommandQueue,
-    // which does not observe the metallib kernel's write under async dispatch
-    // (default-on since X+71) — the write is batched/uncommitted on Hagane's
-    // queue, so MLX reads stale (zero) bytes. Drain the Hagane queue so the
-    // shared MTLBuffer is coherent before the MLX read. The C++/hipMemcpy path
-    // already syncs at the memcpy boundary; the torch path reads via MLX, hence
-    // this. At M3 (MLX off the hot path) the consumer is the next metallib op on
-    // the same queue and this drain is removed. Without it, abs/silu/... return
-    // zeros under HAGANE_USE_METALLIB_ROUTE=1.
-    ::hipDeviceSynchronize();
+    note_native_launch(kname);
+    // M3c: mark the output dirty-on-Hagane-queue instead of draining now; the
+    // drain fires lazily at the MLX/host read boundary, so native chains don't
+    // pay the per-op sync (the X+71 async win is preserved for routed ops).
+    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
+    return true;
+}
+
+inline bool try_launch_binary_metallib(const std::string& kname,
+                                       TensorIteratorBase& iter) {
+    void* d_out = iter.data_ptr(0);
+    void* d_a   = iter.data_ptr(1);
+    void* d_b   = iter.data_ptr(2);
+    int N = static_cast<int>(iter.numel());
+    if (N <= 0) return true;
+    ::haganeOpsFlush();
+    dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
+    void*  args[]      = {d_a, d_b, d_out, &N};
+    int    arg_types[] = {0, 0, 0, 1};
+    size_t arg_sizes[] = {0, 0, 0, sizeof(int)};
+    if (hagane_launch_kernel_mixed(kname.c_str(), grid, block, 0, nullptr,
+                                   args, arg_types, arg_sizes, 4) != hipSuccess)
+        return false;
+    note_native_launch(kname);
+    // M3c: mark the output dirty-on-Hagane-queue instead of draining now; the
+    // drain fires lazily at the MLX/host read boundary, so native chains don't
+    // pay the per-op sync (the X+71 async win is preserved for routed ops).
+    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
+    return true;
+}
+
+inline bool try_launch_unary_scalar_metallib(const std::string& kname,
+                                             TensorIteratorBase& iter, float scalar) {
+    void* d_out = iter.data_ptr(0);
+    void* d_in  = iter.data_ptr(1);
+    int N = static_cast<int>(iter.numel());
+    if (N <= 0) return true;
+    ::haganeOpsFlush();
+    float sc = scalar;
+    dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
+    void*  args[]      = {d_in, d_out, &sc, &N};
+    int    arg_types[] = {0, 0, 1, 1};
+    size_t arg_sizes[] = {0, 0, sizeof(float), sizeof(int)};
+    if (hagane_launch_kernel_mixed(kname.c_str(), grid, block, 0, nullptr,
+                                   args, arg_types, arg_sizes, 4) != hipSuccess)
+        return false;
+    note_native_launch(kname);
+    // M3c: mark the output dirty-on-Hagane-queue instead of draining now; the
+    // drain fires lazily at the MLX/host read boundary, so native chains don't
+    // pay the per-op sync (the X+71 async win is preserved for routed ops).
+    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
     return true;
 }
 
@@ -470,10 +564,10 @@ inline void hagane_kernel_bridge(TensorIteratorBase& iter) {
         iter.tensor(0).copy_(at::sign(iter.tensor(1)));
     } else {
         if constexpr (Cfg.metallib_kernel != nullptr) {
-            if (MetallibState<Cfg>::available
-                && iter.dtype() == at::kFloat
-                && iter.is_contiguous()) {
-                if (try_launch_via_metallib<Cfg>(iter)) return;
+            if (MetallibState<Cfg>::available && iter.is_contiguous()) {
+                std::string kname =
+                    metallib_kernel_name(Cfg.metallib_kernel, iter.dtype(), "");
+                if (!kname.empty() && try_launch_unary_metallib(kname, iter)) return;
             }
         }
 
@@ -488,12 +582,33 @@ inline void hagane_kernel_bridge(TensorIteratorBase& iter) {
 
 template <const BinaryOpConfig& Cfg>
 inline void hagane_binary_bridge(TensorIteratorBase& iter) {
+    if constexpr (Cfg.metallib_kernel != nullptr) {
+        std::call_once(MetallibState<Cfg>::once, maybe_register_metallib<Cfg>);
+    }
+
     if constexpr (Cfg.at_fp64_fn != nullptr) {
         if (iter.common_dtype() == c10::ScalarType::Double) {
             auto a = iter.tensor(1).to(c10::ScalarType::Float);
             auto b = iter.tensor(2).to(c10::ScalarType::Float);
             iter.tensor(0).copy_(Cfg.at_fp64_fn(a, b));
             return;
+        }
+    }
+
+    // Native tensor-tensor (a2) path: both inputs must be real tensors of the
+    // output dtype with identical shape (the unrolled_contig kernel is pure
+    // element-wise — no broadcast, no scalar operand, no mixed dtype). Anything
+    // else falls through to the MLX c_abi path below.
+    if constexpr (Cfg.metallib_kernel != nullptr) {
+        if (MetallibState<Cfg>::available && iter.ninputs() == 2
+            && iter.is_contiguous()
+            && iter.tensor(1).scalar_type() == iter.dtype()
+            && iter.tensor(2).scalar_type() == iter.dtype()
+            && iter.tensor(1).sizes() == iter.tensor(0).sizes()
+            && iter.tensor(2).sizes() == iter.tensor(0).sizes()) {
+            std::string kname =
+                metallib_kernel_name(Cfg.metallib_kernel, iter.dtype(), "_a2");
+            if (!kname.empty() && try_launch_binary_metallib(kname, iter)) return;
         }
     }
 
@@ -625,11 +740,27 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
 
 template <const UnaryScalarOpConfig& Cfg>
 inline void hagane_unary_scalar_bridge(TensorIteratorBase& iter, const Scalar& scalar) {
+    if constexpr (Cfg.metallib_kernel != nullptr) {
+        std::call_once(MetallibState<Cfg>::once, maybe_register_metallib<Cfg>);
+    }
+
     if constexpr (Cfg.at_fp64_fn != nullptr) {
         if (iter.common_dtype() == c10::ScalarType::Double) {
             auto in = iter.tensor(1).to(c10::ScalarType::Float);
             iter.tensor(0).copy_(Cfg.at_fp64_fn(in, scalar).to(c10::ScalarType::Double));
             return;
+        }
+    }
+
+    // Native captured-scalar (a1_s1) path: the kernel takes the input tensor,
+    // output, the opmath scalar (always float) and N.
+    if constexpr (Cfg.metallib_kernel != nullptr) {
+        if (MetallibState<Cfg>::available && iter.is_contiguous()) {
+            std::string kname =
+                metallib_kernel_name(Cfg.metallib_kernel, iter.dtype(), "_a1_s1");
+            if (!kname.empty()
+                && try_launch_unary_scalar_metallib(kname, iter, scalar.toFloat()))
+                return;
         }
     }
 
