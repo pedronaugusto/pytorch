@@ -140,9 +140,13 @@ inline constexpr OpConfig kLgammaCfg = {"lgamma", nullptr, &haganeOpsLgamma, &cp
 // X+21 — frac brace-defect bug-fix-by-migration.
 inline constexpr OpConfig kFracCfg   = {"frac",   nullptr, &haganeOpsFrac,   &cpu_dispatch_frac,   nullptr};
 
-inline constexpr OpConfig kHardsigmoidCfg = {"hardsigmoid", nullptr, &haganeOpsHardsigmoid, &cpu_dispatch_hardsigmoid, nullptr};
+// X+72: silu + hardsigmoid moved onto the native transpiler-harvested metallib
+// path (float-contiguous fast path in hagane_kernel_bridge; MLX c_abi_fn still
+// covers half/bfloat/non-contiguous). Kernels harvested by the AST corpus
+// engine from the GPU_LAMBDA activations; numerics verified vs CPU at atol=1e-5.
+inline constexpr OpConfig kHardsigmoidCfg = {"hardsigmoid", "hagane_hardsigmoid_kernel_float_unrolled_contig", &haganeOpsHardsigmoid, &cpu_dispatch_hardsigmoid, nullptr};
 inline constexpr OpConfig kMishCfg        = {"mish",        nullptr, &haganeOpsMish,        &cpu_dispatch_mish,        nullptr};
-inline constexpr OpConfig kSiluCfg        = {"silu",        nullptr, &haganeOpsSilu,        &cpu_dispatch_silu,        nullptr};
+inline constexpr OpConfig kSiluCfg        = {"silu",        "hagane_silu_kernel_float_unrolled_contig", &haganeOpsSilu,        &cpu_dispatch_silu,        nullptr};
 
 // X+24 Lane B — sinc / signbit via new pure-MLX runtime C-ABIs.
 inline constexpr OpConfig kSincCfg    = {"sinc",    nullptr, &haganeOpsSinc,    &cpu_dispatch_sinc,    nullptr};
@@ -361,6 +365,10 @@ inline constexpr UnaryScalarOpConfig kHardshrinkCfg = {"hardshrink", nullptr, &h
 inline constexpr UnaryScalarOpConfig kSoftshrinkCfg = {"softshrink", nullptr, &haganeOpsSoftshrink, &cpu_dispatch_softshrink, nullptr};
 inline constexpr UnaryScalarOpConfig kLogitCfg      = {"logit",      nullptr, &haganeOpsLogit,      &cpu_dispatch_logit,      nullptr};
 
+// Drains both the MLX lazy graph and the Hagane Metal command queue. Used after
+// a metallib launch so the kernel's write is visible to a cross-queue MLX read.
+extern "C" hipError_t hipDeviceSynchronize();
+
 // ---- Lazy metallib registration --------------------------------------------
 // Per-instantiation state. Each Cfg gets its own MetallibState<Cfg> with
 // its own once_flag + availability bool. Only instantiated for Cfgs with
@@ -426,6 +434,16 @@ inline bool try_launch_via_metallib(TensorIteratorBase& iter) {
                      Cfg.op_name, static_cast<int>(rc));
         return false;
     }
+    // X+72: the output buffer is consumed by MLX on its OWN MTLCommandQueue,
+    // which does not observe the metallib kernel's write under async dispatch
+    // (default-on since X+71) — the write is batched/uncommitted on Hagane's
+    // queue, so MLX reads stale (zero) bytes. Drain the Hagane queue so the
+    // shared MTLBuffer is coherent before the MLX read. The C++/hipMemcpy path
+    // already syncs at the memcpy boundary; the torch path reads via MLX, hence
+    // this. At M3 (MLX off the hot path) the consumer is the next metallib op on
+    // the same queue and this drain is removed. Without it, abs/silu/... return
+    // zeros under HAGANE_USE_METALLIB_ROUTE=1.
+    ::hipDeviceSynchronize();
     return true;
 }
 
