@@ -378,6 +378,15 @@ inline constexpr UnaryScalarOpConfig kLogitCfg      = {"logit",      nullptr, &h
 // — so this is no longer called per metallib launch; kept for the contract.)
 extern "C" hipError_t hipDeviceSynchronize();
 
+// X+74 — a raw metallib launch (hagane_launch_kernel_mixed) has no capture
+// hook, so it is invisible to the hagane tape and would be dropped on replay.
+// While a tape is recording (haganeOpsTapeRecording), the launch helpers fall
+// back to the MLX c_abi path, which IS recorded (HAGANE_CAPTURE_OP) and replays
+// correctly. Distinct from haganeOpsCaptureActive() (hipStreamBeginCapture).
+// Declared here (hagane_capture.h is not included by this header).
+extern "C" int haganeOpsTapeRecording(void);
+
+
 // ---- Native metallib dispatch (X+73 M3b) -----------------------------------
 // The corpus engine names harvested kernels
 // `hagane_<base>_<dtypeTag><shape>_unrolled_contig`. <Config>.metallib_kernel
@@ -475,6 +484,7 @@ inline void note_native_launch(const std::string& kname) {
 
 inline bool try_launch_unary_metallib(const std::string& kname,
                                       TensorIteratorBase& iter) {
+    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
     void* d_out = iter.data_ptr(0);
     void* d_in  = iter.data_ptr(1);
     int N = static_cast<int>(iter.numel());
@@ -497,6 +507,7 @@ inline bool try_launch_unary_metallib(const std::string& kname,
 
 inline bool try_launch_binary_metallib(const std::string& kname,
                                        TensorIteratorBase& iter) {
+    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
     void* d_out = iter.data_ptr(0);
     void* d_a   = iter.data_ptr(1);
     void* d_b   = iter.data_ptr(2);
@@ -520,6 +531,7 @@ inline bool try_launch_binary_metallib(const std::string& kname,
 
 inline bool try_launch_unary_scalar_metallib(const std::string& kname,
                                              TensorIteratorBase& iter, float scalar) {
+    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
     void* d_out = iter.data_ptr(0);
     void* d_in  = iter.data_ptr(1);
     int N = static_cast<int>(iter.numel());
