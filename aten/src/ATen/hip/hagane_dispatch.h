@@ -489,7 +489,11 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     void* d_in  = iter.data_ptr(1);
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
-    ::haganeOpsFlush();
+    // X+75: minimal per-input region flush (NOT blanket haganeOpsFlush, which
+    // bumps generation_ and purges wrap_deps_ — corrupting the decode KV-cache
+    // lazy chain). Only the input bytes must be materialized; mirrors
+    // hagane_copy_kernel's haganeOpsFlushRegion(src, nbytes) (HaganeOps.cpp).
+    ::haganeOpsFlushRegion(d_in, static_cast<int64_t>(N) * iter.element_size(1));
     dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &N};
     int    arg_types[] = {0, 0, 1};
@@ -513,7 +517,9 @@ inline bool try_launch_binary_metallib(const std::string& kname,
     void* d_b   = iter.data_ptr(2);
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
-    ::haganeOpsFlush();
+    // X+75: minimal per-input region flush for both operands (see unary above).
+    ::haganeOpsFlushRegion(d_a, static_cast<int64_t>(N) * iter.element_size(1));
+    ::haganeOpsFlushRegion(d_b, static_cast<int64_t>(N) * iter.element_size(2));
     dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
     void*  args[]      = {d_a, d_b, d_out, &N};
     int    arg_types[] = {0, 0, 0, 1};
@@ -536,7 +542,8 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     void* d_in  = iter.data_ptr(1);
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
-    ::haganeOpsFlush();
+    // X+75: minimal per-input region flush (see unary above).
+    ::haganeOpsFlushRegion(d_in, static_cast<int64_t>(N) * iter.element_size(1));
     float sc = scalar;
     dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &sc, &N};
