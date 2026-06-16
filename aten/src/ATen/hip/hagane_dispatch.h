@@ -502,9 +502,14 @@ inline bool try_launch_unary_metallib(const std::string& kname,
                                    args, arg_types, arg_sizes, 3) != hipSuccess)
         return false;
     note_native_launch(kname);
-    // M3c: mark the output dirty-on-Hagane-queue instead of draining now; the
-    // drain fires lazily at the MLX/host read boundary, so native chains don't
-    // pay the per-op sync (the X+71 async win is preserved for routed ops).
+    // M3c / X+76: mark the output dirty-on-Hagane-queue instead of draining now.
+    // The drain fires lazily at a read boundary (haganeOpsMarkMetallibWrite). On
+    // the unified queue (HAGANE_METALLIB_UNIFIED_QUEUE) the MLX-input boundary
+    // skips that drain — downstream MLX readers commit onto Hagane's queue and
+    // order against this write via the shared MTLSharedEvent chain — while the
+    // host-readback / FREE boundaries still drain precisely (correctness). All of
+    // that queue policy lives in the runtime now, so this path is op-agnostic and
+    // flag-off stays bit-identical to X+75.
     haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
     return true;
 }
