@@ -472,6 +472,18 @@ inline void note_native_launch(const std::string& kname) {
         std::fprintf(stderr, "[hagane-path-alpha] native dispatch: %s\n", kname.c_str());
 }
 
+// X+77: settle a metallib kernel's MLX-produced input. Under the unified queue
+// (HAGANE_METALLIB_UNIFIED_QUEUE) this event-orders the input GPU-side — commit
+// the producer async (no host wait) + blit it into the torch block on the same
+// queue — so a native→MLX→native chain pays no blocking host eval. Flag-off
+// keeps the byte-identical X+75 region flush (drain_submitted + mx::eval).
+inline void flush_or_commit_metallib_input(void* d_in, int64_t nbytes) {
+    if (haganeMetallibUnifiedQueueEnabled())
+        ::haganeOpsCommitInputProducer(d_in, nbytes);
+    else
+        ::haganeOpsFlushRegion(d_in, nbytes);
+}
+
 // ---- Launch helpers (one per arity) ----------------------------------------
 // Each flushes pending MLX writes to the input buffer(s), dispatches the named
 // kernel, then drains the Hagane queue so the shared MTLBuffer is coherent
@@ -493,7 +505,8 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     // bumps generation_ and purges wrap_deps_ — corrupting the decode KV-cache
     // lazy chain). Only the input bytes must be materialized; mirrors
     // hagane_copy_kernel's haganeOpsFlushRegion(src, nbytes) (HaganeOps.cpp).
-    ::haganeOpsFlushRegion(d_in, static_cast<int64_t>(N) * iter.element_size(1));
+    // X+77: under the unified queue this event-orders the input GPU-side instead.
+    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(N) * iter.element_size(1));
     dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &N};
     int    arg_types[] = {0, 0, 1};
@@ -523,8 +536,9 @@ inline bool try_launch_binary_metallib(const std::string& kname,
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
     // X+75: minimal per-input region flush for both operands (see unary above).
-    ::haganeOpsFlushRegion(d_a, static_cast<int64_t>(N) * iter.element_size(1));
-    ::haganeOpsFlushRegion(d_b, static_cast<int64_t>(N) * iter.element_size(2));
+    // X+77: event-order both inputs GPU-side under the unified queue.
+    flush_or_commit_metallib_input(d_a, static_cast<int64_t>(N) * iter.element_size(1));
+    flush_or_commit_metallib_input(d_b, static_cast<int64_t>(N) * iter.element_size(2));
     dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
     void*  args[]      = {d_a, d_b, d_out, &N};
     int    arg_types[] = {0, 0, 0, 1};
@@ -548,7 +562,8 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
     // X+75: minimal per-input region flush (see unary above).
-    ::haganeOpsFlushRegion(d_in, static_cast<int64_t>(N) * iter.element_size(1));
+    // X+77: event-order the input GPU-side under the unified queue.
+    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(N) * iter.element_size(1));
     float sc = scalar;
     dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &sc, &N};
