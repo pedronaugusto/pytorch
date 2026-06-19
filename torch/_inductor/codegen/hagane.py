@@ -707,12 +707,16 @@ def maybe_register_hagane_scheduling() -> bool:
     if not _hagane_runtime_available():
         return False
     from .common import register_backend_for_device
-    from .wrapper import PythonWrapperCodegen
+    from .hagane_wrapper import HaganeWrapperCodegen
 
+    # HaganeWrapperCodegen brackets the generated call(args) with
+    # set_compile_active(1/0) so the runtime's unified-queue deferred drain
+    # eager-drains during compiled execution (A4 S0/S1) — a bare
+    # torch.compile(model) can't defer-then-NaN (the X+74 failure).
     register_backend_for_device(
         "cuda",
         HaganeScheduling,
-        PythonWrapperCodegen,
+        HaganeWrapperCodegen,
     )
     # X+66: Override Inductor's sdpa_constraint with a passthrough on Hagane.
     # sdpa_constraint at lowering.py:3113 calls ExternKernel.require_stride_order

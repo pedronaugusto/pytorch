@@ -434,7 +434,11 @@ struct MetallibState {
 
 template <auto& Cfg>
 inline void maybe_register_metallib() {
-    if (!std::getenv("HAGANE_USE_METALLIB_ROUTE")) {
+    // A4 (route default-on): the native metallib route is ON by default;
+    // HAGANE_USE_METALLIB_ROUTE=0 is the escape back to the bit-identical
+    // MLX-only path (the working spine). Any other value (or unset) routes.
+    const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+    if (route && route[0] == '0') {
         std::fprintf(stderr,
                      "[hagane-path-alpha] %s_stub owned by bridge "
                      "(metallib=off)\n",
