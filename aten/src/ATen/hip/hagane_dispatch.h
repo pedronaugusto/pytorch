@@ -48,6 +48,8 @@
 #pragma once
 
 #include <ATen/Functions.h>
+#include <ATen/WrapDimUtils.h>      // E2E-1 — at::maybe_wrap_dim for cross_stub composition.
+#include <ATen/native/Cross.h>     // E2E-1 — cross_fn / cross_stub signature.
 #include <ATen/native/Activation.h>
 #include <ATen/native/DispatchStub.h>
 #include <ATen/native/UnaryOps.h>
@@ -196,6 +198,14 @@ inline constexpr BinaryOpConfig kMaximumCfg    = {"maximum",     nullptr, &hagan
 inline constexpr BinaryOpConfig kMinimumCfg    = {"minimum",     nullptr, &haganeOpsMinimum,    &cpu_dispatch_minimum,     nullptr};
 inline constexpr BinaryOpConfig kCopysignCfg   = {"copysign",    nullptr, &haganeOpsCopysign,   &cpu_dispatch_copysign,    nullptr};
 
+// T2.1 — integer gcd/lcm run NATIVE via the transpiler-owned metallib
+// (GcdLcmKernel.hip → hagane_{gcd,lcm}_kernel_cuda_<int-dtype>_a2_wptN_...).
+// No MLX C-ABI (c_abi_fn=nullptr) and no fp64 (integral-only) → the bridge's
+// nullptr-c_abi branch falls straight to cpu_dispatch_{gcd,lcm} when the
+// metallib is unavailable / dtype/shape unsupported.
+inline constexpr BinaryOpConfig kGcdCfg = {"gcd", "hagane_gcd_kernel_cuda", nullptr, &cpu_dispatch_gcd, nullptr};
+inline constexpr BinaryOpConfig kLcmCfg = {"lcm", "hagane_lcm_kernel_cuda", nullptr, &cpu_dispatch_lcm, nullptr};
+
 // X+23 Lane B — fmax/fmin via NaN-aware MLX composition C-ABIs added in
 // Sprint X+23 (hagane/src/runtime/hagane_ops.cpp). Same BinaryOpConfig
 // shape as maximum/minimum but with NaN propagation semantics.
@@ -250,8 +260,13 @@ struct UnaryIterOpConfig {
     Tensor (*at_fp64_fn)(const Tensor&);
 };
 
-inline constexpr UnaryIterOpConfig kSumCfg       = {"sum",        nullptr, &haganeOpsSum,       &cpu_dispatch_sum,        nullptr};
-inline constexpr UnaryIterOpConfig kMeanCfg      = {"mean",       nullptr, &haganeOpsMean,      &cpu_dispatch_mean,       nullptr};
+// A9: kSumCfg/kMeanCfg carry a non-null metallib_kernel sentinel ("reduce") so
+// the bridge attempts try_launch_reduction_metallib (the owned Tier-a host
+// 2-pass) before the MLX c_abi_fn. The sentinel only gates the attempt; the
+// actual kernel names are picked by dtype inside the helper. All other reduce
+// configs keep nullptr → MLX (unchanged).
+inline constexpr UnaryIterOpConfig kSumCfg       = {"sum",        "reduce", &haganeOpsSum,       &cpu_dispatch_sum,        nullptr};
+inline constexpr UnaryIterOpConfig kMeanCfg      = {"mean",       "reduce", &haganeOpsMean,      &cpu_dispatch_mean,       nullptr};
 inline constexpr UnaryIterOpConfig kProdCfg      = {"prod",       nullptr, &haganeOpsProd,      &cpu_dispatch_prod,       nullptr};
 inline constexpr UnaryIterOpConfig kArgmaxCfg    = {"argmax",     nullptr, &haganeOpsArgmax,    &cpu_dispatch_argmax,     nullptr};
 inline constexpr UnaryIterOpConfig kArgminCfg    = {"argmin",     nullptr, &haganeOpsArgmin,    &cpu_dispatch_argmin,     nullptr};
@@ -413,11 +428,24 @@ inline const char* metallib_dtype_tag(c10::ScalarType st) {
     }
 }
 
+// A8: work-per-thread vectorization factor. MUST equal the transpiler's
+// emit_functor_specialization (wpt = 8/sizeof(elem)): bf16/half->4, float/int32
+// ->2, int8/bool->8, int64->1. Encoded in the kernel name (_wptN) AND used to
+// size the launch grid (ceil(N/wpt) threads), so the kernel and its launch
+// agree by construction; any drift -> kernel-not-found -> MLX c_abi fallback
+// (correct-but-slow, never wrong).
+inline int metallib_work_per_thread(c10::ScalarType st) {
+    int bytes = static_cast<int>(c10::elementSize(st));
+    return (bytes > 0 && bytes <= 8) ? 8 / bytes : 1;
+}
+
 inline std::string metallib_kernel_name(const char* base, c10::ScalarType st,
                                         const char* shape) {
     const char* tag = metallib_dtype_tag(st);
     if (!tag) return {};
-    return std::string(base) + "_" + tag + shape + "_unrolled_contig";
+    return std::string(base) + "_" + tag + shape
+         + "_wpt" + std::to_string(metallib_work_per_thread(st))
+         + "_unrolled_contig";
 }
 
 // ---- Lazy metallib registration --------------------------------------------
@@ -511,7 +539,11 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     // hagane_copy_kernel's haganeOpsFlushRegion(src, nbytes) (HaganeOps.cpp).
     // X+77: under the unified queue this event-orders the input GPU-side instead.
     flush_or_commit_metallib_input(d_in, static_cast<int64_t>(N) * iter.element_size(1));
-    dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
+    // A8: each thread handles wpt elements (matches the kernel's _wptN); the
+    // grid covers ceil(N/wpt) threads.
+    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int nthreads = (N + wpt - 1) / wpt;
+    dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &N};
     int    arg_types[] = {0, 0, 1};
     size_t arg_sizes[] = {0, 0, sizeof(int)};
@@ -531,6 +563,483 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     return true;
 }
 
+// ---- A6 (Phase 2): native norm route (rms_norm + layer_norm) ----------------
+// Unlike the elementwise ops (DispatchStub + OpConfig + bridge), the fused
+// rms_norm / layer_norm entries (_fused_rms_norm_cuda, layer_norm_cuda) are
+// direct C10_EXPORTs, so the shared norm.metallib is registered here via a
+// standalone thread-safe once-init rather than MetallibState<Cfg>. It bundles
+// all 12 transpiler-owned kernels ({float,half,bfloat16} × {ln,rms} ×
+// {RowwiseMoments,LayerNormForward}); haganeRegisterMetallibAll is idempotent so
+// one registration serves both norms. Two kernels per dtype run the per-row
+// geometry grid=(M) block=256 (one threadgroup per row): the real PyTorch
+// RowwiseMoments (Welford → mean,rstd) then LayerNormForward (apply). Route-off
+// (HAGANE_USE_METALLIB_ROUTE=0) skips registration → unavailable → MLX fallback
+// (the bit-identical spine).
+inline bool norm_metallib_available() {
+    static const bool available = [] {
+        const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+        if (route && route[0] == '0') return false;
+        std::string path = metallib_dir() + "/norm.metallib";
+        if (haganeRegisterMetallibAll(path.c_str()) != hipSuccess) {
+            std::fprintf(stderr,
+                "[hagane-path-alpha] failed to register %s; norm stays on MLX\n",
+                path.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+            "[hagane-path-alpha] norm metallib registered "
+            "(rms+layer_norm moments+apply, all dtype arms)\n");
+        return true;
+    }();
+    return available;
+}
+
+// Per-thread persistent scratch for the moments outputs, reused across calls so
+// the hot decode path never frees a buffer with an in-flight metallib write —
+// which would trip the unconditional FREE-boundary drain and serialize the
+// deferred queue (a ~15% decode regression vs reusing). Grows monotonically;
+// leaked (never destructed) to dodge static-teardown ordering vs the allocator.
+// Safe to reuse on the in-order Hagane queue: call N's apply consumes these
+// before call N+1's moments overwrites them.
+inline void* rms_moments_scratch(const at::TensorOptions& opts, int64_t M, int slot) {
+    static thread_local at::Tensor* scratch[2] = {nullptr, nullptr};
+    at::Tensor*& t = scratch[slot];
+    if (t == nullptr) t = new at::Tensor();
+    if (!t->defined() || t->numel() < M || t->device() != opts.device())
+        *t = at::empty({M}, opts.dtype(at::kFloat));
+    return t->data_ptr();
+}
+
+// A10: the FAST norm path — PyTorch's own FUSED vectorized_layer_norm_kernel
+// (single moments+apply pass, aligned_vector<T,4> vec loads, dynamic threadgroup
+// scratch). Eligible only for N % 4 == 0 + 16-byte-aligned X/gamma/beta/Y, dtype
+// {float,bfloat16} (no half fused arm). Geometry mirrors
+// launch_vectorized_layer_norm_kernel: block(warp_size, num_threads/warp_size),
+// grid(M), shared = threads.y>1 ? threads.y*3/2*sizeof(float) : 0. Returns false →
+// the caller falls back to the byte-unchanged scalar 2-kernel path. The kernel
+// name carries the variant, so any codegen/launch drift → name-not-registered →
+// hagane_launch_kernel_mixed fails → false → MLX (never silent-wrong).
+inline bool fused_norm_eligible(const char* tag, int64_t N,
+                                void* dX, void* dgamma, void* dbeta, void* dY) {
+    if (std::strcmp(tag, "half") == 0) return false;   // no fused half arm
+    if (N % 4 != 0) return false;
+    auto a16 = [](void* p) {
+        return (reinterpret_cast<size_t>(p) % 16) == 0;  // arm64: size_t==ptr width
+    };
+    return a16(dX) && a16(dgamma) && a16(dY) && (dbeta == nullptr || a16(dbeta));
+}
+
+inline bool launch_fused_norm(const char* tag, bool rms, void* dX, void* dgamma,
+                              void* dbeta, void* dmean, void* drstd, void* dY,
+                              int64_t M, int64_t N, double eps) {
+    const std::string k = std::string("hagane_vectorized_layer_norm_kernel_") +
+                          tag + (rms ? "_rms" : "_ln");
+    const int warp_size = 32, num_threads = 256;
+    const int threads_y = num_threads / warp_size;  // 8 (matches the launcher)
+    const unsigned shared = threads_y > 1
+        ? static_cast<unsigned>(threads_y * 3 / 2 * sizeof(float)) : 0u;
+    dim3 grid(static_cast<unsigned>(M), 1, 1), block(warp_size, threads_y, 1);
+    int   c_N   = static_cast<int>(N);
+    float c_eps = static_cast<float>(eps);
+    void*  args[] = {&c_N, &c_eps, dX, dgamma, dbeta, dmean, drstd, dY};
+    int    at[]   = {1, 1, 0, 0, 0, 0, 0, 0};
+    size_t as[]   = {sizeof(int), sizeof(float), 0, 0, 0, 0, 0, 0};
+    if (hagane_launch_kernel_mixed(k.c_str(), grid, block, shared, nullptr,
+                                   args, at, as, 8) != hipSuccess)
+        return false;
+    note_native_launch(k);
+    return true;
+}
+
+// Run rms_norm natively (moments→apply). On success writes `output` and, when
+// `need_rstd` (backward needed), hands back the per-row rstd (== rrms =
+// rsqrt(E[x^2]+eps)) in `rstd_out` so the caller returns it without recomputing
+// (consistent with the exact forward normalization); that fresh tensor is held
+// by autograd, so it isn't freed during the forward either. Returns false →
+// caller falls back to the MLX path: route-off, an unsupported/non-float dtype,
+// tape recording (so torch.compile capture/replay stays on MLX), or any launch
+// failure.
+inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
+                                         const std::optional<at::Tensor>& weight,
+                                         at::Tensor& output,
+                                         int64_t M, int64_t N, double eps,
+                                         bool need_rstd, at::Tensor& rstd_out) {
+    if (haganeOpsTapeRecording()) return false;
+    if (M <= 0 || N <= 0) return false;
+    if (!norm_metallib_available()) return false;
+    const char* tag = nullptr;
+    switch (input_c.scalar_type()) {
+        case at::kFloat:    tag = "float";    break;
+        case at::kHalf:     tag = "half";     break;
+        case at::kBFloat16: tag = "bfloat16"; break;
+        default: return false;
+    }
+
+    // T_ACC = float for every arm. mean is never read out (rms uses only rstd),
+    // so it's always reusable scratch; rstd is a fresh result only when backward
+    // needs it (returned), else reusable scratch too.
+    const auto opts = input_c.options();
+    void* dmean = rms_moments_scratch(opts, M, 0);
+    at::Tensor rstd_fresh;
+    void* drstd;
+    if (need_rstd) {
+        rstd_fresh = at::empty({M}, opts.dtype(at::kFloat));
+        drstd = rstd_fresh.data_ptr();
+    } else {
+        drstd = rms_moments_scratch(opts, M, 1);
+    }
+
+    // gamma must be a valid (non-null) buffer — the mixed launcher rejects null
+    // buffer args. With a weight, gamma = weight; without, a ones-vector
+    // reproduces the kernel's `gamma == nullptr ? 1 : gamma[j]` identity branch.
+    // beta is never read in the rms arm (if constexpr DCE) but is still a bound
+    // param, so reuse gamma as a harmless non-null dummy.
+    at::Tensor gamma = (weight.has_value() && weight->defined())
+        ? weight->contiguous()
+        : at::ones({N}, input_c.options());
+
+    void* dX     = input_c.data_ptr();
+    void* dgamma = gamma.data_ptr();
+    void* dY     = output.data_ptr();
+    const int64_t elt = input_c.element_size();
+
+    flush_or_commit_metallib_input(dX, M * N * elt);
+    flush_or_commit_metallib_input(dgamma, N * gamma.element_size());
+
+    // A10: the fused vec4 kernel (one pass) when aligned + N%4==0. beta is a bound
+    // param the rms arm never dereferences (if constexpr DCE), so the gamma dummy
+    // is safe — identical to the scalar path's beta=gamma.
+    if (fused_norm_eligible(tag, N, dX, dgamma, dgamma, dY) &&
+        launch_fused_norm(tag, /*rms=*/true, dX, dgamma, dgamma, dmean, drstd, dY,
+                          M, N, eps)) {
+        haganeOpsMarkMetallibWrite(dY, static_cast<size_t>(M) * N * elt);
+        if (need_rstd) rstd_out = rstd_fresh;
+        return true;
+    }
+
+    std::string moments = std::string("hagane_RowwiseMomentsCUDAKernel_") + tag + "_rms";
+    std::string apply   = std::string("hagane_LayerNormForwardCUDAKernel_") + tag + "_rms";
+
+    dim3 grid(static_cast<unsigned>(M), 1, 1), block(256, 1, 1);
+    int64_t c_N = N;
+    float c_eps = static_cast<float>(eps);
+
+    void*  margs[] = {&c_N, &c_eps, dX, dmean, drstd};
+    int    mat[]   = {1, 1, 0, 0, 0};
+    size_t mas[]   = {sizeof(int64_t), sizeof(float), 0, 0, 0};
+    if (hagane_launch_kernel_mixed(moments.c_str(), grid, block, 0, nullptr,
+                                   margs, mat, mas, 5) != hipSuccess)
+        return false;
+
+    // gamma at [4], beta=gamma (dummy) at [5]; the two kernels run in submission
+    // order on the in-order Hagane queue, so apply reads the rstd moments wrote.
+    void*  aargs[] = {&c_N, dX, dmean, drstd, dgamma, dgamma, dY};
+    int    aat[]   = {1, 0, 0, 0, 0, 0, 0};
+    size_t aas[]   = {sizeof(int64_t), 0, 0, 0, 0, 0, 0};
+    if (hagane_launch_kernel_mixed(apply.c_str(), grid, block, 0, nullptr,
+                                   aargs, aat, aas, 7) != hipSuccess)
+        return false;
+
+    note_native_launch(moments);
+    note_native_launch(apply);
+    haganeOpsMarkMetallibWrite(dY, static_cast<size_t>(M) * N * elt);
+    if (need_rstd) rstd_out = rstd_fresh;
+    return true;
+}
+
+// Run layer_norm natively (moments→apply), mirroring the rms path but with the
+// `_ln` kernel arms: both mean AND rstd are live (RowwiseMoments writes both;
+// LayerNormForward applies Y = (X-mean)*rstd*gamma + beta). When `need_stats`
+// (backward needed) the caller gets fresh mean+rstd back (held by autograd, so
+// never freed during the forward) feeding layer_norm_backward without an ATen
+// recompute; otherwise both are reusable per-thread scratch. The mixed launcher
+// rejects null buffers, so no-weight binds a ones-vector gamma and no-bias binds
+// a zeros-vector beta (reproducing the kernel's nullptr-guard identities).
+// Returns false → MLX fallback: route-off, unsupported/non-float dtype, tape
+// recording, or any launch failure.
+inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
+                                           const std::optional<at::Tensor>& weight,
+                                           const std::optional<at::Tensor>& bias,
+                                           at::Tensor& output,
+                                           int64_t M, int64_t N, double eps,
+                                           bool need_stats,
+                                           at::Tensor& mean_out, at::Tensor& rstd_out) {
+    if (haganeOpsTapeRecording()) return false;
+    if (M <= 0 || N <= 0) return false;
+    if (!norm_metallib_available()) return false;
+    const char* tag = nullptr;
+    switch (input_c.scalar_type()) {
+        case at::kFloat:    tag = "float";    break;
+        case at::kHalf:     tag = "half";     break;
+        case at::kBFloat16: tag = "bfloat16"; break;
+        default: return false;
+    }
+
+    // T_ACC = float for every arm. mean and rstd are both live (apply reads
+    // them). When backward needs the stats they're fresh tensors (returned);
+    // otherwise reusable per-thread scratch.
+    const auto opts = input_c.options();
+    at::Tensor mean_fresh, rstd_fresh;
+    void* dmean;
+    void* drstd;
+    if (need_stats) {
+        mean_fresh = at::empty({M}, opts.dtype(at::kFloat));
+        rstd_fresh = at::empty({M}, opts.dtype(at::kFloat));
+        dmean = mean_fresh.data_ptr();
+        drstd = rstd_fresh.data_ptr();
+    } else {
+        dmean = rms_moments_scratch(opts, M, 0);
+        drstd = rms_moments_scratch(opts, M, 1);
+    }
+
+    at::Tensor gamma = (weight.has_value() && weight->defined())
+        ? weight->contiguous()
+        : at::ones({N}, input_c.options());
+    at::Tensor beta = (bias.has_value() && bias->defined())
+        ? bias->contiguous()
+        : at::zeros({N}, input_c.options());
+
+    void* dX     = input_c.data_ptr();
+    void* dgamma = gamma.data_ptr();
+    void* dbeta  = beta.data_ptr();
+    void* dY     = output.data_ptr();
+    const int64_t elt = input_c.element_size();
+
+    flush_or_commit_metallib_input(dX, M * N * elt);
+    flush_or_commit_metallib_input(dgamma, N * gamma.element_size());
+    flush_or_commit_metallib_input(dbeta, N * beta.element_size());
+
+    // A10: the fused vec4 kernel (one pass) when aligned + N%4==0.
+    if (fused_norm_eligible(tag, N, dX, dgamma, dbeta, dY) &&
+        launch_fused_norm(tag, /*rms=*/false, dX, dgamma, dbeta, dmean, drstd, dY,
+                          M, N, eps)) {
+        haganeOpsMarkMetallibWrite(dY, static_cast<size_t>(M) * N * elt);
+        if (need_stats) { mean_out = mean_fresh; rstd_out = rstd_fresh; }
+        return true;
+    }
+
+    std::string moments = std::string("hagane_RowwiseMomentsCUDAKernel_") + tag + "_ln";
+    std::string apply   = std::string("hagane_LayerNormForwardCUDAKernel_") + tag + "_ln";
+
+    dim3 grid(static_cast<unsigned>(M), 1, 1), block(256, 1, 1);
+    int64_t c_N = N;
+    float c_eps = static_cast<float>(eps);
+
+    void*  margs[] = {&c_N, &c_eps, dX, dmean, drstd};
+    int    mat[]   = {1, 1, 0, 0, 0};
+    size_t mas[]   = {sizeof(int64_t), sizeof(float), 0, 0, 0};
+    if (hagane_launch_kernel_mixed(moments.c_str(), grid, block, 0, nullptr,
+                                   margs, mat, mas, 5) != hipSuccess)
+        return false;
+
+    void*  aargs[] = {&c_N, dX, dmean, drstd, dgamma, dbeta, dY};
+    int    aat[]   = {1, 0, 0, 0, 0, 0, 0};
+    size_t aas[]   = {sizeof(int64_t), 0, 0, 0, 0, 0, 0};
+    if (hagane_launch_kernel_mixed(apply.c_str(), grid, block, 0, nullptr,
+                                   aargs, aat, aas, 7) != hipSuccess)
+        return false;
+
+    note_native_launch(moments);
+    note_native_launch(apply);
+    haganeOpsMarkMetallibWrite(dY, static_cast<size_t>(M) * N * elt);
+    if (need_stats) { mean_out = mean_fresh; rstd_out = rstd_fresh; }
+    return true;
+}
+
+// ---- A9 (Phase 2): native reduction route (sum / mean, full contiguous) ------
+// PyTorch's real reduce_kernel can't be transpiled (its ReduceOp carries an
+// un-nameable GPU_LAMBDA ops type — see hagane/kernels/reduce.hip), so we own a
+// generic Tier-a block reducer instead. reduce.metallib bundles 3 concrete
+// kernels: f32→f32, bf16→f32 (pass 1), f32→bf16 (pass 2). Route-off
+// (HAGANE_USE_METALLIB_ROUTE=0) skips registration → MLX (the bit-identical spine).
+inline bool reduction_metallib_available() {
+    static const bool available = [] {
+        const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+        if (route && route[0] == '0') return false;
+        std::string path = metallib_dir() + "/reduce.metallib";
+        if (haganeRegisterMetallibAll(path.c_str()) != hipSuccess) {
+            std::fprintf(stderr,
+                "[hagane-path-alpha] failed to register %s; reductions stay on MLX\n",
+                path.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+            "[hagane-path-alpha] reduce metallib registered (sum/mean Tier-a, f32+bf16)\n");
+        return true;
+    }();
+    return available;
+}
+
+// Per-thread persistent float partials buffer for the reduction 2-pass — reused
+// across calls (mirrors rms_moments_scratch: never freed mid-flight, grows
+// monotonically, safe on the in-order queue since pass 2 consumes pass 1's
+// partials before the next call overwrites them).
+inline void* reduce_partials_scratch(const at::TensorOptions& opts, int64_t nblocks) {
+    static thread_local at::Tensor* t = nullptr;
+    if (t == nullptr) t = new at::Tensor();
+    if (!t->defined() || t->numel() < nblocks || t->device() != opts.device())
+        *t = at::empty({nblocks}, opts.dtype(at::kFloat));
+    return t->data_ptr();
+}
+
+// Full contiguous sum/mean as a host 2-pass: pass 1 reduces the input → per-block
+// float partials (grid=(nblocks) block=256, grid-strided); pass 2 reduces the
+// partials → the single output (grid=(1) block=256). `scale` (1 for sum, 1/N for
+// mean) is applied once at the pass-2 store. Returns false → MLX fallback:
+// route-off, tape recording, non-contiguous, unsupported dtype, partial-dim
+// reduction (out.numel()!=1, deferred to a Tier-b follow-on), or launch failure.
+inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
+    if (haganeOpsTapeRecording()) return false;
+    if (!reduction_metallib_available()) return false;
+    const at::Tensor& in_t  = iter.tensor(1);
+    const at::Tensor& out_t = iter.tensor(0);
+    if (out_t.numel() != 1) return false;          // full reduction only (v1)
+    if (!in_t.is_contiguous()) return false;
+    const int64_t N = in_t.numel();
+    if (N <= 0) return false;
+
+    const char *k1, *k2;
+    const auto inty = in_t.scalar_type(), outty = out_t.scalar_type();
+    if (inty == at::kFloat && outty == at::kFloat) {
+        k1 = "hagane_reduce_f32_f32"; k2 = "hagane_reduce_f32_f32";
+    } else if (inty == at::kBFloat16 && outty == at::kBFloat16) {
+        k1 = "hagane_reduce_bf16_f32"; k2 = "hagane_reduce_f32_bf16";
+    } else {
+        return false;  // half / mixed-acc dtypes stay on MLX
+    }
+
+    const int block = 256;
+    int64_t nbtmp = (N + block - 1) / block;     // ~one block per 256 elements,
+    if (nbtmp < 1) nbtmp = 1;                     // clamped to [1, 256] so pass 2's
+    if (nbtmp > 256) nbtmp = 256;                 // single block reduces the partials
+    const int nblocks = static_cast<int>(nbtmp);
+    void* dpart = reduce_partials_scratch(in_t.options(), nblocks);
+    void* dX    = in_t.data_ptr();
+    void* dout  = out_t.data_ptr();
+    flush_or_commit_metallib_input(dX, N * in_t.element_size());
+
+    int64_t c_N = N, c_NB = nblocks;
+    float s1 = 1.0f, s2 = is_mean ? static_cast<float>(1.0 / static_cast<double>(N)) : 1.0f;
+    const int    at_[] = {1, 0, 0, 1};
+    const size_t as_[] = {sizeof(int64_t), 0, 0, sizeof(float)};
+    dim3 b(block, 1, 1), g1(static_cast<unsigned>(nblocks), 1, 1), g2(1, 1, 1);
+
+    void* a1[] = {&c_N, dX, dpart, &s1};   // pass 1: X(N) → partials(nblocks), scale 1
+    if (hagane_launch_kernel_mixed(k1, g1, b, 0, nullptr, a1, at_, as_, 4) != hipSuccess)
+        return false;
+    void* a2[] = {&c_NB, dpart, dout, &s2}; // pass 2: partials(nblocks) → out(1), scale
+    if (hagane_launch_kernel_mixed(k2, g2, b, 0, nullptr, a2, at_, as_, 4) != hipSuccess)
+        return false;
+
+    note_native_launch(k1);
+    note_native_launch(k2);
+    haganeOpsMarkMetallibWrite(dout, static_cast<size_t>(out_t.element_size()));
+    return true;
+}
+
+// A6 softmax: register the warp-per-row softmax metallib (PyTorch's REAL
+// softmax_warp_forward, owned via explicit-instantiation injection — float +
+// bfloat16, log2_elements 0..11, is_log {false,true}). Separate from norm.metallib;
+// haganeRegisterMetallibAll is idempotent. Route-off skips registration → MLX.
+inline bool softmax_metallib_available() {
+    static const bool available = [] {
+        const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+        if (route && route[0] == '0') return false;
+        std::string path = metallib_dir() + "/softmax.metallib";
+        if (haganeRegisterMetallibAll(path.c_str()) != hipSuccess) {
+            std::fprintf(stderr,
+                "[hagane-path-alpha] failed to register %s; softmax stays on MLX\n",
+                path.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+            "[hagane-path-alpha] softmax metallib registered "
+            "(warp-per-row, float+bfloat16, log2 0..11, fwd+log)\n");
+        return true;
+    }();
+    return available;
+}
+
+// Persistent per-thread dummy mask buffer. is_masked=false → the kernel never
+// dereferences mask, but it is still bound as buffer(5); sized to M*N bytes so a
+// Metal bounds validation of the bound buffer (and the kernel's `mask += offset`
+// pointer arithmetic) stays in range. Reused; leaked to dodge static-teardown.
+inline void* softmax_mask_scratch(const at::TensorOptions& opts, int64_t bytes) {
+    static thread_local at::Tensor* scratch = nullptr;
+    if (scratch == nullptr) scratch = new at::Tensor();
+    if (!scratch->defined() || scratch->numel() < bytes ||
+        scratch->device() != opts.device())
+        *scratch = at::zeros({bytes}, opts.dtype(at::kBool));
+    return scratch->data_ptr();
+}
+
+// Run softmax / log_softmax natively via the warp-per-row kernel. Writes
+// `output` and returns true; false → caller falls back to MLX. Covers only what
+// the warp kernel owns: reduction over the LAST (innermost) dim, N ≤ 2048,
+// contiguous, output dtype == input dtype (so half_to_float stays on MLX),
+// dtype ∈ {float, bfloat16} (fp16 deferred). Backward stays on MLX (reads this
+// dtype-preserved output). Geometry is N-derived, identical to
+// dispatch_softmax_forward (PersistentSoftmax.cuh:311). is_masked=false.
+inline bool try_launch_softmax_metallib(const at::Tensor& input_c,
+                                        const at::Tensor& output,
+                                        int64_t dim, bool is_log) {
+    if (haganeOpsTapeRecording()) return false;
+    if (!softmax_metallib_available()) return false;
+    const int64_t ndim = input_c.dim();
+    if (ndim == 0) return false;
+    const int64_t d = dim < 0 ? dim + ndim : dim;
+    if (d != ndim - 1) return false;                       // last-dim only
+    if (output.scalar_type() != input_c.scalar_type()) return false;  // no half_to_float
+    if (!input_c.is_contiguous() || !output.is_contiguous()) return false;
+    const char* tag = nullptr;
+    switch (input_c.scalar_type()) {
+        case at::kFloat:    tag = "float";    break;
+        case at::kBFloat16: tag = "bfloat16"; break;
+        default: return false;                              // fp16 deferred
+    }
+    const int64_t N = input_c.size(-1);
+    if (N <= 0 || N > 2048) return false;                   // warp kernel coverage
+    const int64_t M = input_c.numel() / N;
+    if (M <= 0) return false;
+
+    // Geometry — identical to dispatch_softmax_forward.
+    int log2e = 0; while ((1 << log2e) < static_cast<int>(N)) ++log2e;
+    const int npot = 1 << log2e;
+    const int warp_size = (npot < 32) ? npot : 32;
+    const int batches_per_warp = (npot <= 128) ? 2 : 1;
+    const int warps_per_block = 128 / warp_size;
+    const int batches_per_block = warps_per_block * batches_per_warp;
+    const unsigned blocks =
+        static_cast<unsigned>((M + batches_per_block - 1) / batches_per_block);
+
+    std::string kernel = std::string("hagane_softmax_warp_forward_") + tag +
+                         "_l2e" + std::to_string(log2e) + "_ws32" +
+                         (is_log ? "_log" : "");
+
+    void* dst = output.data_ptr();
+    void* src = input_c.data_ptr();
+    const int64_t elt = input_c.element_size();
+    void* dmask = softmax_mask_scratch(input_c.options(), M * N);
+
+    flush_or_commit_metallib_input(src, M * N * elt);
+
+    int batch_size = static_cast<int>(M), stride = static_cast<int>(N),
+        element_count = static_cast<int>(N), head_chunk = -1;
+    bool is_tmask = false;
+    void*  args[] = {dst, src, &batch_size, &stride, &element_count,
+                     dmask, &head_chunk, &is_tmask};
+    int    at_[]  = {0, 0, 1, 1, 1, 0, 1, 1};
+    size_t as_[]  = {0, 0, sizeof(int), sizeof(int), sizeof(int),
+                     0, sizeof(int), sizeof(bool)};
+    dim3 grid(blocks, 1, 1), block(warp_size, warps_per_block, 1);
+    if (hagane_launch_kernel_mixed(kernel.c_str(), grid, block, 0, nullptr,
+                                   args, at_, as_, 8) != hipSuccess)
+        return false;
+    note_native_launch(kernel);
+    haganeOpsMarkMetallibWrite(dst, static_cast<size_t>(M) * N * elt);
+    return true;
+}
+
 inline bool try_launch_binary_metallib(const std::string& kname,
                                        TensorIteratorBase& iter) {
     if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
@@ -543,7 +1052,10 @@ inline bool try_launch_binary_metallib(const std::string& kname,
     // X+77: event-order both inputs GPU-side under the unified queue.
     flush_or_commit_metallib_input(d_a, static_cast<int64_t>(N) * iter.element_size(1));
     flush_or_commit_metallib_input(d_b, static_cast<int64_t>(N) * iter.element_size(2));
-    dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
+    // A8: wpt elements per thread (matches the kernel's _wptN).
+    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int nthreads = (N + wpt - 1) / wpt;
+    dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_a, d_b, d_out, &N};
     int    arg_types[] = {0, 0, 0, 1};
     size_t arg_sizes[] = {0, 0, 0, sizeof(int)};
@@ -569,7 +1081,10 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     // X+77: event-order the input GPU-side under the unified queue.
     flush_or_commit_metallib_input(d_in, static_cast<int64_t>(N) * iter.element_size(1));
     float sc = scalar;
-    dim3 block(256, 1, 1), grid((N + 255) / 256, 1, 1);
+    // A8: wpt elements per thread (matches the kernel's _wptN).
+    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int nthreads = (N + wpt - 1) / wpt;
+    dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &sc, &N};
     int    arg_types[] = {0, 0, 1, 1};
     size_t arg_sizes[] = {0, 0, sizeof(float), sizeof(int)};
@@ -655,13 +1170,19 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
         }
     }
 
-    auto out = make_ops_tensor_local(iter, 0);
-    at::Tensor sa, sb;
-    auto a = make_ops_tensor_or_scalar_local(iter, 1, sa);
-    auto b = make_ops_tensor_or_scalar_local(iter, 2, sb);
-    if (Cfg.c_abi_fn(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
+    if constexpr (Cfg.c_abi_fn == nullptr) {
+        // No MLX path (e.g. integer gcd/lcm): the metallib is the only device
+        // route; fall to the CPU stub on fallthrough (route-off/unsupported).
         Cfg.cpu_fallback(iter);
+    } else {
+        auto out = make_ops_tensor_local(iter, 0);
+        at::Tensor sa, sb;
+        auto a = make_ops_tensor_or_scalar_local(iter, 1, sa);
+        auto b = make_ops_tensor_or_scalar_local(iter, 2, sb);
+        if (Cfg.c_abi_fn(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
+            ::haganeOpsFlush();
+            Cfg.cpu_fallback(iter);
+        }
     }
 }
 
@@ -702,6 +1223,14 @@ inline void hagane_unary_iter_bridge(TensorIterator& iter) {
             return;
         }
     }
+
+    // A9: full contiguous sum/mean route through the owned Tier-a reducer
+    // (metallib_kernel != nullptr enables it). Any miss (partial-dim, non-
+    // contiguous, unsupported dtype, route-off) falls through to the MLX C-ABI —
+    // the bit-identical spine.
+    if (Cfg.metallib_kernel != nullptr &&
+        try_launch_reduction_metallib(iter, std::string(Cfg.op_name) == "mean"))
+        return;
 
     auto out = make_ops_tensor_local(iter, 0);
     auto in  = make_ops_tensor_local(iter, 1);
@@ -1411,6 +1940,25 @@ inline void hagane_avg_pool3d_forward_bridge(
         Cfg.cpu_fallback(output, input, kW, kH, kD, dW, dH, dD,
                          padW, padH, padD, count_include_pad, divisor_override);
     }
+}
+
+// E2E-1 (o-voxel flexible_dual_grid_to_mesh) surfaced torch.cross / linalg_cross
+// crashing on Hagane: the stock CrossKernel.hip launches a raw cross_kernel<<<>>>
+// whose OffsetCalculator/TensorIterator GPU path has no Metal backing on the Hagane
+// fork -> segfault. Own cross_stub via REGISTER_DISPATCH (the bridge mechanism that
+// reliably overrides the hipified artifact's stub, unlike an operator-level m.impl
+// which loses the link-order race to the generated structured CUDA kernel). Compose
+// from OWNED primitives (roll/mul/sub) — exact vs the CPU reference (float epsilon):
+//   cross(x1,x2) along d = roll(x1,-1,d)*roll(x2,-2,d) - roll(x1,-2,d)*roll(x2,-1,d)
+// result/x1/x2 are already broadcast + sized by the structured linalg_cross.out.
+// ADR-036-clean (REGISTER_DISPATCH in the bridge TU); ADR-032-clean (a generic vector
+// op composed from owned primitives, not model-shaped runtime code).
+inline void hagane_cross_impl(const at::Tensor& result, const at::Tensor& x1,
+                              const at::Tensor& x2, const int64_t dim) {
+    int64_t d = at::maybe_wrap_dim(dim, x1.dim());
+    result.copy_(at::sub(
+        at::mul(at::roll(x1, {-1}, {d}), at::roll(x2, {-2}, {d})),
+        at::mul(at::roll(x1, {-2}, {d}), at::roll(x2, {-1}, {d}))));
 }
 
 } // namespace at::native::hagane_dispatch::detail

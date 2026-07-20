@@ -21,6 +21,10 @@ namespace at::native {
 
 using namespace at::native::hagane_dispatch::detail;
 
+// E2E-1 — own cross_stub (torch.cross / linalg_cross) via owned roll/mul/sub;
+// the stock CrossKernel.hip cross_kernel<<<>>> has no Metal backing (segfault).
+REGISTER_DISPATCH(cross_stub, &hagane_cross_impl)
+
 // ---- Unary `OpConfig` rows (37 ops) ---------------------------------------
 REGISTER_DISPATCH(abs_stub,        &hagane_kernel_bridge<kAbsCfg>)
 REGISTER_DISPATCH(neg_stub,        &hagane_kernel_bridge<kNegCfg>)
@@ -93,6 +97,10 @@ REGISTER_DISPATCH(bitwise_xor_stub,       &hagane_binary_bridge<kBitwiseXorCfg>)
 REGISTER_DISPATCH(maximum_stub,           &hagane_binary_bridge<kMaximumCfg>)
 REGISTER_DISPATCH(minimum_stub,           &hagane_binary_bridge<kMinimumCfg>)
 REGISTER_DISPATCH(copysign_stub,          &hagane_binary_bridge<kCopysignCfg>)
+// T2.1 — integer gcd/lcm now run native via the transpiler-owned metallib
+// (retired the HaganeOps.cpp .to(kCPU) round-trip).
+REGISTER_DISPATCH(gcd_stub,               &hagane_binary_bridge<kGcdCfg>)
+REGISTER_DISPATCH(lcm_stub,               &hagane_binary_bridge<kLcmCfg>)
 
 // X+21 Lane D — 3 binary ops on `binary_fn` (TensorIterator&).
 // max_elementwise_stub / min_elementwise_stub: declared in BinaryOps.h but

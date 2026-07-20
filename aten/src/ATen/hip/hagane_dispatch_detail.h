@@ -256,6 +256,12 @@ inline void cpu_dispatch_bitwise_xor (TensorIteratorBase& iter) { bitwise_xor_st
 inline void cpu_dispatch_maximum     (TensorIteratorBase& iter) { maximum_stub     (c10::DeviceType::CPU, iter); }
 inline void cpu_dispatch_minimum     (TensorIteratorBase& iter) { minimum_stub     (c10::DeviceType::CPU, iter); }
 inline void cpu_dispatch_copysign    (TensorIteratorBase& iter) { copysign_stub    (c10::DeviceType::CPU, iter); }
+// T2.1 — integer gcd/lcm: transpiler-owned native metallib is the primary path
+// (kGcdCfg/kLcmCfg); these are the fallback for route-off / unsupported dtype.
+// On UMA the CPU stub runs directly on the device tensors (no copy) — cheaper
+// than the retired HaganeOps.cpp .to(kCPU) round-trip it replaces.
+inline void cpu_dispatch_gcd         (TensorIteratorBase& iter) { gcd_stub         (c10::DeviceType::CPU, iter); }
+inline void cpu_dispatch_lcm         (TensorIteratorBase& iter) { lcm_stub         (c10::DeviceType::CPU, iter); }
 // `binary_fn` (TensorIterator&) stubs — distinct signature; routed through
 // the BinaryIterOpConfig + hagane_binary_iter_bridge template below.
 inline void cpu_dispatch_logical_and (TensorIterator& iter) { logical_and_stub (c10::DeviceType::CPU, iter); }

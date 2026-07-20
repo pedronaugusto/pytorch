@@ -129,6 +129,7 @@
 
 #include <hagane_ops.h>
 #include <hagane_capture.h>
+#include "hagane_dispatch.h"  // A6: native rms_norm route helper
 #include <cstdlib>
 
 #include <cstring>
@@ -354,8 +355,27 @@ C10_EXPORT void GeluCUDAKernelImpl(TensorIteratorBase& iter, GeluType approximat
 }
 
 C10_EXPORT void GeluBackwardCUDAKernelImpl(TensorIteratorBase& iter, GeluType approximate) {
-  // For now, fall back to CPU for backward pass (training only)
-  GeluBackwardKernel(c10::DeviceType::CPU, iter, approximate);
+  // Route through hagane_ops MLX GPU implementation (Track C). The structured
+  // gelu_backward iter is (grad_input=out, grad_output, self); the C-ABI takes
+  // (grad_output, self, grad_input, approximate). Mirrors GeluCUDAKernelImpl's
+  // dtype mapping. CPU fallback only on C-ABI failure (e.g. an unsupported dtype).
+  const at::Tensor& gi_t   = iter.tensor(0);  // grad_input (output)
+  const at::Tensor& go_t   = iter.tensor(1);  // grad_output (dy)
+  const at::Tensor& self_t = iter.tensor(2);  // self (x)
+  auto st = iter.dtype();
+  int32_t dt = HAGANE_DTYPE_FLOAT32;
+  if (st == c10::ScalarType::Half) dt = HAGANE_DTYPE_FLOAT16;
+  else if (st == c10::ScalarType::BFloat16) dt = HAGANE_DTYPE_BFLOAT16;
+  haganeOpsTensor_t gi   = { iter.data_ptr(0), gi_t.sizes().data(), gi_t.strides().data(),
+                             static_cast<int32_t>(gi_t.dim()), dt };
+  haganeOpsTensor_t go   = { iter.data_ptr(1), go_t.sizes().data(), go_t.strides().data(),
+                             static_cast<int32_t>(go_t.dim()), dt };
+  haganeOpsTensor_t self = { iter.data_ptr(2), self_t.sizes().data(), self_t.strides().data(),
+                             static_cast<int32_t>(self_t.dim()), dt };
+  int approx = (approximate == GeluType::Tanh) ? 1 : 0;
+  if (haganeOpsGeluBackward(&go, &self, &gi, approx) != HAGANE_OPS_SUCCESS) {
+    GeluBackwardKernel(c10::DeviceType::CPU, iter, approximate);
+  }
 }
 
 static int32_t to_hagane_dtype_ext(c10::ScalarType st) {
@@ -1772,6 +1792,9 @@ static int32_t to_hagane_dtype(c10::ScalarType st) {
     case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
     case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
     case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
+    case c10::ScalarType::UInt16:   return HAGANE_DTYPE_UINT16;
+    case c10::ScalarType::UInt32:   return HAGANE_DTYPE_UINT32;
+    case c10::ScalarType::UInt64:   return HAGANE_DTYPE_UINT64;
     case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
     default:                        return HAGANE_DTYPE_FLOAT32;
   }
@@ -1984,7 +2007,7 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
 
 void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
   auto out = make_ops_tensor(iter, 0);
-  if (haganeOpsFill(&out, value.toFloat()) != HAGANE_OPS_SUCCESS) {
+  if (haganeOpsFill(&out, value.toDouble()) != HAGANE_OPS_SUCCESS) {
     HAGANE_BEFORE_RAW_READ();
     fill_stub(c10::DeviceType::CPU, iter, value);
   }
@@ -2107,9 +2130,21 @@ void hagane_silu_backward_kernel(TensorIteratorBase& iter) {
 // ---------------------------------------------------------------------------
 
 void hagane_threshold_kernel(TensorIteratorBase& iter, const Scalar& threshold, const Scalar& value) {
+  // threshold_stub is binary: out = self <= threshold ? value : other.
+  // operand(1) = self (the gate); operand(2) = other — `self` for forward
+  // threshold(), `grad` for threshold_backward(). The unary haganeOpsThreshold
+  // only matches the forward case (other == self); backward must pass `grad`
+  // through, else relu/threshold backward emits relu(self) (wrong gradients).
   auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsThreshold(&in, &out, threshold.toFloat(), value.toFloat()) != HAGANE_OPS_SUCCESS) {
+  auto self = make_ops_tensor(iter, 1);
+  auto other = make_ops_tensor(iter, 2);
+  int rc;
+  if (self.data == other.data) {
+    rc = haganeOpsThreshold(&self, &out, threshold.toFloat(), value.toFloat());
+  } else {
+    rc = haganeOpsThresholdBackward(&self, &other, &out, threshold.toFloat(), value.toFloat());
+  }
+  if (rc != HAGANE_OPS_SUCCESS) {
     HAGANE_BEFORE_RAW_READ();
     threshold_stub(c10::DeviceType::CPU, iter, threshold, value);
   }
@@ -2726,17 +2761,9 @@ void hagane_add_clamp_kernel(TensorIterator& iter, const Scalar& alpha, const Sc
   iter.tensor(0).copy_(at::clamp(at::add(a, b, alpha), min_val, max_val));
 }
 
-void hagane_gcd_kernel(TensorIteratorBase& iter) {
-  auto cpu_a = iter.tensor(1).to(at::kCPU);
-  auto cpu_b = iter.tensor(2).to(at::kCPU);
-  iter.tensor(0).copy_(at::gcd(cpu_a, cpu_b).to(iter.tensor(0).device()));
-}
-
-void hagane_lcm_kernel(TensorIteratorBase& iter) {
-  auto cpu_a = iter.tensor(1).to(at::kCPU);
-  auto cpu_b = iter.tensor(2).to(at::kCPU);
-  iter.tensor(0).copy_(at::lcm(cpu_a, cpu_b).to(iter.tensor(0).device()));
-}
+// T2.1 — gcd/lcm retired to the native transpiler-owned metallib path
+// (kGcdCfg/kLcmCfg in hagane_dispatch.h → HaganeMetallibBridge.cpp). The prior
+// .to(kCPU) round-trip is gone; cpu_dispatch_{gcd,lcm} is the fallback.
 
 void hagane_nextafter_kernel(TensorIteratorBase& iter) {
   auto cpu_a = iter.tensor(1).to(at::kCPU);
@@ -3266,8 +3293,7 @@ REGISTER_DISPATCH(clamp_stub, &hagane_clamp_kernel)
 REGISTER_DISPATCH(clamp_scalar_stub, &hagane_clamp_scalar_kernel)
 REGISTER_DISPATCH(clamp_min_scalar_stub, &hagane_clamp_min_scalar_kernel)
 REGISTER_DISPATCH(clamp_max_scalar_stub, &hagane_clamp_max_scalar_kernel)
-REGISTER_DISPATCH(gcd_stub, &hagane_gcd_kernel)
-REGISTER_DISPATCH(lcm_stub, &hagane_lcm_kernel)
+// T2.1 — gcd_stub/lcm_stub registered in HaganeMetallibBridge.cpp (native).
 REGISTER_DISPATCH(nextafter_stub, &hagane_nextafter_kernel)
 REGISTER_DISPATCH(igamma_stub, &hagane_igamma_kernel)
 REGISTER_DISPATCH(igammac_stub, &hagane_igammac_kernel)
@@ -3355,6 +3381,10 @@ REGISTER_DISPATCH(pdist_forward_stub, &hagane_pdist_forward_dispatch_kernel)
 TORCH_IMPL_FUNC(softmax_cuda_out)
 (const Tensor& input, int64_t dim, bool half_to_float, const Tensor& output) {
   auto in_t = input.contiguous();
+  // A6: native warp-per-row softmax (last-dim, N≤2048, float/bf16). On a miss
+  // (other dim, large N, half_to_float, fp16, route-off) fall through to MLX.
+  if (hagane_dispatch::detail::try_launch_softmax_metallib(
+          in_t, output, dim, /*is_log=*/false)) return;
   auto id = make_tensor_desc(in_t);
   auto od = make_tensor_desc(output);
   haganeOpsSoftmax(&id, &od, static_cast<int32_t>(dim), /*is_log=*/0);
@@ -3363,6 +3393,8 @@ TORCH_IMPL_FUNC(softmax_cuda_out)
 TORCH_IMPL_FUNC(log_softmax_cuda_out)
 (const Tensor& input, int64_t dim, bool half_to_float, const Tensor& output) {
   auto in_t = input.contiguous();
+  if (hagane_dispatch::detail::try_launch_softmax_metallib(
+          in_t, output, dim, /*is_log=*/true)) return;
   auto id = make_tensor_desc(in_t);
   auto od = make_tensor_desc(output);
   haganeOpsSoftmax(&id, &od, static_cast<int32_t>(dim), /*is_log=*/1);
@@ -4043,10 +4075,24 @@ C10_EXPORT std::tuple<Tensor&, Tensor&, Tensor&> slow_conv2d_backward_out_cuda(
     haganeOpsConvTranspose2d(&god, &wd, &gid, (int)stride[0], (int)stride[1],
                              (int)padding[0], (int)padding[1], 1, 1, 0, 0, 1);
   }
-  // grad_weight and grad_bias: compute via basic ops
+  // grad_weight via im2col + batched matmul over the batch (Track C). Composes
+  // from working ops (at::im2col, at::bmm, at::sum) instead of the old zero_()
+  // stub that silently returned wrong gradients. nn.Conv2d's autograd routes
+  // through convolution_backward (which already computes this correctly); this
+  // makes the _slow_conv2d_backward aten entry correct too. groups=1 (the slow
+  // path), dilation=1.
   if (grad_weight.defined()) {
-    // This is a training operation - use at:: tensor ops
-    grad_weight.zero_();
+    auto self_c = self.contiguous();
+    auto go_c = grad_output.contiguous();
+    int64_t N = self_c.size(0), Cout = go_c.size(1);
+    int64_t L = go_c.size(2) * go_c.size(3);
+    // cols: [N, Cin*kH*kW, L]; go: [N, Cout, L]
+    auto cols = at::im2col(self_c, {kernel_size[0], kernel_size[1]}, {1, 1},
+                           {padding[0], padding[1]}, {stride[0], stride[1]});
+    auto go = go_c.reshape({N, Cout, L});
+    // gw[Cout, Cin*kH*kW] = sum_n go[n] @ cols[n]^T
+    auto gw = at::bmm(go, cols.transpose(1, 2)).sum(0).reshape(grad_weight.sizes());
+    grad_weight.copy_(gw);
   }
   if (grad_bias.defined()) {
     grad_bias.zero_();
@@ -5241,6 +5287,26 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> layer_norm_cuda(
   // emitted via the composition path for the backward signature; tests
   // only check output and inference-only callers don't read mean/rstd.
   auto output = at::empty_like(input_r);
+
+  // A6-d (Phase 2): native layer_norm route — the transpiler-owned
+  // RowwiseMoments + LayerNormForward `_ln` kernels run the normalization on the
+  // Hagane queue (MLX off the hot path). Returns the native per-row moments
+  // (mean,rstd) for backward — no ATen recompute. Returns false → fall through
+  // to the MLX / ATen-composite path (the route-off / unsupported bit-identical
+  // spine).
+  {
+    const bool need_stats = input.requires_grad();
+    at::Tensor mean_n, rstd_n;
+    if (hagane_dispatch::detail::try_launch_layer_norm_metallib(
+            input_r, weight, bias, output, M, N, eps, need_stats, mean_n, rstd_n)) {
+      if (!need_stats) {
+        auto z = at::empty({M}, input.options().dtype(at::kFloat));
+        return std::make_tuple(output.reshape(input.sizes()), z, z);
+      }
+      return std::make_tuple(output.reshape(input.sizes()), mean_n, rstd_n);
+    }
+  }
+
   if (output.scalar_type() == input_r.scalar_type() &&
       (!weight.has_value() || weight->scalar_type() == input_r.scalar_type()) &&
       (!bias.has_value()   || bias->scalar_type()   == input_r.scalar_type())) {
@@ -5338,9 +5404,27 @@ C10_EXPORT std::tuple<Tensor, Tensor> _fused_rms_norm_cuda(
   int64_t N = 1;
   for (auto s : normalized_shape) N *= s;
 
-  // Use fused MLX RMSNorm kernel (float32 accumulators internally)
   auto input_c = input.contiguous();
   auto output = at::empty_like(input_c);
+
+  // A6 (Phase 2): native rms_norm route — the transpiler-owned RowwiseMoments +
+  // LayerNormForward kernels run the normalization on the Hagane queue (MLX off
+  // the hot path). Returns false → fall through to the MLX fused kernel (the
+  // route-off / unsupported-dtype / torch.compile-capture bit-identical spine).
+  // The moments kernel's per-row rstd IS rrms (rsqrt(E[x^2]+eps)), so we return
+  // it directly for backward — no recompute, consistent with the forward.
+  {
+    const bool need_rstd = input.requires_grad();
+    at::Tensor rstd;
+    if (hagane_dispatch::detail::try_launch_rms_norm_metallib(
+            input_c, weight, output, M, N, e, need_rstd, rstd)) {
+      if (!need_rstd)
+        return std::make_tuple(output, at::empty({M}, input.options().dtype(at::kFloat)));
+      return std::make_tuple(output, rstd);  // rstd == rrms, shape {M}
+    }
+  }
+
+  // Fused MLX RMSNorm kernel (float32 accumulators internally) — route-off spine.
   auto in_d = make_tensor_desc(input_c);
   auto out_d = make_tensor_desc(output);
   if (weight.has_value() && weight->defined()) {
@@ -5853,14 +5937,17 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
     const Tensor& /*philox_seed*/, const Tensor& /*philox_offset*/,
     std::optional<double> scale, std::optional<int64_t> /*window_left*/,
     std::optional<int64_t> /*window_right*/) {
+  // Use at::matmul (not at::bmm): flash attention passes q/k/v as 4D
+  // [N, heads, L, head_dim], and bmm is 3D-only ("batch1 must be a 3D tensor").
+  // matmul batches over all leading dims and matches the forward math fallback.
   double s = scale.value_or(1.0 / std::sqrt((double)query.size(-1)));
-  auto attn_weight = at::mul(at::bmm(query, key.transpose(-2, -1)), s);
+  auto attn_weight = at::mul(at::matmul(query, key.transpose(-2, -1)), s);
   auto attn_probs = at::softmax(attn_weight, -1);
-  auto grad_v = at::bmm(attn_probs.transpose(-2, -1), grad_out);
-  auto grad_attn = at::bmm(grad_out, value.transpose(-2, -1));
+  auto grad_v = at::matmul(attn_probs.transpose(-2, -1), grad_out);
+  auto grad_attn = at::matmul(grad_out, value.transpose(-2, -1));
   auto grad_softmax = at::mul(attn_probs, at::sub(grad_attn, at::mul(grad_attn, attn_probs).sum(-1, true)));
-  auto grad_q = at::mul(at::bmm(grad_softmax, key), s);
-  auto grad_k = at::mul(at::bmm(grad_softmax.transpose(-2, -1), query), s);
+  auto grad_q = at::mul(at::matmul(grad_softmax, key), s);
+  auto grad_k = at::mul(at::matmul(grad_softmax.transpose(-2, -1), query), s);
   return std::make_tuple(grad_q, grad_k, grad_v);
 }
 
