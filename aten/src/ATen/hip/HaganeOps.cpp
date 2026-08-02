@@ -5695,87 +5695,168 @@ C10_EXPORT std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _thnn_fused_gru_ce
 // Unique / Histogram
 // ---------------------------------------------------------------------------
 
-C10_EXPORT std::tuple<Tensor, Tensor> _unique_cuda(const Tensor& self, bool sorted, bool return_inverse) {
-  auto self_c = self.contiguous().view({-1});
-  auto sorted_t = std::get<0>(self_c.sort());
-  std::vector<int64_t> unique_vals;
-  float prev = -std::numeric_limits<float>::infinity();
-  auto data = sorted_t.const_data_ptr<float>();
-  for (int64_t i = 0; i < sorted_t.size(0); i++) {
-    if (i == 0 || data[i] != prev) { unique_vals.push_back(i); prev = data[i]; }
-  }
-  auto output = at::empty({(int64_t)unique_vals.size()}, self.options());
-  for (int64_t i = 0; i < (int64_t)unique_vals.size(); i++) output[i] = sorted_t[unique_vals[i]];
+// The unique family is expressed in ATen device ops rather than host loops.
+// The previous form read const_data_ptr<float>() and compared with
+// .item<float>(), so every integer dtype threw "expected scalar type Float but
+// found Long", and it scanned O(N*U) with a GPU->CPU sync per element.
+
+namespace {
+
+// Reshape so that slices along `dim` become rows. Returns the dim-to-front
+// tensor (so the caller can restore the shape) and its [n, k] row view.
+std::pair<Tensor, Tensor> hagane_slices_as_rows(const Tensor& self, int64_t dim) {
+  auto moved = self.transpose(0, dim).contiguous();
+  return {moved, moved.reshape({moved.size(0), -1})};
+}
+
+// rank[i] = number of rows lexicographically less than row i. Callers pass
+// pairwise-distinct rows, so the result is a permutation.
+Tensor hagane_lex_rank(const Tensor& rows) {
+  const int64_t u = rows.size(0), k = rows.size(1);
+  auto opts_long = rows.options().dtype(kLong);
+  auto lt = at::lt(rows.unsqueeze(1), rows.unsqueeze(0));
+  auto ne = at::ne(rows.unsqueeze(1), rows.unsqueeze(0));
+  auto kcol = at::arange(k, opts_long).view({1, 1, k}).expand({u, u, k});
+  auto first_diff = std::get<0>(
+      at::where(ne, kcol, at::full({u, u, k}, k, opts_long)).min(-1));
+  auto differs = at::any(ne, -1);
+  auto less = at::logical_and(
+      at::gather(lt, -1, first_diff.clamp_max(k - 1).unsqueeze(-1)).squeeze(-1),
+      differs);
+  return less.to(kLong).sum(0);
+}
+
+// Marks the first element of each run of equal adjacent rows.
+Tensor hagane_run_starts(const Tensor& rows) {
+  const int64_t n = rows.size(0);
+  auto head = at::ones({1}, rows.options().dtype(kBool));
+  if (n <= 1) return head;
+  return at::cat({head, at::any(at::ne(rows.slice(0, 1, n),
+                                       rows.slice(0, 0, n - 1)), -1)});
+}
+
+}  // namespace
+
+C10_EXPORT std::tuple<Tensor, Tensor> _unique_cuda(const Tensor& self, bool /*sorted*/, bool return_inverse) {
+  auto flat = self.contiguous().view({-1});
+  const int64_t n = flat.size(0);
+  auto opts_long = self.options().dtype(kLong);
+  if (n == 0) return std::make_tuple(flat.clone(), at::empty({0}, opts_long));
+
+  auto sorted_v = std::get<0>(flat.sort());
+  auto keep = at::cat({at::ones({1}, self.options().dtype(kBool)),
+                       at::ne(sorted_v.slice(0, 1, n), sorted_v.slice(0, 0, n - 1))});
+  auto output = sorted_v.index_select(0, at::nonzero(keep).squeeze(1));
+
   Tensor inverse;
-  if (return_inverse) {
-    inverse = at::empty_like(self_c, self.options().dtype(kLong));
-    for (int64_t i = 0; i < self_c.size(0); i++) {
-      for (int64_t j = 0; j < output.size(0); j++) {
-        if (self_c[i].item<float>() == output[j].item<float>()) { inverse[i] = j; break; }
-      }
-    }
-  }
-  return std::make_tuple(output, return_inverse ? inverse : Tensor());
+  // output is ascending and every input value occurs in it, so the insertion
+  // point is exactly the value's index.
+  if (return_inverse) inverse = at::searchsorted(output, self.contiguous());
+  return std::make_tuple(output, inverse);
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> _unique2_cuda(const Tensor& self, bool sorted, bool return_inverse, bool return_counts) {
-  auto [output, inverse] = _unique_cuda(self, sorted, return_inverse);
+  auto opts_long = self.options().dtype(kLong);
+  auto [output, inverse] = _unique_cuda(self, sorted, return_inverse || return_counts);
   Tensor counts;
   if (return_counts) {
-    counts = at::zeros({output.size(0)}, self.options().dtype(kLong));
-    auto self_c = self.contiguous().view({-1});
-    for (int64_t i = 0; i < self_c.size(0); i++) {
-      for (int64_t j = 0; j < output.size(0); j++) {
-        if (self_c[i].item<float>() == output[j].item<float>()) { counts[j] = counts[j].item<int64_t>() + 1; break; }
-      }
-    }
+    const int64_t n = self.numel();
+    counts = at::zeros({output.size(0)}, opts_long);
+    counts.index_add_(0, inverse.reshape({-1}), at::ones({n}, opts_long));
   }
-  return std::make_tuple(output, return_inverse ? inverse : Tensor(), return_counts ? counts : Tensor());
+  return std::make_tuple(output, return_inverse ? inverse : Tensor(), counts);
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda(
     const Tensor& self, int64_t dim, bool sorted, bool return_inverse, bool return_counts) {
-  return _unique2_cuda(self, sorted, return_inverse, return_counts);
-}
+  if (dim < 0) dim += self.dim();
+  const int64_t n = self.size(dim);
+  auto opts_long = self.options().dtype(kLong);
+  if (n == 0) {
+    return std::make_tuple(self.clone(), at::empty({0}, opts_long), at::empty({0}, opts_long));
+  }
 
-C10_EXPORT std::tuple<Tensor, Tensor, Tensor> unique_consecutive_cuda(
-    const Tensor& self, bool return_inverse, bool return_counts, std::optional<int64_t> dim) {
-  auto self_c = self.contiguous().view({-1});
-  std::vector<float> unique_vals;
-  std::vector<int64_t> inv, cnts;
-  int64_t count = 0;
-  for (int64_t i = 0; i < self_c.size(0); i++) {
-    float v = self_c[i].item<float>();
-    if (unique_vals.empty() || v != unique_vals.back()) {
-      if (!unique_vals.empty()) cnts.push_back(count);
-      unique_vals.push_back(v);
-      count = 1;
-    } else { count++; }
-    inv.push_back(unique_vals.size() - 1);
+  // Unique SLICES along `dim`, not unique scalars: flatten each slice to a row
+  // and dedupe rows. Forwarding to _unique2 here (as this used to) silently
+  // returned unique elements of the flattened tensor.
+  auto [moved, rows] = hagane_slices_as_rows(self, dim);
+  auto eq = at::eq(rows.unsqueeze(1), rows.unsqueeze(0)).all(-1);
+  auto ar = at::arange(n, opts_long);
+  // first[i] = lowest j whose slice equals slice i (i itself when i is new).
+  auto first = std::get<0>(at::where(eq, ar.unsqueeze(0).expand({n, n}),
+                                     at::full({n, n}, n, opts_long)).min(1));
+  auto uniq = at::nonzero(at::eq(first, ar)).squeeze(1);
+
+  if (sorted && uniq.size(0) > 1) {
+    auto order = std::get<1>(hagane_lex_rank(rows.index_select(0, uniq)).sort());
+    uniq = uniq.index_select(0, order);
   }
-  if (!unique_vals.empty()) cnts.push_back(count);
-  // ADR-027 Invariant E: build output via dispatch (CPU staging + .to(device))
-  // so the device storage carries a pending-stash entry. Raw mutable_data_ptr
-  // writes to fresh device storage are invisible to MLX's lazy graph.
-  auto cpu_output = at::from_blob(unique_vals.data(),
-                                  {(int64_t)unique_vals.size()},
-                                  at::TensorOptions().dtype(at::kFloat)).clone();
-  auto output = cpu_output.to(self.options());
-  Tensor inverse_t, counts_t;
+
+  auto shape = moved.sizes().vec();
+  shape[0] = uniq.size(0);
+  auto output = rows.index_select(0, uniq).reshape(shape).transpose(0, dim).contiguous();
+
+  Tensor inverse, counts;
   if (return_inverse) {
-    inverse_t = at::empty({self_c.size(0)}, self.options().dtype(kLong));
-    for (int64_t i = 0; i < self_c.size(0); i++) inverse_t[i] = inv[i];
+    auto pos = at::zeros({n}, opts_long);
+    pos.index_copy_(0, uniq, at::arange(uniq.size(0), opts_long));
+    inverse = pos.index_select(0, first);
   }
-  if (return_counts) {
-    counts_t = at::empty({(int64_t)cnts.size()}, self.options().dtype(kLong));
-    for (int64_t i = 0; i < (int64_t)cnts.size(); i++) counts_t[i] = cnts[i];
-  }
-  return std::make_tuple(output, inverse_t, counts_t);
+  if (return_counts) counts = eq.to(kLong).sum(1).index_select(0, uniq);
+  return std::make_tuple(output, inverse, counts);
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> unique_dim_consecutive_cuda(
     const Tensor& self, int64_t dim, bool return_inverse, bool return_counts) {
-  return unique_consecutive_cuda(self, return_inverse, return_counts, dim);
+  if (dim < 0) dim += self.dim();
+  const int64_t n = self.size(dim);
+  auto opts_long = self.options().dtype(kLong);
+  if (n == 0) {
+    return std::make_tuple(self.clone(), at::empty({0}, opts_long), at::empty({0}, opts_long));
+  }
+
+  auto [moved, rows] = hagane_slices_as_rows(self, dim);
+  auto starts = hagane_run_starts(rows);
+  auto keep = at::nonzero(starts).squeeze(1);
+  auto group = at::cumsum(starts.to(kLong), 0).sub(1);
+
+  auto shape = moved.sizes().vec();
+  shape[0] = keep.size(0);
+  auto output = rows.index_select(0, keep).reshape(shape).transpose(0, dim).contiguous();
+
+  Tensor inverse, counts;
+  if (return_inverse) inverse = group;
+  if (return_counts) {
+    counts = at::zeros({keep.size(0)}, opts_long);
+    counts.index_add_(0, group, at::ones({n}, opts_long));
+  }
+  return std::make_tuple(output, inverse, counts);
+}
+
+C10_EXPORT std::tuple<Tensor, Tensor, Tensor> unique_consecutive_cuda(
+    const Tensor& self, bool return_inverse, bool return_counts, std::optional<int64_t> dim) {
+  if (dim.has_value()) {
+    return unique_dim_consecutive_cuda(self, *dim, return_inverse, return_counts);
+  }
+  auto flat = self.contiguous().view({-1});
+  const int64_t n = flat.size(0);
+  auto opts_long = self.options().dtype(kLong);
+  if (n == 0) {
+    return std::make_tuple(flat.clone(), at::empty({0}, opts_long), at::empty({0}, opts_long));
+  }
+
+  auto starts = hagane_run_starts(flat.reshape({n, 1}));
+  auto keep = at::nonzero(starts).squeeze(1);
+  auto group = at::cumsum(starts.to(kLong), 0).sub(1);
+  auto output = flat.index_select(0, keep);
+
+  Tensor inverse, counts;
+  if (return_inverse) inverse = group.reshape(self.sizes());
+  if (return_counts) {
+    counts = at::zeros({keep.size(0)}, opts_long);
+    counts.index_add_(0, group, at::ones({n}, opts_long));
+  }
+  return std::make_tuple(output, inverse, counts);
 }
 
 C10_EXPORT Tensor _histc_cuda(const Tensor& self, int64_t bins, const Scalar& min, const Scalar& max) {
