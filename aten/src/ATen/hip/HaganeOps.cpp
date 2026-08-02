@@ -1570,23 +1570,37 @@ C10_EXPORT void _amp_foreach_non_finite_check_and_unscale_cuda_(
 // Batch 5: Non-foreach ops — Random, Creation, Dropout
 // ---------------------------------------------------------------------------
 
+// The PRNG state for one draw, taken from the caller's generator or the device
+// default. `seed` names the stream; `offset` is the generator's counter, which
+// we advance by the number of values this call consumes so the next draw lands
+// on fresh ground. Without this the runtime falls back to MLX's own thread-local
+// time-seeded key and torch.manual_seed does nothing. Mirrors what every ROCm
+// RNG kernel does with PhiloxCudaState.
+static std::pair<uint64_t, uint64_t> hagane_rng_state(
+    const std::optional<Generator>& gen, int64_t consumed) {
+  auto* impl = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+      gen, at::cuda::detail::getDefaultCUDAGenerator());
+  std::lock_guard<std::mutex> lock(impl->mutex_);
+  return impl->philox_engine_inputs(
+      static_cast<uint64_t>(std::max<int64_t>(consumed, 1)));
+}
+
 // randperm: generate random permutation
 C10_EXPORT Tensor& randperm_out_cuda(
     int64_t n, std::optional<Generator> generator, Tensor& result) {
   result.resize_({n});
   if (n == 0) return result;
-  // Generate random keys and argsort for permutation
+  // Sort random keys carrying 0..n-1 as the payload: haganeOpsSort permutes the
+  // payload by the key order, so the permuted payload IS the permutation.
+  // (Sorting with an *uninitialized* payload, as this did before, gathered
+  // garbage — the result was not a permutation at all.)
   auto keys = at::empty({n}, result.options().dtype(kFloat));
   auto kd = make_tensor_desc(keys);
-  haganeOpsUniform(&kd, 0.0, 1.0);
-  // Argsort the random keys to get permutation
+  auto [rng_seed, rng_offset] = hagane_rng_state(generator, n);
+  haganeOpsUniform(&kd, 0.0, 1.0, rng_seed, rng_offset);
+  at::arange_out(result, n);
   auto rd = make_tensor_desc(result);
-  auto sorted_keys = at::empty_like(keys);
-  auto skd = make_tensor_desc(sorted_keys);
-  // Copy keys for sorting
-  HAGANE_BEFORE_RAW_READ();
-  std::memcpy(sorted_keys.data_ptr(), keys.data_ptr(), n * sizeof(float));
-  haganeOpsSort(&skd, &rd, 0, 0);
+  haganeOpsSort(&kd, &rd, 0, 0);
   return result;
 }
 
@@ -1671,7 +1685,9 @@ C10_EXPORT Tensor rrelu_with_noise_cuda(
   if (training) {
     // Fill noise with uniform random in [lower, upper]
     auto noise_d = make_tensor_desc(noise);
-    haganeOpsUniform(&noise_d, lower.toDouble(), upper.toDouble());
+    auto [rng_seed, rng_offset] = hagane_rng_state(generator, noise.numel());
+    haganeOpsUniform(&noise_d, lower.toDouble(), upper.toDouble(),
+                     rng_seed, rng_offset);
     // output = self * noise where self < 0, else self
     auto mask = self.lt(0);
     auto scaled = at::mul(self, noise);
@@ -1703,18 +1719,25 @@ C10_EXPORT Tensor& rrelu_with_noise_out_cuda(
   return output;
 }
 
-// Philox RNG ops (thin wrappers — MLX manages its own RNG state)
+// Philox RNG ops. The explicit-key family (`_philox_key_split` /
+// `_philox_key_fold_in` below) is still stubbed, so these draw from the device
+// default generator and IGNORE the key they were handed — reproducible under
+// torch.manual_seed, but not keyed the way the caller asked. Tracked as HIP
+// parity 1.40; the fix is to implement key split/fold-in and derive (seed,
+// offset) from the key tensor.
 C10_EXPORT Tensor& _philox_normal_cuda_(
     Tensor& self, const Tensor& /*philox_key*/, double mean, double std) {
   auto d = make_tensor_desc(self);
-  haganeOpsNormal(&d, mean, std);
+  auto [rng_seed, rng_offset] = hagane_rng_state(std::nullopt, self.numel());
+  haganeOpsNormal(&d, mean, std, rng_seed, rng_offset);
   return self;
 }
 
 C10_EXPORT Tensor& _philox_uniform_cuda_(
     Tensor& self, const Tensor& /*philox_key*/, double low, double high) {
   auto d = make_tensor_desc(self);
-  haganeOpsUniform(&d, low, high);
+  auto [rng_seed, rng_offset] = hagane_rng_state(std::nullopt, self.numel());
+  haganeOpsUniform(&d, low, high, rng_seed, rng_offset);
   return self;
 }
 
@@ -1739,7 +1762,8 @@ C10_EXPORT std::tuple<Tensor, Tensor> native_dropout_cuda(
   }
   auto mask = at::empty_like(input, input.options().dtype(kBool));
   auto md = make_tensor_desc(mask);
-  haganeOpsBernoulliScalar(&md, 1.0 - p);
+  auto [rng_seed, rng_offset] = hagane_rng_state(std::nullopt, mask.numel());
+  haganeOpsBernoulliScalar(&md, 1.0 - p, rng_seed, rng_offset);
   double scale = 1.0 / (1.0 - p);
   auto mask_f = mask.to(input.dtype());
   auto scaled_mask = at::mul(mask_f, at::scalar_tensor(scale, input.options()));
@@ -1760,9 +1784,11 @@ C10_EXPORT std::tuple<Tensor, Tensor> fused_dropout_cuda(
 }
 
 C10_EXPORT void _fill_mem_eff_dropout_mask_(
-    Tensor& mask, double dropout_p, int64_t /*seed*/, int64_t /*offset*/) {
+    Tensor& mask, double dropout_p, int64_t seed, int64_t offset) {
   auto md = make_tensor_desc(mask);
-  haganeOpsBernoulliScalar(&md, 1.0 - dropout_p);
+  haganeOpsBernoulliScalar(&md, 1.0 - dropout_p,
+                           static_cast<uint64_t>(seed),
+                           static_cast<uint64_t>(offset));
 }
 
 } // namespace at::native
@@ -1978,7 +2004,7 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
   dst_d.ndim = static_cast<int32_t>(dst_t.dim());
   dst_d.dtype = to_hagane_dtype(dst_t.scalar_type());
 
-  if (haganeOpsCopyFull(&src_d, &dst_d) == HAGANE_OPS_SUCCESS) {
+  if (haganeOpsCopyFull(&src_d, &dst_d, gpu_to_cpu ? 1 : 0) == HAGANE_OPS_SUCCESS) {
     g_copy_lazy_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -2444,7 +2470,8 @@ void hagane_cat_serial_kernel(const Tensor& result,
 void hagane_normal_kernel(const TensorBase& self, double mean, double std,
                           std::optional<Generator> gen) {
   auto out_d = make_tensor_desc(self);
-  if (haganeOpsNormal(&out_d, mean, std) != HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, self.numel());
+  if (haganeOpsNormal(&out_d, mean, std, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     // CPU fallback: generate on CPU, copy to "GPU" (UMA)
     auto cpu_t = at::empty(self.sizes(), self.options().device(c10::kCPU));
     cpu_t.normal_(mean, std);
@@ -2457,7 +2484,8 @@ void hagane_normal_kernel(const TensorBase& self, double mean, double std,
 void hagane_uniform_kernel(TensorIteratorBase& iter, double from, double to,
                            std::optional<Generator> gen) {
   auto out = make_ops_tensor(iter, 0);
-  if (haganeOpsUniform(&out, from, to) != HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
+  if (haganeOpsUniform(&out, from, to, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     HAGANE_BEFORE_RAW_READ();
     uniform_stub(c10::DeviceType::CPU, iter, from, to, gen);
   }
@@ -2467,7 +2495,8 @@ void hagane_bernoulli_tensor_kernel(const TensorBase& self, const TensorBase& p_
                                     std::optional<Generator> gen) {
   auto out_d = make_tensor_desc(self);
   auto p_d = make_tensor_desc(p_);
-  if (haganeOpsBernoulliTensor(&out_d, &p_d) != HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, self.numel());
+  if (haganeOpsBernoulliTensor(&out_d, &p_d, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = at::empty(self.sizes(), self.options().device(c10::kCPU));
     cpu_self.bernoulli_(Tensor(p_).cpu());
     HAGANE_BEFORE_RAW_READ();
@@ -2479,7 +2508,8 @@ void hagane_bernoulli_tensor_kernel(const TensorBase& self, const TensorBase& p_
 void hagane_bernoulli_scalar_kernel(const TensorBase& self, double p,
                                     std::optional<Generator> gen) {
   auto out_d = make_tensor_desc(self);
-  if (haganeOpsBernoulliScalar(&out_d, p) != HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, self.numel());
+  if (haganeOpsBernoulliScalar(&out_d, p, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = at::empty(self.sizes(), self.options().device(c10::kCPU));
     cpu_self.bernoulli_(p);
     HAGANE_BEFORE_RAW_READ();
@@ -2491,7 +2521,9 @@ void hagane_bernoulli_scalar_kernel(const TensorBase& self, double p,
 void hagane_random_from_to_kernel(TensorIteratorBase& iter, uint64_t range,
                                   int64_t base, std::optional<Generator> gen) {
   auto out = make_ops_tensor(iter, 0);
-  if (haganeOpsRandomFromTo(&out, base, base + static_cast<int64_t>(range)) != HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
+  if (haganeOpsRandomFromTo(&out, base, base + static_cast<int64_t>(range),
+                            rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     HAGANE_BEFORE_RAW_READ();
     random_from_to_stub(c10::DeviceType::CPU, iter, range, base, gen);
   }
@@ -2499,7 +2531,8 @@ void hagane_random_from_to_kernel(TensorIteratorBase& iter, uint64_t range,
 
 void hagane_random_full_kernel(TensorIteratorBase& iter, std::optional<Generator> gen) {
   auto out = make_ops_tensor(iter, 0);
-  if (haganeOpsRandom(&out) != HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
+  if (haganeOpsRandom(&out, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     HAGANE_BEFORE_RAW_READ();
     random_full_64_bits_range_stub(c10::DeviceType::CPU, iter, gen);
   }
@@ -2507,7 +2540,8 @@ void hagane_random_full_kernel(TensorIteratorBase& iter, std::optional<Generator
 
 void hagane_random_kernel(TensorIteratorBase& iter, std::optional<Generator> gen) {
   auto out = make_ops_tensor(iter, 0);
-  if (haganeOpsRandom(&out) != HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
+  if (haganeOpsRandom(&out, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     HAGANE_BEFORE_RAW_READ();
     random_stub(c10::DeviceType::CPU, iter, gen);
   }
@@ -2517,7 +2551,8 @@ void hagane_log_normal_kernel(TensorIteratorBase& iter, double mean, double std,
                               std::optional<Generator> gen) {
   // log_normal = exp(normal(mean, std))
   auto out = make_ops_tensor(iter, 0);
-  if (haganeOpsNormal(&out, mean, std) == HAGANE_OPS_SUCCESS) {
+  auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
+  if (haganeOpsNormal(&out, mean, std, rng_seed, rng_offset) == HAGANE_OPS_SUCCESS) {
     // Apply exp in-place via MLX
     auto in = make_ops_tensor(iter, 0);
     haganeOpsExp(&in, &out);
