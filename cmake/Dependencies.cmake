@@ -1101,7 +1101,12 @@ if(USE_ROCM)
     endif()
 
     # ROCM-SMI needed to support symmetric memory
-    if(USE_DISTRIBUTED AND UNIX)
+    # Hagane: not on APPLE. rocm_smi64 is AMD's system-management library and
+    # does not exist on macOS; its only consumer here is the symmetric-memory /
+    # intra-node-P2P c10d code, which caffe2/CMakeLists.txt deliberately
+    # excludes under Hagane (one GPU per machine — see the comment there).
+    # Upstream gates NCCL the same way (`NOT APPLE`).
+    if(USE_DISTRIBUTED AND UNIX AND NOT APPLE)
       list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
         rocm_smi64
       )
@@ -1249,7 +1254,19 @@ if(USE_GLOO)
       set(USE_RCCL_SAVED ${USE_RCCL})
       set(USE_NCCL OFF)
       set(USE_RCCL OFF)
+      # Hagane: also hide USE_ROCM from Gloo. Gloo's ROCm support means "gloo
+      # collectives over real ROCm device buffers", which needs a real hipcc to
+      # populate GLOO_HIP_SRCS. Under the synthetic Hagane SDK that detection
+      # finds nothing, so gloo/CMakeLists.txt:152 calls
+      # gloo_hip_add_library(gloo_hip) with an EMPTY source list and cmake dies
+      # with "No SOURCES given to target: gloo_hip". We only need Gloo's CPU +
+      # libuv transport so that torch.distributed exists and imports; Hagane's
+      # device-collective story is RCCL, which is a separate (hardware-gated)
+      # milestone. Same save/restore idiom as USE_NCCL/USE_RCCL above.
+      set(USE_ROCM_SAVED ${USE_ROCM})
+      set(USE_ROCM OFF)
       add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../third_party/gloo)
+      set(USE_ROCM ${USE_ROCM_SAVED})
       set(USE_NCCL ${USE_NCCL_SAVED})
       set(USE_RCCL ${USE_RCCL_SAVED})
 
@@ -1290,7 +1307,9 @@ if(USE_GLOO)
     list(APPEND Caffe2_DEPENDENCY_LIBS gloo)
     if(USE_CUDA)
       list(APPEND Caffe2_CUDA_DEPENDENCY_LIBS gloo_cuda)
-    elseif(USE_ROCM)
+    elseif(USE_ROCM AND TARGET gloo_hip)
+      # Hagane: gloo_hip is deliberately not built (see the USE_ROCM override
+      # around add_subdirectory(gloo) above), so only link it if it exists.
       list(APPEND Caffe2_HIP_DEPENDENCY_LIBS gloo_hip)
     endif()
     add_compile_options(-DCAFFE2_USE_GLOO)

@@ -989,7 +989,26 @@ if(USE_ROCM)
     set(_hagane_kept_srcs "")
     foreach(_src ${Caffe2_HIP_SRCS})
       set(_exclude FALSE)
-      if("${_src}" MATCHES "\\.(hip|cu)$" AND EXISTS "${_src}")
+      # Hagane: drop the DEVICE-side c10d sources (any extension, so this must
+      # run before the .hip/.cu-only checks below).
+      #
+      # USE_DISTRIBUTED=1 is enabled so that `torch.distributed` EXISTS and
+      # IMPORTS — libraries import it unconditionally at module scope (ARDY via
+      # vector_quantize_pytorch, vLLM's nn.Module layers), and stock macOS
+      # PyTorch ships it too, so being without it put us behind the platform
+      # baseline for no benefit. What we take is Gloo's CPU + libuv transport.
+      #
+      # What we deliberately do NOT build is the device-collective fabric:
+      # these files want amd_smi/amdsmi.h, real __hip_bfloat16 intrinsics,
+      # multimem PTX, and peer-to-peer symmetric memory across several GPUs.
+      # Apple Silicon has ONE GPU per machine, so intra-node P2P collectives
+      # are not merely unimplemented here — they are meaningless. Hagane's
+      # collective story is RCCL over a machine fabric, a separate and
+      # hardware-gated milestone (ADR-042 M5).
+      if("${_src}" MATCHES "csrc/distributed/c10d/.*(symm_mem|intra_node_comm|GlooCuda|NCCL|nccl|UCC|cuda/)")
+        set(_exclude TRUE)
+      endif()
+      if(NOT _exclude AND "${_src}" MATCHES "\\.(hip|cu)$" AND EXISTS "${_src}")
         # Always exclude AMD-specific kernel directories and thrust-dependent files
         if("${_src}" MATCHES "(bgemm_kernels|ck_gemm|composable_kernel)")
           set(_exclude TRUE)

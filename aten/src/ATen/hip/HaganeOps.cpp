@@ -5792,7 +5792,17 @@ C10_EXPORT int64_t _fused_sdp_choice_cuda(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
     std::optional<double> scale, bool enable_gqa) {
-  return 1; // 1 = flash backend → routes to _hagane_sdpa_forward
+  // 0 = math, 1 = flash, 2 = efficient — all three land in
+  // _hagane_sdpa_forward, but only the EFFICIENT op's schema carries an
+  // attn_bias. Returning flash unconditionally meant the DISPATCHER dropped
+  // the caller's attn_mask before any Hagane code ran, and the call then
+  // returned success having computed plain UNMASKED attention: every padding
+  // mask and every custom attention mask was silently ignored.
+  // _scaled_dot_product_efficient_attention_cuda already forwards attn_bias
+  // (and torch's preprocess_mask has converted a bool mask to an additive one
+  // by then), so masked calls just need to be routed there.
+  if (attn_mask.has_value() && attn_mask->defined()) return 2;
+  return 1;
 }
 REGISTER_CUDA_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_cuda)
 
@@ -6080,17 +6090,75 @@ C10_EXPORT std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     const Tensor& qkv_weight, const Tensor& qkv_bias,
     const Tensor& proj_weight, const Tensor& proj_bias,
     const std::optional<Tensor>& mask, bool need_weights, bool average_attn_weights,
-    std::optional<int64_t> /*mask_type*/) {
-  int64_t head_dim = embed_dim / num_heads;
-  auto qkv = at::addmm(qkv_bias, query, qkv_weight.t()).chunk(3, -1);
-  auto q = qkv[0].view({query.size(0), -1, num_heads, head_dim}).transpose(1, 2);
-  auto k = qkv[1].view({key.size(0), -1, num_heads, head_dim}).transpose(1, 2);
-  auto v = qkv[2].view({value.size(0), -1, num_heads, head_dim}).transpose(1, 2);
-  double scale = 1.0 / std::sqrt((double)head_dim);
-  auto attn = at::softmax(at::mul(at::matmul(q, k.transpose(-2, -1)), scale), -1);
-  auto out = at::matmul(attn, v).transpose(1, 2).contiguous().view({query.size(0), -1, embed_dim});
-  auto proj_out = at::addmm(proj_bias, out.view({-1, embed_dim}), proj_weight.t()).view(out.sizes());
-  return std::make_tuple(proj_out, need_weights ? attn.mean(1) : Tensor());
+    std::optional<int64_t> mask_type) {
+  TORCH_CHECK(query.dim() == 3 && key.dim() == 3 && value.dim() == 3,
+              "native_multi_head_attention: expected 3-D [B, T, D] query/key/value, got ",
+              query.dim(), "/", key.dim(), "/", value.dim(), "-D");
+  const int64_t head_dim = embed_dim / num_heads;
+  const int64_t B = query.size(0), T = query.size(1), S = key.size(1);
+
+  // at::linear folds the batch dimension itself. The previous at::addmm here
+  // accepted only a 2-D mat1, so this op errored for every [B, T, D] input —
+  // that is, for every nn.TransformerEncoderLayer fast-path call.
+  auto to_heads = [&](const Tensor& x, int64_t len) {
+    return x.view({B, len, num_heads, head_dim}).transpose(1, 2);
+  };
+  Tensor q, k, v;
+  if (query.is_same(key) && key.is_same(value)) {
+    auto qkv = at::linear(query, qkv_weight, qkv_bias).chunk(3, -1);
+    q = to_heads(qkv[0], T); k = to_heads(qkv[1], T); v = to_heads(qkv[2], T);
+  } else {
+    auto w = qkv_weight.chunk(3, 0);
+    auto b = qkv_bias.chunk(3, 0);
+    q = to_heads(at::linear(query, w[0], b[0]), T);
+    k = to_heads(at::linear(key,   w[1], b[1]), S);
+    v = to_heads(at::linear(value, w[2], b[2]), S);
+  }
+
+  // The mask was previously ACCEPTED AND IGNORED — a padded batch silently
+  // attended to its padding. Per MultiheadAttention.merge_masks, mask_type is
+  // 0 = attention mask (T, S), 1 = key-padding mask (B, S), 2 = the two
+  // already merged and expanded to 4-D.
+  std::optional<Tensor> attn_mask;
+  if (mask.has_value() && mask->defined()) {
+    Tensor m = *mask;
+    const int64_t mt = mask_type.value_or((m.dim() == 2 && m.size(0) == B) ? 1 : 0);
+    if (m.dim() == 2) {
+      m = (mt == 1) ? m.view({B, 1, 1, S})   // key padding
+                    : m.view({1, 1, T, S});  // attention mask
+    } else if (m.dim() == 3) {
+      m = m.view({B, 1, T, S});
+    }
+    TORCH_CHECK(m.dim() == 4, "native_multi_head_attention: unsupported mask of dim ", m.dim());
+    attn_mask = m;
+  }
+  const bool mask_is_bool =
+      attn_mask.has_value() && attn_mask->scalar_type() == at::kBool;
+
+  Tensor attn_out, attn_weights;
+  if (!need_weights) {
+    // SDPA's boolean attn_mask marks positions that MAY attend — the inverse
+    // of nn.Transformer's "True == masked out".
+    std::optional<Tensor> sdpa_mask;
+    if (attn_mask.has_value())
+      sdpa_mask = mask_is_bool ? at::logical_not(*attn_mask) : *attn_mask;
+    attn_out = at::scaled_dot_product_attention(
+        q, k, v, sdpa_mask, 0.0, false, std::nullopt);
+  } else {
+    auto scores = at::mul(at::matmul(q, k.transpose(-2, -1)),
+                          1.0 / std::sqrt((double)head_dim));
+    if (attn_mask.has_value()) {
+      scores = mask_is_bool
+          ? scores.masked_fill(*attn_mask, -std::numeric_limits<float>::infinity())
+          : at::add(scores, *attn_mask);
+    }
+    attn_weights = at::softmax(scores, -1);
+    attn_out = at::matmul(attn_weights, v);
+    // average_attn_weights was previously ignored (it always averaged).
+    if (average_attn_weights) attn_weights = attn_weights.mean(1);
+  }
+  auto out = attn_out.transpose(1, 2).contiguous().view({B, T, embed_dim});
+  return std::make_tuple(at::linear(out, proj_weight, proj_bias), attn_weights);
 }
 
 C10_EXPORT std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cuda(
