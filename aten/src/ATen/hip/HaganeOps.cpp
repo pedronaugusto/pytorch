@@ -140,8 +140,26 @@
 // Phase 12a: every raw-byte read/write of a device pointer must flush the
 // lazy MLX pending graph first. Otherwise a stashed mx::array could later
 // memcpy stale bytes over freshly-written data (or the reader picks up
-// pre-eval zeroes). haganeOpsFlush() is cheap and idempotent on empty map.
-#define HAGANE_BEFORE_RAW_READ() ::haganeOpsFlush()
+// pre-eval zeroes).
+//
+// Tracker 1.53: haganeOpsFlush() lands the lazy MLX graph and NOTHING ELSE —
+// it does not settle the Metal command queue, so a transpiler-owned metallib
+// kernel that is already ENCODED (sitting in an open, uncommitted batch) is
+// still in flight when the CPU kernel below starts reading and writing the
+// very same unified-memory pointers. That is a two-way hazard: the host store
+// overwrites operands a queued kernel has not read yet, and the host load
+// returns bytes a queued kernel has not written yet.
+//
+// It surfaced as `test_e2e1_flexible_dual_grid` failing with a flipped quad
+// split: aten::index (CPU-delegated, right below) wrote its int32 output over
+// the input of an `abs` kernel still queued in an open batch. It had been
+// masked for months by the allocator FREE hook's blanket synchronize — which
+// is exactly why removing that drain (tracker 1.50) and making it non-blocking
+// (1.53) both failed this one gate and nothing else.
+//
+// haganeOpsSettleForCpuKernel() adds the queue drain. These are already
+// full host round-trips, so the settle is not the expensive part.
+#define HAGANE_BEFORE_RAW_READ() ::haganeOpsSettleForCpuKernel()
 
 // Erase stale pending entries when PyTorch's caching allocator frees a block.
 // Without this, address reuse causes lazy results to be read as wrong-dtype data.
@@ -161,7 +179,12 @@ static void hagane_register_allocator_hook() {
     [](const c10::CachingDeviceAllocator::TraceEntry& e) {
       using TE = c10::CachingDeviceAllocator::TraceEntry;
       if (e.action_ == TE::FREE_REQUESTED) {
-        haganeOpsPendingErase(reinterpret_cast<void*>(e.addr_));
+        // Tracker 1.52: pass the block SIZE. Without it the runtime flushes
+        // [block, end-of-segment), so freeing one temporary materialises every
+        // pending lazy chain reading anywhere later in the same (megabyte-sized,
+        // many-live-blocks) segment — and blocks the host on it.
+        haganeOpsPendingEraseSized(reinterpret_cast<void*>(e.addr_),
+                                   static_cast<int64_t>(e.size_));
         g_erase_count.fetch_add(1, std::memory_order_relaxed);
         return;
       }
@@ -2375,10 +2398,120 @@ void hagane_scatter_reduce_two_kernel(const Tensor& self, int64_t dim,
 // Batch 2: Index ops — CPU delegation (complex TensorIterator patterns)
 // ---------------------------------------------------------------------------
 
+// Advanced indexing, on device (#996). The semantics, from the reference CPU
+// kernel (native/cpu/IndexKernelUtils.h `Indexer::get`), are:
+//
+//     out[i] = *(char*)(self_data + strides1[i] + SUM_j wrap(idx_j[i]) * indexed_strides[j])
+//
+// where every stride is in BYTES, operand 0 is the output, operand 1 is `self`
+// restrided with stride 0 along the indexed dims, and operands 2.. are the
+// int64 index tensors already broadcast to the iterator's shape. `wrap` adds
+// the dimension size to a negative index.
+//
+// This used to be an unconditional hop to the CPU stub. That is a correctness
+// hazard as much as a perf one: a host-side kernel never reaches a recorder
+// hook, so a graph capture containing it can only be refused (it was the ONE
+// op refusing capture of ARDY's whole denoiser forward, 1 of 667 aten calls),
+// and every call pays a full queue settle.
+//
+// Nothing new is needed on the device to do this properly — the offset
+// arithmetic is arange/mul/add/where and the gather is index_select, all of
+// which Hagane already runs natively. So the whole thing is expressed in aten
+// and stays on device. Returns false (→ CPU fallback, which taints a capture
+// loudly rather than lying) for the shapes this does not cover.
+static bool hagane_index_on_device(TensorIteratorBase& iter,
+                                   IntArrayRef indexed_sizes,
+                                   IntArrayRef indexed_strides) {
+  const int ntensor = iter.ntensors();
+  const int n_idx = ntensor - 2;
+  if (n_idx <= 0 || (int)indexed_sizes.size() != n_idx ||
+      (int)indexed_strides.size() != n_idx)
+    return false;
+
+  const Tensor& out = iter.tensor(0);
+  const Tensor& self = iter.tensor(1);
+  if (!out.defined() || !self.defined()) return false;
+  if (!out.is_cuda() || !self.is_cuda()) return false;
+
+  const int64_t esz = self.element_size();
+  if (esz <= 0) return false;
+  const auto shape = iter.shape();
+  const int ndim = (int)shape.size();
+  if (ndim == 0) return false;   // scalar iteration: rare, leave to the stub
+
+  // Byte strides must be whole elements for the element-space arithmetic below.
+  auto elem_strides = [&](int arg, int64_t item) -> std::vector<int64_t> {
+    std::vector<int64_t> es;
+    for (int64_t s : iter.strides(arg)) {
+      if (item == 0 || s % item != 0) return {};
+      es.push_back(s / item);
+    }
+    return es;
+  };
+  const auto out_es = elem_strides(0, out.element_size());
+  const auto self_es = elem_strides(1, esz);
+  if (out_es.empty() || self_es.empty()) return false;
+  for (int j = 0; j < n_idx; ++j)
+    if (indexed_strides[j] % esz != 0) return false;
+
+  auto i64 = self.options().dtype(at::kLong);
+
+  // Flat element offset into self's storage for each output position:
+  //   base[i] = SUM_d i_d * self_es[d]        (the restrided `self` term)
+  //           + SUM_j wrap(idx_j[i]) * indexed_strides[j]/esz
+  Tensor offset = at::zeros({1}, i64);
+  for (int d = 0; d < ndim; ++d) {
+    if (self_es[d] == 0 || shape[d] <= 1) continue;
+    std::vector<int64_t> view(ndim, 1);
+    view[d] = shape[d];
+    // arange WITH A STEP, not arange * stride: a scalar-operand multiply is
+    // recorded by the tape as a 1-input MUL, which replay cannot reconstruct
+    // (see the sibling note on at::full below).
+    offset = at::add(offset,
+                     at::arange(0, shape[d] * self_es[d], self_es[d], i64).view(view));
+  }
+  for (int j = 0; j < n_idx; ++j) {
+    const Tensor& idx_base = iter.tensor(2 + j);
+    if (!idx_base.defined() || idx_base.scalar_type() != at::kLong) return false;
+    const auto idx_es = elem_strides(2 + j, idx_base.element_size());
+    if (idx_es.empty()) return false;
+    // The iterator's shape/strides for this operand describe it in iteration
+    // order (dims may have been permuted or coalesced); as_strided rebuilds
+    // exactly that view over the same storage.
+    Tensor idx = at::as_strided(idx_base, shape, idx_es, idx_base.storage_offset());
+    const int64_t size = indexed_sizes[j];
+    idx = at::where(at::lt(idx, 0), at::add(idx, size), idx);
+    // Clamp for memory safety. A valid program is unaffected; an out-of-range
+    // index is a defined wrong value rather than a read outside the allocation.
+    // It is NOT diagnosed — see the follow-up task; CPU raises here and CUDA
+    // fires a device-side assert, and we can do neither without a host sync.
+    idx = at::clamp(idx, 0, size > 0 ? size - 1 : 0);
+    // Multiply by a 1-ELEMENT TENSOR, not a scalar. Every op here may be
+    // recorded into a graph tape, and the tape records a scalar-operand mul
+    // with n_inputs=1, which replay rejects. Keeping both operands tensors
+    // keeps this whole function replayable.
+    offset = at::add(offset,
+                     at::mul(idx, at::full({1}, indexed_strides[j] / esz, i64)));
+  }
+
+  // Gather from a flat view of self's storage. The view starts at self's
+  // storage offset, which is the base every offset above is relative to.
+  const int64_t span =
+      (int64_t)(self.storage().nbytes() / esz) - self.storage_offset();
+  if (span <= 0) return false;
+  Tensor self_flat = at::as_strided(self, {span}, {1}, self.storage_offset());
+
+  Tensor gathered =
+      at::index_select(self_flat, 0, offset.expand(shape).reshape({-1}));
+  Tensor out_view =
+      at::as_strided(out, shape, out_es, out.storage_offset());
+  out_view.copy_(gathered.view(shape));
+  return true;
+}
+
 void hagane_index_kernel(TensorIteratorBase& iter, IntArrayRef indexed_sizes,
                          IntArrayRef indexed_strides) {
-  // Advanced indexing uses complex TensorIterator patterns
-  // UMA allows CPU path to operate on the same memory directly
+  if (hagane_index_on_device(iter, indexed_sizes, indexed_strides)) return;
   HAGANE_BEFORE_RAW_READ();
   index_stub(c10::DeviceType::CPU, iter, indexed_sizes, indexed_strides);
 }
