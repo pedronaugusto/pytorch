@@ -5959,7 +5959,15 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
   // ratio) — fallback to the manual chain when the fused kernel can't
   // handle the shape. Reuses the existing HAGANE_OP_SDPA tape op +
   // dispatch_op replay branch (Phase 3 MVP T1).
-  if (!is_causal && !attn_mask.has_value() && dropout_p == 0.0 &&
+  // Masked and causal calls route here too. They used to be excluded, which
+  // sent every one of them down the aten chain below — and that chain is
+  // expensive: measured on ARDY's shape (3,8,13,128), unmasked 0.028 ms vs
+  // ~2.94 ms masked, ~100x, with ARDY spending ~36% of a replan in it. Part of
+  // the cost is the `logsumexp` on the last line, a full extra reduction over
+  // the score matrix that inference never reads. haganeOpsSdpa picks between a
+  // decomposed graph and MLX's fused kernel by shape.
+  const bool have_mask = attn_mask.has_value() && attn_mask->defined();
+  if (dropout_p == 0.0 &&
       q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
       q.scalar_type() == k.scalar_type() &&
       q.scalar_type() == v.scalar_type() &&
@@ -5975,10 +5983,18 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
       auto qd = make_tensor_desc(q);
       auto kd = make_tensor_desc(k);
       auto vd = make_tensor_desc(v);
+      Tensor mask_c;
+      haganeOpsTensor_t md;
+      const haganeOpsTensor_t* mdp = nullptr;
+      if (have_mask) {
+        mask_c = attn_mask->is_contiguous() ? *attn_mask : attn_mask->contiguous();
+        md = make_tensor_desc(mask_c);
+        mdp = &md;
+      }
       auto output = at::empty_like(q);
       auto od = make_tensor_desc(output);
-      if (haganeOpsSdpa(&qd, &kd, &vd, nullptr, &od,
-                        static_cast<float>(s), 0) == HAGANE_OPS_SUCCESS) {
+      if (haganeOpsSdpa(&qd, &kd, &vd, mdp, &od,
+                        static_cast<float>(s), is_causal ? 1 : 0) == HAGANE_OPS_SUCCESS) {
         // logsumexp tuple element is autograd-backward-only; inference
         // ignores it. Returning an empty Tensor avoids re-wrapping q/k
         // through the recorder (which would record extra MATMUL/MUL ops
@@ -5996,7 +6012,10 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
   auto attn_weight = at::mul(at::matmul(q, k.transpose(-2, -1)), s);
   if (is_causal) {
     int64_t L = q.size(-2), S = k.size(-2);
-    auto mask = at::ones({L, S}, q.options().dtype(kBool)).tril(S - L);
+    // torch defines is_causal as tril(diagonal=0) — TOP-LEFT aligned. This was
+    // tril(S - L), i.e. bottom-right, which silently computed different
+    // attention whenever L != S (caught vs CPU at (1,4,5/9,64): max_abs 3.41).
+    auto mask = at::ones({L, S}, q.options().dtype(kBool)).tril(0);
     attn_weight = attn_weight.masked_fill(~mask, -std::numeric_limits<float>::infinity());
   }
   if (attn_mask.has_value()) attn_weight = at::add(attn_weight, *attn_mask);
