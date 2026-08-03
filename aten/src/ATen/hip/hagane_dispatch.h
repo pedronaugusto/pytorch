@@ -547,7 +547,7 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     void*  args[]      = {d_in, d_out, &N};
     int    arg_types[] = {0, 0, 1};
     size_t arg_sizes[] = {0, 0, sizeof(int)};
-    if (hagane_launch_kernel_mixed(kname.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                    args, arg_types, arg_sizes, 3) != hipSuccess)
         return false;
     note_native_launch(kname);
@@ -644,7 +644,7 @@ inline bool launch_fused_norm(const char* tag, bool rms, void* dX, void* dgamma,
     void*  args[] = {&c_N, &c_eps, dX, dgamma, dbeta, dmean, drstd, dY};
     int    at[]   = {1, 1, 0, 0, 0, 0, 0, 0};
     size_t as[]   = {sizeof(int), sizeof(float), 0, 0, 0, 0, 0, 0};
-    if (hagane_launch_kernel_mixed(k.c_str(), grid, block, shared, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(k.c_str(), grid, block, shared, nullptr,
                                    args, at, as, 8) != hipSuccess)
         return false;
     note_native_launch(k);
@@ -727,7 +727,7 @@ inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
     void*  margs[] = {&c_N, &c_eps, dX, dmean, drstd};
     int    mat[]   = {1, 1, 0, 0, 0};
     size_t mas[]   = {sizeof(int64_t), sizeof(float), 0, 0, 0};
-    if (hagane_launch_kernel_mixed(moments.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(moments.c_str(), grid, block, 0, nullptr,
                                    margs, mat, mas, 5) != hipSuccess)
         return false;
 
@@ -736,7 +736,7 @@ inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
     void*  aargs[] = {&c_N, dX, dmean, drstd, dgamma, dgamma, dY};
     int    aat[]   = {1, 0, 0, 0, 0, 0, 0};
     size_t aas[]   = {sizeof(int64_t), 0, 0, 0, 0, 0, 0};
-    if (hagane_launch_kernel_mixed(apply.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(apply.c_str(), grid, block, 0, nullptr,
                                    aargs, aat, aas, 7) != hipSuccess)
         return false;
 
@@ -828,14 +828,14 @@ inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
     void*  margs[] = {&c_N, &c_eps, dX, dmean, drstd};
     int    mat[]   = {1, 1, 0, 0, 0};
     size_t mas[]   = {sizeof(int64_t), sizeof(float), 0, 0, 0};
-    if (hagane_launch_kernel_mixed(moments.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(moments.c_str(), grid, block, 0, nullptr,
                                    margs, mat, mas, 5) != hipSuccess)
         return false;
 
     void*  aargs[] = {&c_N, dX, dmean, drstd, dgamma, dbeta, dY};
     int    aat[]   = {1, 0, 0, 0, 0, 0, 0};
     size_t aas[]   = {sizeof(int64_t), 0, 0, 0, 0, 0, 0};
-    if (hagane_launch_kernel_mixed(apply.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(apply.c_str(), grid, block, 0, nullptr,
                                    aargs, aat, aas, 7) != hipSuccess)
         return false;
 
@@ -925,10 +925,10 @@ inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
     dim3 b(block, 1, 1), g1(static_cast<unsigned>(nblocks), 1, 1), g2(1, 1, 1);
 
     void* a1[] = {&c_N, dX, dpart, &s1};   // pass 1: X(N) → partials(nblocks), scale 1
-    if (hagane_launch_kernel_mixed(k1, g1, b, 0, nullptr, a1, at_, as_, 4) != hipSuccess)
+    if (hagane_launch_kernel_mixed_tracked(k1, g1, b, 0, nullptr, a1, at_, as_, 4) != hipSuccess)
         return false;
     void* a2[] = {&c_NB, dpart, dout, &s2}; // pass 2: partials(nblocks) → out(1), scale
-    if (hagane_launch_kernel_mixed(k2, g2, b, 0, nullptr, a2, at_, as_, 4) != hipSuccess)
+    if (hagane_launch_kernel_mixed_tracked(k2, g2, b, 0, nullptr, a2, at_, as_, 4) != hipSuccess)
         return false;
 
     note_native_launch(k1);
@@ -1032,7 +1032,7 @@ inline bool try_launch_softmax_metallib(const at::Tensor& input_c,
     size_t as_[]  = {0, 0, sizeof(int), sizeof(int), sizeof(int),
                      0, sizeof(int), sizeof(bool)};
     dim3 grid(blocks, 1, 1), block(warp_size, warps_per_block, 1);
-    if (hagane_launch_kernel_mixed(kernel.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(kernel.c_str(), grid, block, 0, nullptr,
                                    args, at_, as_, 8) != hipSuccess)
         return false;
     note_native_launch(kernel);
@@ -1059,7 +1059,7 @@ inline bool try_launch_binary_metallib(const std::string& kname,
     void*  args[]      = {d_a, d_b, d_out, &N};
     int    arg_types[] = {0, 0, 0, 1};
     size_t arg_sizes[] = {0, 0, 0, sizeof(int)};
-    if (hagane_launch_kernel_mixed(kname.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                    args, arg_types, arg_sizes, 4) != hipSuccess)
         return false;
     note_native_launch(kname);
@@ -1088,7 +1088,7 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     void*  args[]      = {d_in, d_out, &sc, &N};
     int    arg_types[] = {0, 0, 1, 1};
     size_t arg_sizes[] = {0, 0, sizeof(float), sizeof(int)};
-    if (hagane_launch_kernel_mixed(kname.c_str(), grid, block, 0, nullptr,
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                    args, arg_types, arg_sizes, 4) != hipSuccess)
         return false;
     note_native_launch(kname);
