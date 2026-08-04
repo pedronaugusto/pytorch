@@ -188,6 +188,13 @@ static void hagane_register_allocator_hook() {
         g_erase_count.fetch_add(1, std::memory_order_relaxed);
         return;
       }
+      // ARDY-17: an ALLOC is the definitive "this address now belongs to a new
+      // tensor" event. Stamp it unconditionally — a lazy stash keyed on this
+      // address from the previous tenant is dead, and without this stamp the
+      // runtime cannot tell it apart from a live one and serves it silently.
+      if (e.action_ == TE::ALLOC) {
+        haganeOpsNoteAlloc(reinterpret_cast<void*>(e.addr_));
+      }
       // Sprint DD-B — track allocations made during a hipStream capture
       // window. PyTorch tags pool allocations with a non-default
       // mempool_id (CUDAGraph::capture_begin → beginAllocateToPool), but
