@@ -2461,6 +2461,56 @@ static bool hagane_index_on_device(TensorIteratorBase& iter,
   for (int j = 0; j < n_idx; ++j)
     if (indexed_strides[j] % esz != 0) return false;
 
+  // One call, or the op-by-op composition below. The composition is ~12 aten
+  // dispatches — an arange per dim plus where/clamp/mul/add per index plus an
+  // index_select and a copy — and on ARDY that measured 1.9 ms to gather ten
+  // int64s, 13.2% of a denoise step, nearly all of it dispatch rather than
+  // work. haganeOpsIndexGather does the same arithmetic in one. It declines
+  // during graph capture, where the composition is what the tape can replay.
+  {
+    const int64_t span_1 =
+        (int64_t)(self.storage().nbytes() / esz) - self.storage_offset();
+    bool out_contig = true;
+    int64_t expect = 1;
+    for (int d = ndim - 1; d >= 0; --d) {
+      if (shape[d] > 1 && out_es[d] != expect) { out_contig = false; break; }
+      expect *= shape[d];
+    }
+    if (span_1 > 0 && out_contig) {
+      std::vector<int64_t> flat_shape{span_1}, flat_stride{1};
+      haganeOpsTensor_t self_d{self.data_ptr(), flat_shape.data(),
+                               flat_stride.data(), 1, to_hagane_dtype(self.scalar_type())};
+      std::vector<int64_t> shp(shape.begin(), shape.end());
+      haganeOpsTensor_t out_d{out.data_ptr(), shp.data(), out_es.data(),
+                              ndim, to_hagane_dtype(out.scalar_type())};
+
+      std::vector<std::vector<int64_t>> idx_strides(n_idx);
+      std::vector<haganeOpsTensor_t> idx_descs(n_idx);
+      std::vector<const haganeOpsTensor_t*> idx_ptrs(n_idx);
+      std::vector<int64_t> sizes(n_idx), istrides(n_idx);
+      bool ok = true;
+      for (int j = 0; j < n_idx && ok; ++j) {
+        const Tensor& ib = iter.tensor(2 + j);
+        if (!ib.defined() || ib.scalar_type() != at::kLong) { ok = false; break; }
+        idx_strides[j] = elem_strides(2 + j, ib.element_size());
+        if (idx_strides[j].empty()) { ok = false; break; }
+        idx_descs[j] = haganeOpsTensor_t{ib.data_ptr(), shp.data(),
+                                         idx_strides[j].data(), ndim,
+                                         to_hagane_dtype(ib.scalar_type())};
+        idx_ptrs[j] = &idx_descs[j];
+        sizes[j] = indexed_sizes[j];
+        istrides[j] = indexed_strides[j] / esz;
+      }
+      if (ok) {
+        std::vector<int64_t> self_it_strides(self_es.begin(), self_es.end());
+        if (haganeOpsIndexGather(&self_d, idx_ptrs.data(), n_idx, sizes.data(),
+                                 istrides.data(), self_it_strides.data(),
+                                 &out_d) == HAGANE_OPS_SUCCESS)
+          return true;
+      }
+    }
+  }
+
   auto i64 = self.options().dtype(at::kLong);
 
   // Flat element offset into self's storage for each output position:
