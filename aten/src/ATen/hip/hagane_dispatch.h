@@ -1176,25 +1176,77 @@ inline bool vendor_elementwise_route_enabled() {
     return on;
 }
 
+// #1023 — a decline site names itself.
+//
+// A third of the stashes ARDY still pays sit in routes below, which means a
+// precondition here returns false and nobody knows which. Reading them did not
+// answer it, and inferring it put two ops in the wrong bucket. So every
+// `return false` becomes `return decline(route, op, why)` — same control flow,
+// and with HAGANE_DECLINE_TRACE set the reason is counted in the runtime, where
+// a probe can read it without going through torch.
+//
+// route_enter() is the other half: a route with zero ENTERs is not declining,
+// it is never reached, and those two need different fixes but read identically
+// from the source.
+inline bool decline_trace_on() {
+    static const bool on = haganeOpsDeclineTraceEnabled() != 0;
+    return on;
+}
+inline bool decline(const char* route, const char* op, const char* why) {
+    if (decline_trace_on()) haganeOpsDeclineNote(route, op, why);
+    return false;
+}
+inline void route_enter(const char* route, const char* op) {
+    if (decline_trace_on()) haganeOpsDeclineNote(route, op, "ENTER");
+}
+// A layout decline is only actionable with the layout: "extend the route" and
+// "this caller should not be making that copy" are different fixes.
+inline bool decline_layout(const char* route, const char* why,
+                           const at::Tensor& t) {
+    if (!decline_trace_on()) return false;
+    std::string w = std::string(why) + "[";
+    for (int64_t i = 0; i < t.dim(); ++i)
+        w += (i ? "," : "") + std::to_string(t.size(i));
+    w += "|";
+    for (int64_t i = 0; i < t.dim(); ++i)
+        w += (i ? "," : "") + std::to_string(t.stride(i));
+    w += "]";
+    haganeOpsDeclineNote(route, nullptr, w.c_str());
+    return false;
+}
+// A dtype-mismatch decline is only actionable with the pair that mismatched:
+// "route the cast" and "pick a mixed-dtype kernel" are different fixes and the
+// bare reason cannot tell them apart.
+inline bool decline_dtypes(const char* route, const char* op, const char* why,
+                           c10::ScalarType from, c10::ScalarType to) {
+    if (!decline_trace_on()) return false;
+    std::string w = std::string(why) + "[" + c10::toString(from) + "->"
+                  + c10::toString(to) + "]";
+    haganeOpsDeclineNote(route, op, w.c_str());
+    return false;
+}
+
 inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& iter) {
-    if (!vendor_elementwise_route_enabled()) return false;
+    constexpr const char* R = "bin_flat";
+    if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
     const char* mlx_op = mlx_binary_op_name(torch_op);
-    if (!mlx_op) return false;
-    if (haganeOpsTapeRecording()) return false;  // capture records via MLX
-    if (iter.ninputs() != 2) return false;
-    if (!haganeOpsVendorElementwiseAvailable()) return false;
+    if (!mlx_op) return decline(R, torch_op, "no_mlx_name");
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (iter.ninputs() != 2) return decline(R, torch_op, "ninputs");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, torch_op, "corpus_unavailable");
 
     // The vv_/sv_/vs_ kernels are flat and unbroadcast: one linear index into
     // each operand. So every operand must be contiguous and the same shape as
     // the output, and the compute dtype must be the storage dtype.
-    if (!iter.is_contiguous()) return false;
+    if (!iter.is_contiguous()) return decline(R, torch_op, "iter_not_contiguous");
     const auto compute = iter.common_dtype();
     const int dt = hagane_vendor_dtype(compute);
-    if (dt < 0) return false;
+    if (dt < 0) return decline(R, torch_op, "compute_dtype");
 
     const int64_t N = iter.numel();
     if (N <= 0) return true;                      // nothing to compute
-    if (N > static_cast<int64_t>(UINT32_MAX)) return false;
+    if (N > static_cast<int64_t>(UINT32_MAX)) return decline(R, torch_op, "numel_too_big");
 
     const void* ptrs[2] = {nullptr, nullptr};
     bool is_scalar[2] = {false, false};
@@ -1202,23 +1254,28 @@ inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& ite
     for (int i = 0; i < 2; i++) {
         const int arg = i + 1;
         if (iter.is_cpu_scalar(arg)) {
-            if (!vendor_scalar_bytes(iter, arg, compute, &scalars[i])) return false;
+            if (!vendor_scalar_bytes(iter, arg, compute, &scalars[i]))
+                return decline(R, torch_op, "scalar_dtype");
             is_scalar[i] = true;
             continue;
         }
         // A device operand must already be in the compute dtype and full-sized:
         // a promoted or broadcast operand would need MLX's g*_ strided kernels,
         // which this path does not select.
-        if (iter.tensor(arg).scalar_type() != compute) return false;
-        if (iter.tensor(arg).sizes() != iter.tensor(0).sizes()) return false;
+        if (iter.tensor(arg).scalar_type() != compute)
+            return decline_dtypes(R, torch_op, "operand_dtype_promoted",
+                                  iter.tensor(arg).scalar_type(), compute);
+        if (iter.tensor(arg).sizes() != iter.tensor(0).sizes())
+            return decline(R, torch_op, "operand_broadcast");
         ptrs[i] = iter.data_ptr(arg);
     }
-    if (is_scalar[0] && is_scalar[1]) return false;
+    if (is_scalar[0] && is_scalar[1]) return decline(R, torch_op, "both_scalar");
     // A comparison writes bool while computing in the input dtype; the kernel
     // handles that, but the output BUFFER must then be bool-sized. Only accept
     // out dtype == compute dtype, or bool out for a comparison.
     const auto out_st = iter.dtype(0);
-    if (out_st != compute && out_st != c10::ScalarType::Bool) return false;
+    if (out_st != compute && out_st != c10::ScalarType::Bool)
+        return decline(R, torch_op, "out_dtype");
     if (out_st == c10::ScalarType::Bool && compute != c10::ScalarType::Bool) {
         // MLX names these by the INPUT dtype and writes bool — supported, but
         // only for the ops that actually produce bool.
@@ -1226,7 +1283,7 @@ inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& ite
             "Equal", "NotEqual", "Less", "LessEqual", "Greater", "GreaterEqual"};
         bool ok = false;
         for (const char* b : kBoolOut) if (std::strcmp(mlx_op, b) == 0) ok = true;
-        if (!ok) return false;
+        if (!ok) return decline(R, torch_op, "bool_out_not_cmp");
     }
 
     // The output span must come from the OUTPUT dtype: a comparison computes in
@@ -1234,11 +1291,11 @@ inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& ite
     // supersede/mark bytes past the end of the output — corrupting whatever
     // tensor's stash sits after it.
     const int dt_out = hagane_vendor_dtype(out_st);
-    if (dt_out < 0) return false;
+    if (dt_out < 0) return decline(R, torch_op, "out_dtype_unspellable");
     if (haganeOpsVendorBinary(mlx_op, dt, dt_out, ptrs[0], ptrs[1], iter.data_ptr(0), N,
                               is_scalar[0] ? 1 : 0, is_scalar[1] ? 1 : 0,
                               scalars[0], scalars[1]) != HAGANE_OPS_SUCCESS)
-        return false;
+        return decline(R, torch_op, "kernel_dispatch");
     note_native_launch(std::string("mlx:") + mlx_op);
 
     return true;
@@ -1257,37 +1314,40 @@ inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& ite
 //
 // The OUTPUT must be contiguous — the kernel writes it with a linear index.
 inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) {
-    if (!vendor_elementwise_route_enabled()) return false;
+    constexpr const char* R = "bin_g";
+    if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
     const char* mlx_op = mlx_binary_op_name(torch_op);
-    if (!mlx_op) return false;
-    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
-    if (iter.ninputs() != 2) return false;
-    if (!haganeOpsVendorElementwiseAvailable()) return false;
+    if (!mlx_op) return decline(R, torch_op, "no_mlx_name");
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (iter.ninputs() != 2) return decline(R, torch_op, "ninputs");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, torch_op, "corpus_unavailable");
 
     const auto compute = iter.common_dtype();
     const int dt = hagane_vendor_dtype(compute);
-    if (dt < 0) return false;
+    if (dt < 0) return decline(R, torch_op, "compute_dtype");
     const auto out_st = iter.dtype(0);
-    if (out_st != compute && out_st != c10::ScalarType::Bool) return false;
+    if (out_st != compute && out_st != c10::ScalarType::Bool)
+        return decline(R, torch_op, "out_dtype");
     if (out_st == c10::ScalarType::Bool && compute != c10::ScalarType::Bool) {
         static constexpr const char* kBoolOut[] = {
             "Equal", "NotEqual", "Less", "LessEqual", "Greater", "GreaterEqual"};
         bool ok = false;
         for (const char* b : kBoolOut) if (std::strcmp(mlx_op, b) == 0) ok = true;
-        if (!ok) return false;
+        if (!ok) return decline(R, torch_op, "bool_out_not_cmp");
     }
     const int dt_out = hagane_vendor_dtype(out_st);
-    if (dt_out < 0) return false;
+    if (dt_out < 0) return decline(R, torch_op, "out_dtype_unspellable");
 
     const at::Tensor& out = iter.tensor(0);
-    if (!out.is_contiguous()) return false;
+    if (!out.is_contiguous()) return decline(R, torch_op, "out_not_contiguous");
     const int64_t N = iter.numel();
     if (N <= 0) return true;                      // nothing to compute
-    if (N > static_cast<int64_t>(INT32_MAX)) return false;
+    if (N > static_cast<int64_t>(INT32_MAX)) return decline(R, torch_op, "numel_too_big");
 
     const auto osz = out.sizes();
     const int64_t n = static_cast<int64_t>(osz.size());
-    if (n > 16) return false;
+    if (n > 16) return decline(R, torch_op, "rank_gt16");
 
     // Each operand's stride along every OUTPUT dimension, right-aligned.
     int64_t st[2][16];
@@ -1297,27 +1357,30 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     for (int i = 0; i < 2; i++) {
         const int arg = i + 1;
         if (iter.is_cpu_scalar(arg)) {
-            if (!vendor_scalar_bytes(iter, arg, compute, &scalars[i])) return false;
+            if (!vendor_scalar_bytes(iter, arg, compute, &scalars[i]))
+                return decline(R, torch_op, "scalar_dtype");
             is_scalar[i] = true;
             for (int64_t k = 0; k < n; ++k) st[i][k] = 0;
             continue;
         }
         const at::Tensor& t = iter.tensor(arg);
-        if (t.scalar_type() != compute) return false;
+        if (t.scalar_type() != compute)
+            return decline_dtypes(R, torch_op, "operand_dtype_promoted",
+                                  t.scalar_type(), compute);
         const int64_t tn = t.dim();
-        if (tn > n) return false;
+        if (tn > n) return decline(R, torch_op, "operand_rank_gt_out");
         for (int64_t k = 0; k < n; ++k) {
             const int64_t j = k - (n - tn);
             if (j < 0)                    { st[i][k] = 0; continue; }
             if (t.size(j) == osz[k])        st[i][k] = t.stride(j);
             else if (t.size(j) == 1)        st[i][k] = 0;
-            else return false;            // not broadcastable to the output
-            if (st[i][k] < 0) return false;   // MLX indexes unsigned
+            else return decline(R, torch_op, "not_broadcastable");
+            if (st[i][k] < 0) return decline(R, torch_op, "negative_stride");
         }
         // The tensor's own base, since the strides above are the tensor's own.
         ptrs[i] = t.const_data_ptr();
     }
-    if (is_scalar[0] && is_scalar[1]) return false;
+    if (is_scalar[0] && is_scalar[1]) return decline(R, torch_op, "both_scalar");
 
     // Collapse: merge an inner dimension into the group outside it only when
     // EVERY operand's index stays linear across the pair.
@@ -1333,21 +1396,26 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
         }
     }
     if (ng == 0) { ext[0] = 1; sa[0] = 0; sb[0] = 0; ng = 1; }   // all dims were 1
-    if (ng > 3) return false;                                    // beyond g3_
+    if (ng > 3) return decline(R, torch_op, "groups_gt3");       // beyond g3_
 
     if (haganeOpsVendorBinaryG(mlx_op, dt, dt_out, ptrs[0], ptrs[1],
                                iter.data_ptr(0),
                                is_scalar[0] ? 1 : 0, is_scalar[1] ? 1 : 0,
                                scalars[0], scalars[1],
                                ext, sa, sb, ng) != HAGANE_OPS_SUCCESS)
-        return false;
+        return decline(R, torch_op, "kernel_dispatch");
     note_native_launch(std::string("mlx:g_") + mlx_op);
     return true;
 }
 
 // The flat kernels first — they are cheaper to set up and cover the shape most
 // ops actually have; the strided ones catch everything else.
+//
+// Only ENTER is recorded here: the flat path declining is NORMAL (it is the
+// narrow one), so the decline that matters is bin_g's, and its reason counts
+// already sum to this route's total declines.
 inline bool try_vendor_binary(const char* torch_op, TensorIteratorBase& iter) {
+    route_enter("bin", torch_op);
     return try_vendor_binary_flat(torch_op, iter)
         || try_vendor_binary_g(torch_op, iter);
 }
@@ -1430,34 +1498,39 @@ inline const char* mlx_unary_op_name(const char* op) {
 }
 
 inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
-    if (!vendor_elementwise_route_enabled()) return false;
+    constexpr const char* R = "unary";
+    route_enter(R, torch_op);
+    if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
     const char* mlx_op = mlx_unary_op_name(torch_op);
-    if (!mlx_op) return false;
-    if (haganeOpsTapeRecording()) return false;  // capture records via MLX
-    if (iter.ninputs() != 1) return false;
-    if (!haganeOpsVendorElementwiseAvailable()) return false;
+    if (!mlx_op) return decline(R, torch_op, "no_mlx_name");
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (iter.ninputs() != 1) return decline(R, torch_op, "ninputs");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, torch_op, "corpus_unavailable");
 
     // unary_v is flat and unbroadcast: one linear index into each operand.
-    if (!iter.is_contiguous()) return false;
+    if (!iter.is_contiguous()) return decline(R, torch_op, "iter_not_contiguous");
 
     // Require in dtype == out dtype. MLX names a unary kernel by BOTH, so a
     // widening or bool-producing variant is a DIFFERENT kernel; refusing here
     // means the name we build is always the one we mean. logical_not over a
     // float input lands here (bool out, float in) and correctly declines.
     const auto st = iter.dtype(0);
-    if (iter.dtype(1) != st) return false;
+    if (iter.dtype(1) != st)
+        return decline_dtypes(R, torch_op, "in_out_dtype_differ", iter.dtype(1), st);
     const int dt = hagane_vendor_dtype(st);
-    if (dt < 0) return false;
+    if (dt < 0) return decline(R, torch_op, "dtype");
 
-    if (iter.tensor(1).sizes() != iter.tensor(0).sizes()) return false;
+    if (iter.tensor(1).sizes() != iter.tensor(0).sizes())
+        return decline(R, torch_op, "operand_broadcast");
 
     const int64_t N = iter.numel();
     if (N <= 0) return true;                      // nothing to compute
-    if (N > static_cast<int64_t>(UINT32_MAX)) return false;
+    if (N > static_cast<int64_t>(UINT32_MAX)) return decline(R, torch_op, "numel_too_big");
 
     if (haganeOpsVendorUnary(mlx_op, dt, dt, iter.data_ptr(1), iter.data_ptr(0), N)
         != HAGANE_OPS_SUCCESS)
-        return false;
+        return decline(R, torch_op, "kernel_dispatch");
     note_native_launch(std::string("mlx:") + mlx_op);
     return true;
 }
@@ -1503,21 +1576,26 @@ inline bool vendor_scalar_bytes_of(const c10::Scalar& v, c10::ScalarType st,
 // a leading broadcast (2) and an interior one like [B,1,L,S] (3).
 inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
                                    const c10::Scalar& value) {
-    if (!vendor_elementwise_route_enabled()) return false;
-    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
-    if (!haganeOpsVendorElementwiseAvailable()) return false;
+    constexpr const char* R = "masked_fill";
+    route_enter(R, nullptr);
+    if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, nullptr, "corpus_unavailable");
 
-    if (mask.scalar_type() != c10::ScalarType::Bool) return false;
-    if (!self.is_contiguous() || !mask.is_contiguous()) return false;
+    if (mask.scalar_type() != c10::ScalarType::Bool)
+        return decline(R, nullptr, "mask_not_bool");
+    if (!self.is_contiguous()) return decline(R, nullptr, "self_not_contiguous");
+    if (!mask.is_contiguous()) return decline(R, nullptr, "mask_not_contiguous");
     const int dt = hagane_vendor_dtype(self.scalar_type());
-    if (dt < 0) return false;
+    if (dt < 0) return decline(R, nullptr, "dtype");
     if (self.numel() <= 0) return true;           // nothing to fill
 
     const auto ssz = self.sizes();
     const auto msz = mask.sizes();
     const int64_t n = static_cast<int64_t>(ssz.size());
     const int64_t mn = static_cast<int64_t>(msz.size());
-    if (mn > n) return false;                     // mask would widen the output
+    if (mn > n) return decline(R, nullptr, "mask_rank_gt_self");
 
     // Mask strides in the OUTPUT's index space, right-aligned. mask is
     // contiguous, so its own strides are the running products of its sizes.
@@ -1528,7 +1606,7 @@ inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
             const int64_t i = j + (n - mn);
             if (msz[j] == ssz[i])      mstride_of_dim[i] = acc;
             else if (msz[j] == 1)      mstride_of_dim[i] = 0;
-            else                       return false;   // not broadcastable
+            else                       return decline(R, nullptr, "mask_not_broadcastable");
             acc *= msz[j];
         }
     }
@@ -1543,19 +1621,20 @@ inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
             ext[ng - 1] *= e;
             str[ng - 1] = s;
         } else {
-            if (ng == 8) return false;
+            if (ng == 8) return decline(R, nullptr, "groups_gt8");
             ext[ng] = e; str[ng] = s; ++ng;
         }
     }
     if (ng == 0) { ext[0] = 1; str[0] = 0; ng = 1; }   // all dims were 1
-    if (ng > 3) return false;                          // beyond g3_
+    if (ng > 3) return decline(R, nullptr, "groups_gt3");   // beyond g3_
 
     uint64_t bits = 0;
-    if (!vendor_scalar_bytes_of(value, self.scalar_type(), &bits)) return false;
+    if (!vendor_scalar_bytes_of(value, self.scalar_type(), &bits))
+        return decline(R, nullptr, "scalar_dtype");
 
     if (haganeOpsVendorMaskedFill(dt, mask.const_data_ptr(), self.data_ptr(),
                                   bits, ext, str, ng) != HAGANE_OPS_SUCCESS)
-        return false;
+        return decline(R, nullptr, "kernel_dispatch");
     note_native_launch("mlx:Select");
     return true;
 }
@@ -1565,31 +1644,38 @@ inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
 template <typename TensorList>
 inline bool try_vendor_cat(const TensorList& tensors,
                            int64_t dim, const at::Tensor& result) {
-    if (!vendor_elementwise_route_enabled()) return false;
-    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
-    if (!haganeOpsVendorElementwiseAvailable()) return false;
-    if (!result.is_contiguous() || result.numel() <= 0) return false;
+    constexpr const char* R = "cat";
+    route_enter(R, nullptr);
+    if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, nullptr, "corpus_unavailable");
+    if (!result.is_contiguous()) return decline(R, nullptr, "out_not_contiguous");
+    if (result.numel() <= 0) return decline(R, nullptr, "out_empty");
 
     const int dt = hagane_vendor_dtype(result.scalar_type());
-    if (dt < 0) return false;
+    if (dt < 0) return decline(R, nullptr, "dtype");
     const int64_t n = static_cast<int64_t>(result.dim());
     if (dim < 0) dim += n;
-    if (dim < 0 || dim >= n) return false;
+    if (dim < 0 || dim >= n) return decline(R, nullptr, "dim_out_of_range");
 
     std::vector<const void*> srcs;
     std::vector<int64_t> dims;
     for (const auto& t_ref : tensors) {
         const at::Tensor& t = t_ref;
         if (t.numel() == 0) continue;             // legacy empties add nothing
-        if (t.scalar_type() != result.scalar_type()) return false;
-        if (!t.is_contiguous()) return false;
-        if (t.dim() != n) return false;
+        if (t.scalar_type() != result.scalar_type())
+            return decline_dtypes(R, nullptr, "input_dtype_differs",
+                                  t.scalar_type(), result.scalar_type());
+        if (!t.is_contiguous()) return decline(R, nullptr, "input_not_contiguous");
+        if (t.dim() != n) return decline(R, nullptr, "input_rank_differs");
         for (int64_t i = 0; i < n; ++i)
-            if (i != dim && t.size(i) != result.size(i)) return false;
+            if (i != dim && t.size(i) != result.size(i))
+                return decline(R, nullptr, "input_shape_mismatch");
         srcs.push_back(t.const_data_ptr());
         dims.push_back(t.size(dim));
     }
-    if (srcs.empty()) return false;
+    if (srcs.empty()) return decline(R, nullptr, "all_inputs_empty");
 
     int64_t outer = 1, inner = 1;
     for (int64_t i = 0; i < dim; ++i) outer *= result.size(i);
@@ -1599,7 +1685,7 @@ inline bool try_vendor_cat(const TensorList& tensors,
                            static_cast<int32_t>(srcs.size()),
                            result.data_ptr(), outer, inner,
                            result.size(dim)) != HAGANE_OPS_SUCCESS)
-        return false;
+        return decline(R, nullptr, "kernel_dispatch");
     note_native_launch("mlx:copy_gg");
     return true;
 }
@@ -1621,22 +1707,26 @@ inline bool try_vendor_cat(const TensorList& tensors,
 // broadcast source (stride 0) is fine. Anything else declines to the existing
 // path, which stays byte-for-byte what it was.
 inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
-    if (!vendor_elementwise_route_enabled()) return false;
-    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
-    if (!haganeOpsVendorElementwiseAvailable()) return false;
+    constexpr const char* R = "copy";
+    route_enter(R, nullptr);
+    if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, nullptr, "corpus_unavailable");
 
-    if (!dst.is_cuda() || !src.is_cuda()) return false;
-    if (!dst.is_contiguous()) return false;
+    if (!dst.is_cuda() || !src.is_cuda()) return decline(R, nullptr, "not_both_device");
+    if (!dst.is_contiguous()) return decline_layout(R, "dst_not_contiguous", dst);
     const int64_t numel = dst.numel();
-    if (numel <= 0) return false;                 // let the existing path no-op
-    if (src.sizes() != dst.sizes()) return false;
+    if (numel <= 0) return decline(R, nullptr, "empty");
+    if (src.sizes() != dst.sizes()) return decline(R, nullptr, "shape_mismatch");
 
     const int dt_in = hagane_vendor_dtype(src.scalar_type());
     const int dt_out = hagane_vendor_dtype(dst.scalar_type());
-    if (dt_in < 0 || dt_out < 0) return false;
+    if (dt_in < 0) return decline(R, nullptr, "src_dtype");
+    if (dt_out < 0) return decline(R, nullptr, "dst_dtype");
 
     const int64_t n = static_cast<int64_t>(dst.dim());
-    if (n > 16) return false;
+    if (n > 16) return decline(R, nullptr, "rank_gt16");
 
     // A parallel copy has no correct order when it reads what it writes, and no
     // settle can give it one. Decline on ANY byte overlap rather than reason
@@ -1648,12 +1738,12 @@ inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
         int64_t s_last = 0;
         for (int64_t k = 0; k < n; ++k) {
             const int64_t st = src.stride(k);
-            if (st < 0) return false;             // MLX indexes unsigned
+            if (st < 0) return decline(R, nullptr, "negative_stride");
             s_last += (src.size(k) - 1) * st;
         }
         const char* se = sb + (s_last + 1) * src.element_size();
         const char* de = db + numel * dst.element_size();
-        if (sb < de && db < se) return false;
+        if (sb < de && db < se) return decline(R, nullptr, "src_dst_overlap");
     }
 
     // Collapse, outermost first: merge an inner dimension into the group
@@ -1669,7 +1759,7 @@ inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
         else                               { ext[ng] = e; ss[ng] = S; ++ng; }
     }
     if (ng == 0) { ext[0] = 1; ss[0] = 0; ng = 1; }   // every dim was 1
-    if (ng > 8) return false;                          // beyond the corpus nest
+    if (ng > 8) return decline(R, nullptr, "groups_gt8");  // beyond the corpus nest
 
     // A single collapsed group of stride 1 is a flat copy — MLX's cheapest
     // kernel, and the shape a plain copy or a dtype cast actually has.
@@ -1678,7 +1768,7 @@ inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
     if (haganeOpsVendorCopy(dt_in, dt_out, src.const_data_ptr(), dst.data_ptr(),
                             contiguous_src ? 1 : 0, ext, ss, ng)
         != HAGANE_OPS_SUCCESS)
-        return false;
+        return decline(R, nullptr, "kernel_dispatch");
     note_native_launch(contiguous_src ? "mlx:v_copy" : "mlx:g_copy");
     return true;
 }
