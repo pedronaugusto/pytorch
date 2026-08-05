@@ -1244,6 +1244,101 @@ inline bool try_vendor_binary(const char* torch_op, TensorIteratorBase& iter) {
     return true;
 }
 
+// torch's unary stub name -> MLX's operator name. nullptr means "not ours".
+//
+// Availability was checked against the shipped corpus, but availability is not
+// the bar — SEMANTICS are, and two entries here were checked rather than
+// assumed:
+//
+//   round  MLX uses metal::rint, i.e. half-to-even, which is what torch's
+//          round does. Pinned on exact .5 inputs by the gate, because random
+//          data never lands on the tie that would expose a wrong mode.
+//   sign   MLX computes `(x > 0) - (x < 0)`, which yields 0 for NaN. torch does
+//          the same — verified against stock CPU torch, which returns
+//          [-1, 0, 1, 0, 1] for [-2, 0, 3, nan, inf]. (The intuition that torch
+//          propagates NaN here is wrong; sgn only differs for complex, which
+//          hagane_vendor_dtype declines outright.)
+//
+// bitwise_not on BOOL means logical negation in torch, and MLX instantiates
+// BitwiseInvert for integers only — so v_BitwiseInvertbool_bool_ is not in the
+// corpus and the route declines. That decline had to be MADE to work: the
+// registry builds a pipeline eagerly and threw on the missing function, so
+// `~mask` aborted mid-generate instead of falling back. vendor_elementwise's
+// lookup now catches and memoises the miss. Noted because the omission looks
+// like something to "fix", and the fix is the decline, not the mapping.
+//
+// Not carried by MLX at all, so absent by nature: erfc, frac, lgamma, mish,
+// reciprocal, sinc, signbit, trunc, silu, hardsigmoid, exp2.
+inline const char* mlx_unary_op_name(const char* op) {
+    struct Row { const char* torch_name; const char* mlx_name; };
+    static constexpr Row kMap[] = {
+        {"abs",         "Abs"},
+        {"acos",        "ArcCos"},
+        {"asin",        "ArcSin"},
+        {"atan",        "ArcTan"},
+        {"ceil",        "Ceil"},
+        {"cos",         "Cos"},
+        {"cosh",        "Cosh"},
+        {"erf",         "Erf"},
+        {"exp",         "Exp"},
+        {"expm1",       "Expm1"},
+        {"floor",       "Floor"},
+        {"log",         "Log"},
+        {"log10",       "Log10"},
+        {"log1p",       "Log1p"},
+        {"log2",        "Log2"},
+        {"neg",         "Negative"},
+        {"round",       "Round"},
+        {"rsqrt",       "Rsqrt"},
+        {"sigmoid",     "Sigmoid"},
+        {"sign",        "Sign"},
+        {"sgn",         "Sign"},
+        {"sin",         "Sin"},
+        {"sinh",        "Sinh"},
+        {"sqrt",        "Sqrt"},
+        {"tan",         "Tan"},
+        {"tanh",        "Tanh"},
+        {"bitwise_not", "BitwiseInvert"},
+        {"logical_not", "LogicalNot"},
+    };
+    for (const auto& r : kMap)
+        if (std::strcmp(op, r.torch_name) == 0) return r.mlx_name;
+    return nullptr;
+}
+
+inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
+    if (!vendor_elementwise_route_enabled()) return false;
+    const char* mlx_op = mlx_unary_op_name(torch_op);
+    if (!mlx_op) return false;
+    if (haganeOpsTapeRecording()) return false;  // capture records via MLX
+    if (iter.ninputs() != 1) return false;
+    if (!haganeOpsVendorElementwiseAvailable()) return false;
+
+    // unary_v is flat and unbroadcast: one linear index into each operand.
+    if (!iter.is_contiguous()) return false;
+
+    // Require in dtype == out dtype. MLX names a unary kernel by BOTH, so a
+    // widening or bool-producing variant is a DIFFERENT kernel; refusing here
+    // means the name we build is always the one we mean. logical_not over a
+    // float input lands here (bool out, float in) and correctly declines.
+    const auto st = iter.dtype(0);
+    if (iter.dtype(1) != st) return false;
+    const int dt = hagane_vendor_dtype(st);
+    if (dt < 0) return false;
+
+    if (iter.tensor(1).sizes() != iter.tensor(0).sizes()) return false;
+
+    const int64_t N = iter.numel();
+    if (N <= 0) return true;                      // nothing to compute
+    if (N > static_cast<int64_t>(UINT32_MAX)) return false;
+
+    if (haganeOpsVendorUnary(mlx_op, dt, dt, iter.data_ptr(1), iter.data_ptr(0), N)
+        != HAGANE_OPS_SUCCESS)
+        return false;
+    note_native_launch(std::string("mlx:") + mlx_op);
+    return true;
+}
+
 inline bool try_launch_unary_scalar_metallib(const std::string& kname,
                                              TensorIteratorBase& iter, float scalar) {
     if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
@@ -1302,6 +1397,10 @@ inline void hagane_kernel_bridge(TensorIteratorBase& iter) {
                 if (!kname.empty() && try_launch_unary_metallib(kname, iter)) return;
             }
         }
+
+        // #1010: MLX's kernel, our output block. Same position as the binary
+        // family — after our own metallib, before the MLX C-ABI that allocates.
+        if (try_vendor_unary(Cfg.op_name, iter)) return;
 
         auto out = make_ops_tensor_local(iter, 0);
         auto in  = make_ops_tensor_local(iter, 1);
