@@ -1111,6 +1111,14 @@ inline const char* mlx_binary_op_name(const char* op) {
         {"bitwise_xor", "BitwiseXor"},
         {"logical_and", "LogicalAnd"},
         {"logical_or",  "LogicalOr"},
+        // Operand order matches: torch's atan2(input, other) and MLX's
+        // ArcTan2(a, b) both take y first and x second. The gate pins that on
+        // the four quadrants plus the axes, where a swapped pair is a different
+        // angle rather than a small error. `arctan2` is torch's alias for the
+        // same stub, so one row serves both. Float only in the corpus
+        // (float16/float32/bfloat16); an integer compute dtype declines at the
+        // kernel lookup, which is where torch would have promoted anyway.
+        {"atan2",       "ArcTan2"},
     };
     for (const auto& r : kMap)
         if (std::strcmp(op, r.torch_name) == 0) return r.mlx_name;
@@ -1475,13 +1483,21 @@ inline const char* alpha_effective_op(const char* op, const c10::Scalar& alpha) 
 //          propagates NaN here is wrong; sgn only differs for complex, which
 //          hagane_vendor_dtype declines outright.)
 //
-// bitwise_not on BOOL means logical negation in torch, and MLX instantiates
-// BitwiseInvert for integers only — so v_BitwiseInvertbool_bool_ is not in the
-// corpus and the route declines. That decline had to be MADE to work: the
-// registry builds a pipeline eagerly and threw on the missing function, so
-// `~mask` aborted mid-generate instead of falling back. vendor_elementwise's
-// lookup now catches and memoises the miss. Noted because the omission looks
-// like something to "fix", and the fix is the decline, not the mapping.
+// bitwise_not on BOOL is remapped to LogicalNot below, and that is an EXACT
+// mapping rather than a substitution: torch's aten schema defines `~` on a Bool
+// tensor AS logical negation, and MLX spells logical negation LogicalNot. MLX
+// instantiates BitwiseInvert for integers only, so v_BitwiseInvertbool_bool_ is
+// not in the corpus while v_LogicalNotbool_bool_ is — checked against the
+// shipped metallib, not inferred.
+//
+// This reverses an earlier note here which said the decline WAS the fix. That
+// was written before the corpus was searched for the operation under MLX's name
+// for it, and it cost 21 stashes a step. The general form of the mistake: an op
+// missing under one name is not an op MLX lacks. The decline path stays and is
+// still load-bearing — the registry builds a pipeline eagerly and threw on a
+// missing function, so `~mask` used to abort mid-generate instead of falling
+// back, and vendor_elementwise's lookup catching and memoising that miss is
+// what makes "decline honestly" true at all.
 //
 // Not carried by MLX at all, so absent by nature: erfc, frac, lgamma, mish,
 // reciprocal, sinc, signbit, trunc, silu, hardsigmoid, exp2.
@@ -1545,6 +1561,14 @@ inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
         return decline_dtypes(R, torch_op, "in_out_dtype_differ", iter.dtype(1), st);
     const int dt = hagane_vendor_dtype(st);
     if (dt < 0) return decline(R, torch_op, "dtype");
+
+    // `~` on Bool IS logical negation in torch, and that is what MLX calls
+    // LogicalNot — see the note on mlx_unary_op_name. Integer bitwise_not keeps
+    // BitwiseInvert. Remapped here rather than in the table because the table
+    // does not see a dtype, and moving the name lookup down to where it does
+    // would change which decline name fires for every op that is not ours.
+    if (st == c10::ScalarType::Bool && std::strcmp(torch_op, "bitwise_not") == 0)
+        mlx_op = "LogicalNot";
 
     if (iter.tensor(1).sizes() != iter.tensor(0).sizes())
         return decline(R, torch_op, "operand_broadcast");
