@@ -1070,6 +1070,180 @@ inline bool try_launch_binary_metallib(const std::string& kname,
     return true;
 }
 
+// ---- #1010: MLX's elementwise kernels, writing into OUR output --------------
+//
+// Real ROCm hands rocBLAS the caller's pointer and the library writes into it.
+// We were letting MLX allocate, which leaves the bytes with two homes and makes
+// every subsequent free reconcile them — measured at ~173 us/op against 2.8 us
+// for the identical MLX kernel when the output is already allocated. So the
+// kernel stays MLX's; only the destination comes back to us.
+//
+// Routed as a FAMILY. A boundary between an op that owns its output and one
+// that does not costs ~180 us/op (a 16-op chain measures 6.4 us/op all-native,
+// 176.5 all-MLX, 273.1 alternating), so covering half of a chain is worse than
+// covering none of it. Every op below that MLX's corpus carries is routed
+// together; an op whose name does not map keeps its existing path untouched.
+
+// torch's stub name -> MLX's operator name as it appears in the kernel symbol.
+// nullptr means "not ours" — never a guess. MLX's corpus is checked at dispatch
+// (kernel-not-found declines), so a wrong name here cannot produce a wrong
+// answer, only a fallback.
+inline const char* mlx_binary_op_name(const char* op) {
+    struct Row { const char* torch_name; const char* mlx_name; };
+    static constexpr Row kMap[] = {
+        {"add",         "Add"},
+        {"sub",         "Subtract"},
+        {"mul",         "Multiply"},
+        {"div_true",    "Divide"},
+        {"maximum",     "Maximum"},
+        {"minimum",     "Minimum"},
+        {"pow_tt",      "Power"},
+        {"remainder",   "Remainder"},
+        {"eq",          "Equal"},
+        {"ne",          "NotEqual"},
+        {"lt",          "Less"},
+        {"le",          "LessEqual"},
+        {"gt",          "Greater"},
+        {"ge",          "GreaterEqual"},
+        {"bitwise_and", "BitwiseAnd"},
+        {"bitwise_or",  "BitwiseOr"},
+        {"bitwise_xor", "BitwiseXor"},
+        {"logical_and", "LogicalAnd"},
+        {"logical_or",  "LogicalOr"},
+    };
+    for (const auto& r : kMap)
+        if (std::strcmp(op, r.torch_name) == 0) return r.mlx_name;
+    return nullptr;
+}
+
+// torch dtype -> HAGANE_DTYPE_*. -1 for anything with no Metal representation
+// (float64, complex) — declined, never narrowed behind the caller's back.
+inline int hagane_vendor_dtype(c10::ScalarType st) {
+    switch (st) {
+        case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
+        case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
+        case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
+        case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
+        case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
+        case c10::ScalarType::Int:      return HAGANE_DTYPE_INT32;
+        case c10::ScalarType::Long:     return HAGANE_DTYPE_INT64;
+        case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
+        case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
+        default:                        return -1;
+    }
+}
+
+// Raw bytes of a CPU-scalar operand, in the COMPUTE dtype (which is what the
+// kernel's `device const T*` expects). Returns false for a dtype we do not
+// spell, so the caller declines rather than passing garbage.
+inline bool vendor_scalar_bytes(TensorIteratorBase& iter, int arg,
+                                c10::ScalarType st, uint64_t* out) {
+    *out = 0;
+    switch (st) {
+        case c10::ScalarType::Float:
+            { float v = iter.scalar_value<float>(arg);   std::memcpy(out, &v, 4); return true; }
+        case c10::ScalarType::Half:
+            { auto v = iter.scalar_value<c10::Half>(arg);     std::memcpy(out, &v, 2); return true; }
+        case c10::ScalarType::BFloat16:
+            { auto v = iter.scalar_value<c10::BFloat16>(arg); std::memcpy(out, &v, 2); return true; }
+        case c10::ScalarType::Char:
+            { int8_t v = iter.scalar_value<int8_t>(arg);   std::memcpy(out, &v, 1); return true; }
+        case c10::ScalarType::Short:
+            { int16_t v = iter.scalar_value<int16_t>(arg); std::memcpy(out, &v, 2); return true; }
+        case c10::ScalarType::Int:
+            { int32_t v = iter.scalar_value<int32_t>(arg); std::memcpy(out, &v, 4); return true; }
+        case c10::ScalarType::Long:
+            { int64_t v = iter.scalar_value<int64_t>(arg); std::memcpy(out, &v, 8); return true; }
+        case c10::ScalarType::Byte:
+            { uint8_t v = iter.scalar_value<uint8_t>(arg); std::memcpy(out, &v, 1); return true; }
+        case c10::ScalarType::Bool:
+            { bool v = iter.scalar_value<bool>(arg);       std::memcpy(out, &v, 1); return true; }
+        default: return false;
+    }
+}
+
+// Dispatch one MLX elementwise kernel into iter's output. Returns false having
+// encoded NOTHING when anything is outside what we can prove correct.
+// ON by default -- writing into the caller's output IS the intended behaviour.
+// HAGANE_VENDOR_ELEMENTWISE=0 is the escape back to the MLX-allocates path, and
+// is what the route-off gate uses to prove nothing else changed. (#1011 tracks
+// removing this knob once the whole family is settled.)
+inline bool vendor_elementwise_route_enabled() {
+    static const bool on = [] {
+        const char* s = std::getenv("HAGANE_VENDOR_ELEMENTWISE");
+        return !(s && s[0] == '0');
+    }();
+    return on;
+}
+
+inline bool try_vendor_binary(const char* torch_op, TensorIteratorBase& iter) {
+    if (!vendor_elementwise_route_enabled()) return false;
+    const char* mlx_op = mlx_binary_op_name(torch_op);
+    if (!mlx_op) return false;
+    if (haganeOpsTapeRecording()) return false;  // capture records via MLX
+    if (iter.ninputs() != 2) return false;
+    if (!haganeOpsVendorElementwiseAvailable()) return false;
+
+    // The vv_/sv_/vs_ kernels are flat and unbroadcast: one linear index into
+    // each operand. So every operand must be contiguous and the same shape as
+    // the output, and the compute dtype must be the storage dtype.
+    if (!iter.is_contiguous()) return false;
+    const auto compute = iter.common_dtype();
+    const int dt = hagane_vendor_dtype(compute);
+    if (dt < 0) return false;
+
+    const int64_t N = iter.numel();
+    if (N <= 0) return true;                      // nothing to compute
+    if (N > static_cast<int64_t>(UINT32_MAX)) return false;
+
+    const void* ptrs[2] = {nullptr, nullptr};
+    bool is_scalar[2] = {false, false};
+    uint64_t scalars[2] = {0, 0};
+    for (int i = 0; i < 2; i++) {
+        const int arg = i + 1;
+        if (iter.is_cpu_scalar(arg)) {
+            if (!vendor_scalar_bytes(iter, arg, compute, &scalars[i])) return false;
+            is_scalar[i] = true;
+            continue;
+        }
+        // A device operand must already be in the compute dtype and full-sized:
+        // a promoted or broadcast operand would need MLX's g*_ strided kernels,
+        // which this path does not select.
+        if (iter.tensor(arg).scalar_type() != compute) return false;
+        if (iter.tensor(arg).sizes() != iter.tensor(0).sizes()) return false;
+        ptrs[i] = iter.data_ptr(arg);
+    }
+    if (is_scalar[0] && is_scalar[1]) return false;
+    // A comparison writes bool while computing in the input dtype; the kernel
+    // handles that, but the output BUFFER must then be bool-sized. Only accept
+    // out dtype == compute dtype, or bool out for a comparison.
+    const auto out_st = iter.dtype(0);
+    if (out_st != compute && out_st != c10::ScalarType::Bool) return false;
+    if (out_st == c10::ScalarType::Bool && compute != c10::ScalarType::Bool) {
+        // MLX names these by the INPUT dtype and writes bool — supported, but
+        // only for the ops that actually produce bool.
+        static constexpr const char* kBoolOut[] = {
+            "Equal", "NotEqual", "Less", "LessEqual", "Greater", "GreaterEqual"};
+        bool ok = false;
+        for (const char* b : kBoolOut) if (std::strcmp(mlx_op, b) == 0) ok = true;
+        if (!ok) return false;
+    }
+
+    // The output span must come from the OUTPUT dtype: a comparison computes in
+    // the input dtype and writes bool, and sizing the span from the input would
+    // supersede/mark bytes past the end of the output — corrupting whatever
+    // tensor's stash sits after it.
+    const int dt_out = hagane_vendor_dtype(out_st);
+    if (dt_out < 0) return false;
+    if (haganeOpsVendorBinary(mlx_op, dt, dt_out, ptrs[0], ptrs[1], iter.data_ptr(0), N,
+                              is_scalar[0] ? 1 : 0, is_scalar[1] ? 1 : 0,
+                              scalars[0], scalars[1]) != HAGANE_OPS_SUCCESS)
+        return false;
+    note_native_launch(std::string("mlx:") + mlx_op);
+
+    return true;
+}
+
 inline bool try_launch_unary_scalar_metallib(const std::string& kname,
                                              TensorIteratorBase& iter, float scalar) {
     if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
@@ -1169,6 +1343,11 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
             if (!kname.empty() && try_launch_binary_metallib(kname, iter)) return;
         }
     }
+
+    // #1010: MLX's kernel, our output block. Tried after our own metallib (that
+    // one is already ours end-to-end) and before the MLX C-ABI (which is the
+    // path that makes MLX allocate).
+    if (try_vendor_binary(Cfg.op_name, iter)) return;
 
     if constexpr (Cfg.c_abi_fn == nullptr) {
         // No MLX path (e.g. integer gcd/lcm): the metallib is the only device
@@ -1299,6 +1478,12 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
             return;
         }
     }
+
+    // #1010: alpha != 1 means out = a + alpha*b, which is a DIFFERENT kernel
+    // than MLX's Add. Route only the alpha == 1 case; anything else keeps the
+    // MLX path. Dropping alpha here would be exactly the silent-wrong class the
+    // project forbids.
+    if (alpha.toDouble() == 1.0 && try_vendor_binary(Cfg.op_name, iter)) return;
 
     auto out = make_ops_tensor_local(iter, 0);
     at::Tensor sa, sb;
