@@ -2076,6 +2076,7 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
 }
 
 void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
+  if (hagane_dispatch::detail::try_vendor_fill(iter, value)) return;
   auto out = make_ops_tensor(iter, 0);
   if (haganeOpsFill(&out, value.toDouble()) != HAGANE_OPS_SUCCESS) {
     HAGANE_BEFORE_RAW_READ();

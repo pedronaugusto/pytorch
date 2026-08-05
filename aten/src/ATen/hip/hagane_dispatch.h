@@ -1729,6 +1729,47 @@ inline bool try_vendor_cat(const TensorList& tensors,
     return true;
 }
 
+// fill_ — MLX's copy_s, whose source is one scalar read for every element.
+//
+// The largest single stash in ARDY: 648 per step (#1024), which is 37% of what
+// is left. fill_stub is one funnel, so this covers zeros/ones/zeros_like/full
+// AND every at::empty + output.fill_(v) nested inside a composite — torch's own
+// constant_pad_nd, which is how upstream SDPA pads an attention mask, is one of
+// those. The per-op stash table could not see any of the nested ones; they were
+// charged to whatever aten op the dispatch mode last saw.
+//
+// The value crosses as a double for the same reason haganeOpsFill takes one, and
+// the runtime converts it by exactly fill_scalar's rule so route-on and
+// route-off produce identical bits.
+inline bool try_vendor_fill(TensorIteratorBase& iter, const c10::Scalar& value) {
+    constexpr const char* R = "fill";
+    route_enter(R, nullptr);
+    if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, nullptr, "corpus_unavailable");
+    if (iter.noutputs() != 1) return decline(R, nullptr, "noutputs");
+
+    const at::Tensor& out = iter.tensor(0);
+    // copy_s indexes the output linearly. A strided fill would need a kernel MLX
+    // does not carry, and composing one out of gg*_copy plus a scratch scalar
+    // would be inventing it — decline instead.
+    if (!out.is_contiguous()) return decline_layout(R, "out_not_contiguous", out);
+
+    const int dt = hagane_vendor_dtype(out.scalar_type());
+    if (dt < 0) return decline(R, nullptr, "dtype");
+
+    const int64_t N = iter.numel();
+    if (N <= 0) return true;                      // nothing to fill
+    if (N > static_cast<int64_t>(UINT32_MAX)) return decline(R, nullptr, "numel_too_big");
+
+    if (haganeOpsVendorFill(dt, out.data_ptr(), N, value.toDouble())
+        != HAGANE_OPS_SUCCESS)
+        return decline(R, nullptr, "kernel_dispatch");
+    note_native_launch("mlx:s_copy");
+    return true;
+}
+
 // copy_ — a strided read laid down contiguously in the caller's block, through
 // MLX's copy corpus.
 //
