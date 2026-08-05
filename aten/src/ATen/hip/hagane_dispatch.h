@@ -1176,7 +1176,7 @@ inline bool vendor_elementwise_route_enabled() {
     return on;
 }
 
-inline bool try_vendor_binary(const char* torch_op, TensorIteratorBase& iter) {
+inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& iter) {
     if (!vendor_elementwise_route_enabled()) return false;
     const char* mlx_op = mlx_binary_op_name(torch_op);
     if (!mlx_op) return false;
@@ -1242,6 +1242,129 @@ inline bool try_vendor_binary(const char* torch_op, TensorIteratorBase& iter) {
     note_native_launch(std::string("mlx:") + mlx_op);
 
     return true;
+}
+
+// The same binary op when an operand is BROADCAST, EXPANDED or non-contiguous —
+// which is most of what a model does with one, and all of which the flat path
+// above declines because its kernels index every operand with one linear index.
+//
+// MLX's g1_/g2_/g3_ variants take a stride per operand instead. The operand's
+// stride along each of the output's dimensions comes straight from the tensor
+// (right-aligned, 0 where it broadcasts), so an expanded operand needs no
+// materialisation and a transposed one needs no copy. Adjacent dimensions then
+// collapse wherever BOTH operands stay linear across them, which keeps the
+// common cases inside the three dimensions the corpus carries.
+//
+// The OUTPUT must be contiguous — the kernel writes it with a linear index.
+inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) {
+    if (!vendor_elementwise_route_enabled()) return false;
+    const char* mlx_op = mlx_binary_op_name(torch_op);
+    if (!mlx_op) return false;
+    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
+    if (iter.ninputs() != 2) return false;
+    if (!haganeOpsVendorElementwiseAvailable()) return false;
+
+    const auto compute = iter.common_dtype();
+    const int dt = hagane_vendor_dtype(compute);
+    if (dt < 0) return false;
+    const auto out_st = iter.dtype(0);
+    if (out_st != compute && out_st != c10::ScalarType::Bool) return false;
+    if (out_st == c10::ScalarType::Bool && compute != c10::ScalarType::Bool) {
+        static constexpr const char* kBoolOut[] = {
+            "Equal", "NotEqual", "Less", "LessEqual", "Greater", "GreaterEqual"};
+        bool ok = false;
+        for (const char* b : kBoolOut) if (std::strcmp(mlx_op, b) == 0) ok = true;
+        if (!ok) return false;
+    }
+    const int dt_out = hagane_vendor_dtype(out_st);
+    if (dt_out < 0) return false;
+
+    const at::Tensor& out = iter.tensor(0);
+    if (!out.is_contiguous()) return false;
+    const int64_t N = iter.numel();
+    if (N <= 0) return true;                      // nothing to compute
+    if (N > static_cast<int64_t>(INT32_MAX)) return false;
+
+    const auto osz = out.sizes();
+    const int64_t n = static_cast<int64_t>(osz.size());
+    if (n > 16) return false;
+
+    // Each operand's stride along every OUTPUT dimension, right-aligned.
+    int64_t st[2][16];
+    const void* ptrs[2] = {nullptr, nullptr};
+    bool is_scalar[2] = {false, false};
+    uint64_t scalars[2] = {0, 0};
+    for (int i = 0; i < 2; i++) {
+        const int arg = i + 1;
+        if (iter.is_cpu_scalar(arg)) {
+            if (!vendor_scalar_bytes(iter, arg, compute, &scalars[i])) return false;
+            is_scalar[i] = true;
+            for (int64_t k = 0; k < n; ++k) st[i][k] = 0;
+            continue;
+        }
+        const at::Tensor& t = iter.tensor(arg);
+        if (t.scalar_type() != compute) return false;
+        const int64_t tn = t.dim();
+        if (tn > n) return false;
+        for (int64_t k = 0; k < n; ++k) {
+            const int64_t j = k - (n - tn);
+            if (j < 0)                    { st[i][k] = 0; continue; }
+            if (t.size(j) == osz[k])        st[i][k] = t.stride(j);
+            else if (t.size(j) == 1)        st[i][k] = 0;
+            else return false;            // not broadcastable to the output
+            if (st[i][k] < 0) return false;   // MLX indexes unsigned
+        }
+        // The tensor's own base, since the strides above are the tensor's own.
+        ptrs[i] = t.const_data_ptr();
+    }
+    if (is_scalar[0] && is_scalar[1]) return false;
+
+    // Collapse: merge an inner dimension into the group outside it only when
+    // EVERY operand's index stays linear across the pair.
+    int64_t ext[16], sa[16], sb[16];
+    int ng = 0;
+    for (int64_t k = 0; k < n; ++k) {
+        if (osz[k] == 1) continue;
+        const int64_t e = osz[k], A = st[0][k], B = st[1][k];
+        if (ng > 0 && sa[ng - 1] == A * e && sb[ng - 1] == B * e) {
+            ext[ng - 1] *= e; sa[ng - 1] = A; sb[ng - 1] = B;
+        } else {
+            ext[ng] = e; sa[ng] = A; sb[ng] = B; ++ng;
+        }
+    }
+    if (ng == 0) { ext[0] = 1; sa[0] = 0; sb[0] = 0; ng = 1; }   // all dims were 1
+    if (ng > 3) return false;                                    // beyond g3_
+
+    if (haganeOpsVendorBinaryG(mlx_op, dt, dt_out, ptrs[0], ptrs[1],
+                               iter.data_ptr(0),
+                               is_scalar[0] ? 1 : 0, is_scalar[1] ? 1 : 0,
+                               scalars[0], scalars[1],
+                               ext, sa, sb, ng) != HAGANE_OPS_SUCCESS)
+        return false;
+    note_native_launch(std::string("mlx:g_") + mlx_op);
+    return true;
+}
+
+// The flat kernels first — they are cheaper to set up and cover the shape most
+// ops actually have; the strided ones catch everything else.
+inline bool try_vendor_binary(const char* torch_op, TensorIteratorBase& iter) {
+    return try_vendor_binary_flat(torch_op, iter)
+        || try_vendor_binary_g(torch_op, iter);
+}
+
+// Which MLX op an alpha-carrying stub actually computes. nullptr means "no
+// single kernel does this", and the caller keeps the MLX path.
+inline const char* alpha_effective_op(const char* op, const c10::Scalar& alpha) {
+    const double a = alpha.toDouble();
+    if (a == 1.0) return op;
+    if (a == -1.0) {
+        // Exact for every dtype MLX carries: integer wraparound is the same
+        // two's-complement subtraction on both sides, and there is no rounding
+        // step to differ on.
+        if (std::strcmp(op, "add") == 0) return "sub";
+        if (std::strcmp(op, "sub") == 0) return "add";
+    }
+    return nullptr;
 }
 
 // torch's unary stub name -> MLX's operator name. nullptr means "not ours".
@@ -1720,11 +1843,18 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
         }
     }
 
-    // #1010: alpha != 1 means out = a + alpha*b, which is a DIFFERENT kernel
-    // than MLX's Add. Route only the alpha == 1 case; anything else keeps the
-    // MLX path. Dropping alpha here would be exactly the silent-wrong class the
-    // project forbids.
-    if (alpha.toDouble() == 1.0 && try_vendor_binary(Cfg.op_name, iter)) return;
+    // #1010: alpha is part of the kernel. out = a + alpha*b is NOT MLX's Add
+    // for a general alpha, and dropping it here would be exactly the
+    // silent-wrong class the project forbids. But two alphas ARE another op
+    // exactly: a + (-1)*b is Subtract, and a - (-1)*b is Add.
+    //
+    // That identity is not a nicety — it is the whole subtraction family.
+    // torch's sub_out calls add_stub(-alpha) (BinaryOps.cpp), so EVERY
+    // subtraction arrives here as add with alpha = -1 and sub_stub is never
+    // reached. Without this, `a - b` could not route at all: ARDY's step showed
+    // sub.Tensor at 187 MLX-owned dispatches and zero owned.
+    if (const char* eop = alpha_effective_op(Cfg.op_name, alpha))
+        if (try_vendor_binary(eop, iter)) return;
 
     auto out = make_ops_tensor_local(iter, 0);
     at::Tensor sa, sb;
