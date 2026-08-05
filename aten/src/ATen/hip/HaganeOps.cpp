@@ -895,6 +895,10 @@ C10_EXPORT Tensor index_select_cuda(
 
 C10_EXPORT Tensor& masked_fill__cuda(
     Tensor& self, const Tensor& mask, const Scalar& value) {
+  // #1010: MLX's Select, writing self's own block. Declines (having encoded
+  // nothing) for a mask this cannot prove broadcastable, or a dtype/shape the
+  // corpus does not carry — then the MLX path below runs unchanged.
+  if (hagane_dispatch::detail::try_vendor_masked_fill(self, mask, value)) return self;
   auto self_d = make_tensor_desc(self);
   auto mask_d = make_tensor_desc(mask);
   if (haganeOpsMaskedFill(&self_d, &mask_d, value.toFloat()) != HAGANE_OPS_SUCCESS) {
@@ -7083,6 +7087,13 @@ TORCH_IMPL_FUNC(cat_out_cuda)
  MemoryFormat memory_format, const Tensor& result) {
   if (result.numel() == 0) return;
   auto materialized = tensors.materialize();
+
+  // #1010: MLX's copy_gg, straight into the output torch just allocated. Every
+  // input is a strided copy into a slice of it, so there is no MLX-owned
+  // intermediate to reconcile. Declines (having encoded nothing) on a
+  // non-contiguous input, a mixed dtype, or a dtype the corpus does not carry;
+  // the haganeOpsCat path below then runs exactly as before.
+  if (hagane_dispatch::detail::try_vendor_cat(materialized, dim, result)) return;
 
   // Sprint E.2 — fused-cat parity. Mirrors ROCm/clr where aten::cat
   // dispatches to a single fused kernel; the original narrow+copy_ loop

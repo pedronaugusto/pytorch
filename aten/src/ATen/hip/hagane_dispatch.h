@@ -1339,6 +1339,148 @@ inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
     return true;
 }
 
+// Raw bytes of a Scalar in `st`'s own representation — the same convention
+// vendor_scalar_bytes uses, for a caller that has a Scalar rather than an
+// iterator operand.
+inline bool vendor_scalar_bytes_of(const c10::Scalar& v, c10::ScalarType st,
+                                   uint64_t* out) {
+    *out = 0;
+    switch (st) {
+        case c10::ScalarType::Float:
+            { float x = v.to<float>();             std::memcpy(out, &x, 4); return true; }
+        case c10::ScalarType::Half:
+            { auto x = v.to<c10::Half>();          std::memcpy(out, &x, 2); return true; }
+        case c10::ScalarType::BFloat16:
+            { auto x = v.to<c10::BFloat16>();      std::memcpy(out, &x, 2); return true; }
+        case c10::ScalarType::Char:
+            { int8_t x = v.to<int8_t>();           std::memcpy(out, &x, 1); return true; }
+        case c10::ScalarType::Short:
+            { int16_t x = v.to<int16_t>();         std::memcpy(out, &x, 2); return true; }
+        case c10::ScalarType::Int:
+            { int32_t x = v.to<int32_t>();         std::memcpy(out, &x, 4); return true; }
+        case c10::ScalarType::Long:
+            { int64_t x = v.to<int64_t>();         std::memcpy(out, &x, 8); return true; }
+        case c10::ScalarType::Byte:
+            { uint8_t x = v.to<uint8_t>();         std::memcpy(out, &x, 1); return true; }
+        case c10::ScalarType::Bool:
+            { bool x = v.to<bool>();               std::memcpy(out, &x, 1); return true; }
+        default: return false;
+    }
+}
+
+// masked_fill_ through MLX's Select. self is contiguous and is both operands;
+// the mask may be broadcast, which is the whole reason this uses MLX's strided
+// g*_ variants instead of the flat ones the binary/unary routes use.
+//
+// The mask's stride along each of self's dimensions is 0 where it broadcasts.
+// Adjacent dimensions then collapse whenever the mask index stays linear across
+// them (outer stride == inner stride x inner extent), which is what turns a
+// [B,H,L,S] tensor with an [L,S] mask into two dimensions rather than four. MLX
+// carries g1_/g2_/g3_, so three groups is the limit — enough for same-shape (1),
+// a leading broadcast (2) and an interior one like [B,1,L,S] (3).
+inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
+                                   const c10::Scalar& value) {
+    if (!vendor_elementwise_route_enabled()) return false;
+    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
+    if (!haganeOpsVendorElementwiseAvailable()) return false;
+
+    if (mask.scalar_type() != c10::ScalarType::Bool) return false;
+    if (!self.is_contiguous() || !mask.is_contiguous()) return false;
+    const int dt = hagane_vendor_dtype(self.scalar_type());
+    if (dt < 0) return false;
+    if (self.numel() <= 0) return true;           // nothing to fill
+
+    const auto ssz = self.sizes();
+    const auto msz = mask.sizes();
+    const int64_t n = static_cast<int64_t>(ssz.size());
+    const int64_t mn = static_cast<int64_t>(msz.size());
+    if (mn > n) return false;                     // mask would widen the output
+
+    // Mask strides in the OUTPUT's index space, right-aligned. mask is
+    // contiguous, so its own strides are the running products of its sizes.
+    std::vector<int64_t> mstride_of_dim(n, 0);
+    {
+        int64_t acc = 1;
+        for (int64_t j = mn - 1; j >= 0; --j) {
+            const int64_t i = j + (n - mn);
+            if (msz[j] == ssz[i])      mstride_of_dim[i] = acc;
+            else if (msz[j] == 1)      mstride_of_dim[i] = 0;
+            else                       return false;   // not broadcastable
+            acc *= msz[j];
+        }
+    }
+
+    // Collapse, outermost first. A dimension of extent 1 contributes nothing.
+    int64_t ext[8], str[8];
+    int ng = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (ssz[i] == 1) continue;
+        const int64_t e = ssz[i], s = mstride_of_dim[i];
+        if (ng > 0 && str[ng - 1] == s * e) {     // index stays linear: merge
+            ext[ng - 1] *= e;
+            str[ng - 1] = s;
+        } else {
+            if (ng == 8) return false;
+            ext[ng] = e; str[ng] = s; ++ng;
+        }
+    }
+    if (ng == 0) { ext[0] = 1; str[0] = 0; ng = 1; }   // all dims were 1
+    if (ng > 3) return false;                          // beyond g3_
+
+    uint64_t bits = 0;
+    if (!vendor_scalar_bytes_of(value, self.scalar_type(), &bits)) return false;
+
+    if (haganeOpsVendorMaskedFill(dt, mask.const_data_ptr(), self.data_ptr(),
+                                  bits, ext, str, ng) != HAGANE_OPS_SUCCESS)
+        return false;
+    note_native_launch("mlx:Select");
+    return true;
+}
+
+// cat through MLX's copy_gg: every input strided-copied straight into the
+// output torch already allocated, so nothing on this path is MLX-owned.
+template <typename TensorList>
+inline bool try_vendor_cat(const TensorList& tensors,
+                           int64_t dim, const at::Tensor& result) {
+    if (!vendor_elementwise_route_enabled()) return false;
+    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
+    if (!haganeOpsVendorElementwiseAvailable()) return false;
+    if (!result.is_contiguous() || result.numel() <= 0) return false;
+
+    const int dt = hagane_vendor_dtype(result.scalar_type());
+    if (dt < 0) return false;
+    const int64_t n = static_cast<int64_t>(result.dim());
+    if (dim < 0) dim += n;
+    if (dim < 0 || dim >= n) return false;
+
+    std::vector<const void*> srcs;
+    std::vector<int64_t> dims;
+    for (const auto& t_ref : tensors) {
+        const at::Tensor& t = t_ref;
+        if (t.numel() == 0) continue;             // legacy empties add nothing
+        if (t.scalar_type() != result.scalar_type()) return false;
+        if (!t.is_contiguous()) return false;
+        if (t.dim() != n) return false;
+        for (int64_t i = 0; i < n; ++i)
+            if (i != dim && t.size(i) != result.size(i)) return false;
+        srcs.push_back(t.const_data_ptr());
+        dims.push_back(t.size(dim));
+    }
+    if (srcs.empty()) return false;
+
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= result.size(i);
+    for (int64_t i = dim + 1; i < n; ++i) inner *= result.size(i);
+
+    if (haganeOpsVendorCat(dt, srcs.data(), dims.data(),
+                           static_cast<int32_t>(srcs.size()),
+                           result.data_ptr(), outer, inner,
+                           result.size(dim)) != HAGANE_OPS_SUCCESS)
+        return false;
+    note_native_launch("mlx:copy_gg");
+    return true;
+}
+
 inline bool try_launch_unary_scalar_metallib(const std::string& kname,
                                              TensorIteratorBase& iter, float scalar) {
     if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
