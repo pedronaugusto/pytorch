@@ -7,6 +7,7 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/native/TensorFactories.h>
+#include <ATen/native/RangeUtils.h>   // #1010 1.6 — upstream's own arange bounds + size rule
 #include <ATen/native/DispatchStub.h>
 #include <ATen/native/Copy.h>
 #include <ATen/native/Fill.h>
@@ -812,18 +813,56 @@ C10_EXPORT void launch_median_kernel(
 // Level B: Tensor creation (from excluded .hip files)
 // ---------------------------------------------------------------------------
 
+// haganeOpsArange takes DOUBLES, and mx::arange derives its device-side step as
+// (start + step) - start in the output dtype. Both are exact only while every
+// value of the range is a double-representable integer: past 2^53 the start
+// rounds and the step can collapse to zero, so arange(2^53+1, 2^53+5) came back
+// as four copies of 2^53 and arange(2^62, 2^62+6) as nothing at all. Ask that
+// entry only what it can answer — the host fallback is exact and takes over.
+// The vendor route in front of it has no such limit; it takes the Scalar.
+static bool arange_double_is_exact(const Scalar& start, const Scalar& step,
+                                   int64_t size) {
+  if (!start.isIntegral(/*includeBool=*/false) ||
+      !step.isIntegral(/*includeBool=*/false))
+    return true;                        // a float Scalar IS its own double
+  constexpr int64_t kExact = int64_t{1} << 53;
+  const int64_t s = start.to<int64_t>();
+  const int64_t p = step.to<int64_t>();
+  int64_t span = 0, last = 0;
+  if (__builtin_mul_overflow(p, size - 1, &span)) return false;
+  if (__builtin_add_overflow(s, span, &last)) return false;
+  return s >= -kExact && s <= kExact && last >= -kExact && last <= kExact;
+}
+
 C10_EXPORT Tensor& arange_cuda_out(
     const Scalar& start, const Scalar& end, const Scalar& step, Tensor& result) {
-  double sd = start.toDouble(), ed = end.toDouble(), st = step.toDouble();
-  TORCH_CHECK(st != 0, "step must be nonzero");
-  TORCH_CHECK((st > 0 && sd <= ed) || (st < 0 && sd >= ed),
-              "upper bound and larger bound inconsistent with step sign");
-  int64_t size = static_cast<int64_t>(std::ceil((ed - sd) / st));
-  if (size < 0) size = 0;
-  result.resize_({size});
+  // Upstream's own bounds check and size rule (ATen/native/RangeUtils.h), not a
+  // re-derivation of them. The rule that matters is the int64 branch: computing
+  // the element COUNT in double drifts near 2^53, so arange(2^53+1, 2^53+2)
+  // came out with two elements instead of one. compute_arange_size branches
+  // only on is_same_v<scalar_t, int64_t>, so one non-int64 instantiation stands
+  // in for every other dtype.
+  const int64_t size = result.scalar_type() == c10::ScalarType::Long
+      ? compute_arange_size<int64_t>(start, end, step)
+      : compute_arange_size<int32_t>(start, end, step);
+  if (result.numel() != size) {
+    if (result.numel() > 0)
+      TORCH_WARN("The number of elements in the out tensor of shape ", result.sizes(),
+                 " is ", result.numel(),
+                 " which does not match the computed number of elements ", size,
+                 ". Note that this may occur as a result of rounding error. "
+                 "The out tensor will be resized to a tensor of shape (", size, ",).");
+    result.resize_({size});
+  }
   if (size > 0) {
+    // #1010 1.6 — MLX's arange<T>, dispatched from Hagane's queue straight into
+    // the caller's block. It also takes the Scalars, not doubles: the fallback
+    // below cannot represent an int64 range past 2^53 and silently returns the
+    // same value repeated.
+    if (hagane_dispatch::detail::try_vendor_arange(result, start, step)) return result;
     auto out_d = make_tensor_desc(result);
-    if (haganeOpsArange(&out_d, sd, st) != HAGANE_OPS_SUCCESS) {
+    if (!arange_double_is_exact(start, step, size) ||
+        haganeOpsArange(&out_d, start.toDouble(), step.toDouble()) != HAGANE_OPS_SUCCESS) {
       auto cpu_r = at::arange(start, end, step, result.options().device(c10::kCPU));
       HAGANE_BEFORE_RAW_READ();
       std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
@@ -1678,7 +1717,17 @@ C10_EXPORT Tensor& range_cuda_out(
   int64_t size = static_cast<int64_t>(std::floor((e - s) / st)) + 1;
   result.resize_({size});
   auto rd = make_tensor_desc(result);
-  haganeOpsArange(&rd, s, st);
+  // haganeOpsArange can decline (a range whose values are not separable in
+  // double), and until #1010 1.6 this call ignored that and left the output
+  // uninitialised. It gets the same host fallback arange_cuda_out has.
+  if (size > 0 &&
+      (!arange_double_is_exact(start, step, size) ||
+       haganeOpsArange(&rd, s, st) != HAGANE_OPS_SUCCESS)) {
+    auto cpu_r = at::range(start, end, step, result.options().device(c10::kCPU));
+    HAGANE_BEFORE_RAW_READ();
+    std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(),
+                result.numel() * result.itemsize());
+  }
   return result;
 }
 

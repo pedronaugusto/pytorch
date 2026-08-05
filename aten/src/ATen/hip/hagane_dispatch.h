@@ -1818,6 +1818,81 @@ inline bool try_vendor_fill(TensorIteratorBase& iter, const c10::Scalar& value) 
     return true;
 }
 
+// arange — MLX's arange<T>, out[i] = start + i * step.
+//
+// 84 stashes per ARDY step (#1024), and the entry it replaces is lossy as well
+// as lazy: arange_cuda_out hands haganeOpsArange two doubles, so an int64 range
+// past 2^53 loses its start AND its step (mx::arange derives the step as
+// (start+step)-start in the output dtype, which is 0 once double cannot separate
+// them). torch's own CUDA kernel never goes through double — it takes
+// `start.to<accscalar_t>()` straight off the Scalar — so this route does the
+// same and hands the runtime raw bits.
+//
+// accscalar_t is at::acc_type<scalar_t, true>, read off AccumulateType.h rather
+// than recalled: float32 for Half/BFloat16, int64 for every integer width,
+// itself for Float. The runtime accumulates in it and narrows once.
+//
+//   - Float and the integers run acc == out, one dispatch, the same kernel and
+//     the same immediates mx::arange would have used.
+//   - Half/BFloat16 accumulate in float32 into runtime scratch and narrow with
+//     v_copyfloat32<out>. That is a PARITY FIX, not only a stash removal: MLX's
+//     arangefloat16 accumulates in half, which disagrees with CUDA on 37% of
+//     the elements of a 0.1 step.
+//   - The narrow integers pass int64's value truncated to their own width,
+//     which is what makes one dispatch correct: truncation to N bits is
+//     reduction mod 2^N, and (a + b*c) mod 2^N does not care whether a, b and c
+//     were reduced first. So accumulating in int8 and truncating every step is
+//     the same series CUDA gets by accumulating in int64 and truncating once.
+inline bool try_vendor_arange(at::Tensor& result, const c10::Scalar& start,
+                              const c10::Scalar& step) {
+    constexpr const char* R = "arange";
+    route_enter(R, nullptr);
+    if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, nullptr, "corpus_unavailable");
+
+    // arange<T> indexes its output linearly and MLX carries no strided variant.
+    if (!result.is_contiguous()) return decline_layout(R, "out_not_contiguous", result);
+
+    const c10::ScalarType st = result.scalar_type();
+    // No arange<bool> in the corpus, and torch's own AT_DISPATCH_ALL_TYPES_AND2
+    // does not dispatch Bool either — so this is unreachable, not a gap.
+    if (st == c10::ScalarType::Bool) return decline(R, nullptr, "dtype_bool");
+    const int dt = hagane_vendor_dtype(st);
+    if (dt < 0) return decline(R, nullptr, "dtype");
+
+    const int64_t N = result.numel();
+    if (N <= 0) return true;                      // nothing to write
+    if (N > static_cast<int64_t>(UINT32_MAX)) return decline(R, nullptr, "numel_too_big");
+
+    int acc_dt = dt;
+    uint64_t start_bits = 0, step_bits = 0;
+    if (st == c10::ScalarType::Float || st == c10::ScalarType::Half ||
+        st == c10::ScalarType::BFloat16) {
+        if (st != c10::ScalarType::Float) acc_dt = HAGANE_DTYPE_FLOAT32;
+        const float s = start.to<float>();
+        const float p = step.to<float>();
+        std::memcpy(&start_bits, &s, sizeof(s));
+        std::memcpy(&step_bits, &p, sizeof(p));
+    } else {
+        // accscalar_t is int64 for every integer width; the runtime reads the
+        // low esize(dtype) bytes, which on a little-endian target IS
+        // static_cast<scalar_t>. Same conversion torch does, same throw on a
+        // Scalar that will not fit an int64.
+        const int64_t s = start.to<int64_t>();
+        const int64_t p = step.to<int64_t>();
+        std::memcpy(&start_bits, &s, sizeof(s));
+        std::memcpy(&step_bits, &p, sizeof(p));
+    }
+
+    if (haganeOpsVendorArange(dt, acc_dt, result.data_ptr(), N,
+                              start_bits, step_bits) != HAGANE_OPS_SUCCESS)
+        return decline(R, nullptr, "kernel_dispatch");
+    note_native_launch("mlx:arange");
+    return true;
+}
+
 // copy_ — a strided read laid down contiguously in the caller's block, through
 // MLX's copy corpus.
 //
