@@ -64,6 +64,7 @@
 #include <hagane_ops.h>
 #include <hip/hagane_detail/hagane_kernel_registry.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1641,6 +1642,12 @@ inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
 
 // cat through MLX's copy_gg: every input strided-copied straight into the
 // output torch already allocated, so nothing on this path is MLX-owned.
+//
+// Each input gets its OWN collapsed nest — its strides on one side, the output
+// slice's on the other — which is what makes a strided input free rather than a
+// decline. It was 32 stashes per ARDY step, and the previous shape of this
+// route (one 2-D [outer, run] view per input) could only describe a contiguous
+// one.
 template <typename TensorList>
 inline bool try_vendor_cat(const TensorList& tensors,
                            int64_t dim, const at::Tensor& result) {
@@ -1656,35 +1663,67 @@ inline bool try_vendor_cat(const TensorList& tensors,
     const int dt = hagane_vendor_dtype(result.scalar_type());
     if (dt < 0) return decline(R, nullptr, "dtype");
     const int64_t n = static_cast<int64_t>(result.dim());
+    if (n > 16) return decline(R, nullptr, "rank_gt16");
     if (dim < 0) dim += n;
     if (dim < 0 || dim >= n) return decline(R, nullptr, "dim_out_of_range");
 
+    // The output's own contiguous strides. Every input lands in a SLICE of the
+    // output, and a slice's strides are the output's — only its base moves.
+    int64_t out_stride[16];
+    {
+        int64_t acc = 1;
+        for (int64_t i = n - 1; i >= 0; --i) { out_stride[i] = acc; acc *= result.size(i); }
+    }
+
     std::vector<const void*> srcs;
-    std::vector<int64_t> dims;
+    std::vector<int64_t> dst_offset;
+    std::vector<int32_t> ndims;
+    std::vector<int64_t> ext, ss, ds;
+    int64_t at = 0;                  // running offset along `dim`, in elements of it
     for (const auto& t_ref : tensors) {
         const at::Tensor& t = t_ref;
         if (t.numel() == 0) continue;             // legacy empties add nothing
         if (t.scalar_type() != result.scalar_type())
             return decline_dtypes(R, nullptr, "input_dtype_differs",
                                   t.scalar_type(), result.scalar_type());
-        if (!t.is_contiguous()) return decline(R, nullptr, "input_not_contiguous");
         if (t.dim() != n) return decline(R, nullptr, "input_rank_differs");
         for (int64_t i = 0; i < n; ++i)
             if (i != dim && t.size(i) != result.size(i))
                 return decline(R, nullptr, "input_shape_mismatch");
+
+        // Collapse this input against its destination slice, merging only where
+        // BOTH sides stay linear. A contiguous input collapses to exactly the
+        // [outer, run] pair this route used to require.
+        int ng = 0;
+        for (int64_t k = 0; k < n; ++k) {
+            const int64_t e = t.size(k);
+            if (e == 1) continue;
+            const int64_t S = t.stride(k), D = out_stride[k];
+            if (S < 0) return decline_layout(R, "input_negative_stride", t);
+            if (ng > 0 && ss.back() == S * e && ds.back() == D * e) {
+                ext.back() *= e; ss.back() = S; ds.back() = D;
+            } else {
+                if (ng == 8) return decline_layout(R, "input_groups_gt8", t);
+                ext.push_back(e); ss.push_back(S); ds.push_back(D); ++ng;
+            }
+        }
+        if (ng == 0) { ext.push_back(1); ss.push_back(0); ds.push_back(1); ng = 1; }
+
         srcs.push_back(t.const_data_ptr());
-        dims.push_back(t.size(dim));
+        dst_offset.push_back(at * out_stride[dim]);
+        ndims.push_back(static_cast<int32_t>(ng));
+        at += t.size(dim);
     }
     if (srcs.empty()) return decline(R, nullptr, "all_inputs_empty");
+    // The pieces must tile the output; the runtime rechecks by element count,
+    // because superseding the output's stash depends on it.
+    if (at != result.size(dim)) return decline(R, nullptr, "pieces_do_not_tile");
 
-    int64_t outer = 1, inner = 1;
-    for (int64_t i = 0; i < dim; ++i) outer *= result.size(i);
-    for (int64_t i = dim + 1; i < n; ++i) inner *= result.size(i);
-
-    if (haganeOpsVendorCat(dt, srcs.data(), dims.data(),
-                           static_cast<int32_t>(srcs.size()),
-                           result.data_ptr(), outer, inner,
-                           result.size(dim)) != HAGANE_OPS_SUCCESS)
+    if (haganeOpsVendorCatNest(dt, srcs.data(), dst_offset.data(), ndims.data(),
+                               ext.data(), ss.data(), ds.data(),
+                               static_cast<int32_t>(srcs.size()),
+                               result.data_ptr(), result.numel())
+        != HAGANE_OPS_SUCCESS)
         return decline(R, nullptr, "kernel_dispatch");
     note_native_launch("mlx:copy_gg");
     return true;
@@ -1702,10 +1741,40 @@ inline bool try_vendor_cat(const TensorList& tensors,
 // same family. So the attention math was never the target: a transposed view
 // being made contiguous was.
 //
-// Routes when the DESTINATION is contiguous, the source is a non-overlapping
-// strided view of the same shape, and both dtypes have a Metal spelling. A
-// broadcast source (stride 0) is fine. Anything else declines to the existing
-// path, which stays byte-for-byte what it was.
+// Are these destination strides injective over these extents — i.e. does each
+// element have exactly one thread writing it? Sufficient and structural: sort
+// the dimensions by stride and require each to clear the span of everything
+// inside it. That accepts a slice with a row pitch and a transposed
+// destination, and rejects every genuine overlap.
+//
+// NOT at::has_internal_overlap: that answers TooHard for anything merely
+// non-dense, which is every slice this path exists to route (it declined all
+// 200 of ARDY's on the first attempt). The runtime derives the same rule
+// independently — it is the boundary that must not be talked into a race; this
+// copy exists so the decline has a NAME, because "the destination overlaps
+// itself" and "the corpus has no such kernel" want different follow-ups.
+inline bool dst_nest_injective(const int64_t* ext, const int64_t* ds, int ng) {
+    int order[16];
+    for (int i = 0; i < ng; ++i) order[i] = i;
+    std::sort(order, order + ng, [&](int a, int b) { return ds[a] > ds[b]; });
+    int64_t span = 1;   // elements already covered by the dimensions inside
+    for (int i = ng - 1; i >= 0; --i) {
+        if (ds[order[i]] < span) return false;
+        span = ds[order[i]] * ext[order[i]];
+    }
+    return true;
+}
+
+// Routes when the source is a non-overlapping strided view of the same shape
+// and both dtypes have a Metal spelling. A broadcast source (stride 0) is fine.
+//
+// The DESTINATION may be strided too, which was 200 of ARDY's stashes per step
+// and all 160 of SDPA's: torch's own preprocess_mask aligns an attention mask
+// with `pad(m,[0,k])[..., :n]`, and that lands here as a copy into a slice with
+// a row pitch. MLX's gg*_ family derives BOTH indices from strides, so it is
+// the same dispatch with one more stride array — but only for ONE dtype, and
+// only when the destination is injective. Anything else declines to the
+// existing path, which stays byte-for-byte what it was.
 inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
     constexpr const char* R = "copy";
     route_enter(R, nullptr);
@@ -1715,10 +1784,18 @@ inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
         return decline(R, nullptr, "corpus_unavailable");
 
     if (!dst.is_cuda() || !src.is_cuda()) return decline(R, nullptr, "not_both_device");
-    if (!dst.is_contiguous()) return decline_layout(R, "dst_not_contiguous", dst);
     const int64_t numel = dst.numel();
     if (numel <= 0) return decline(R, nullptr, "empty");
     if (src.sizes() != dst.sizes()) return decline(R, nullptr, "shape_mismatch");
+
+    const bool dst_contig = dst.is_contiguous();
+    if (!dst_contig) {
+        // MLX instantiates the gg_ family for one dtype (instantiate_copy_same),
+        // so a strided destination AND a cast is a kernel that does not exist.
+        if (src.scalar_type() != dst.scalar_type())
+            return decline_dtypes(R, nullptr, "dst_strided_cast",
+                                  src.scalar_type(), dst.scalar_type());
+    }
 
     const int dt_in = hagane_vendor_dtype(src.scalar_type());
     const int dt_out = hagane_vendor_dtype(dst.scalar_type());
@@ -1734,32 +1811,51 @@ inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
     {
         const char* sb = static_cast<const char*>(src.const_data_ptr());
         const char* db = static_cast<const char*>(dst.const_data_ptr());
-        // The source's span from its own base, which is what the strides index.
-        int64_t s_last = 0;
+        // Each side's span from its own base, which is what the strides index.
+        int64_t s_last = 0, d_last = 0;
         for (int64_t k = 0; k < n; ++k) {
-            const int64_t st = src.stride(k);
+            const int64_t st = src.stride(k), dt = dst.stride(k);
             if (st < 0) return decline(R, nullptr, "negative_stride");
+            if (dt < 0) return decline_layout(R, "dst_negative_stride", dst);
             s_last += (src.size(k) - 1) * st;
+            d_last += (dst.size(k) - 1) * dt;
         }
         const char* se = sb + (s_last + 1) * src.element_size();
-        const char* de = db + numel * dst.element_size();
+        const char* de = db + (d_last + 1) * dst.element_size();
         if (sb < de && db < se) return decline(R, nullptr, "src_dst_overlap");
     }
 
-    // Collapse, outermost first: merge an inner dimension into the group
-    // outside it only when the SOURCE stays linear across the pair. The
-    // destination always does, being contiguous over the same extents.
-    int64_t ext[16], ss[16];
+    // Collapse, outermost first. With a contiguous destination, merge an inner
+    // dimension into the group outside it whenever the SOURCE stays linear
+    // across the pair (the destination always does); with a strided one, only
+    // when BOTH do — the same rule try_vendor_binary_g uses for two operands.
+    int64_t ext[16], ss[16], ds[16];
     int ng = 0;
     for (int64_t k = 0; k < n; ++k) {
         const int64_t e = dst.size(k);
         if (e == 1) continue;
-        const int64_t S = src.stride(k);
-        if (ng > 0 && ss[ng - 1] == S * e) { ext[ng - 1] *= e; ss[ng - 1] = S; }
-        else                               { ext[ng] = e; ss[ng] = S; ++ng; }
+        const int64_t S = src.stride(k), D = dst.stride(k);
+        if (ng > 0 && ss[ng - 1] == S * e && (dst_contig || ds[ng - 1] == D * e)) {
+            ext[ng - 1] *= e; ss[ng - 1] = S; ds[ng - 1] = D;
+        } else {
+            ext[ng] = e; ss[ng] = S; ds[ng] = D; ++ng;
+        }
     }
-    if (ng == 0) { ext[0] = 1; ss[0] = 0; ng = 1; }   // every dim was 1
+    if (ng == 0) { ext[0] = 1; ss[0] = 0; ds[0] = 1; ng = 1; }   // every dim was 1
     if (ng > 8) return decline(R, nullptr, "groups_gt8");  // beyond the corpus nest
+
+    if (!dst_contig) {
+        // Two threads writing one element is a race, not a copy, and no settle
+        // can give it an order.
+        if (!dst_nest_injective(ext, ds, ng))
+            return decline_layout(R, "dst_not_injective", dst);
+        if (haganeOpsVendorCopyGG(dt_in, dt_out, src.const_data_ptr(),
+                                  dst.data_ptr(), ext, ss, ds, ng)
+            != HAGANE_OPS_SUCCESS)
+            return decline_layout(R, "gg_kernel_dispatch", dst);
+        note_native_launch("mlx:gg_copy");
+        return true;
+    }
 
     // A single collapsed group of stride 1 is a flat copy — MLX's cheapest
     // kernel, and the shape a plain copy or a dtype cast actually has.
