@@ -1604,6 +1604,85 @@ inline bool try_vendor_cat(const TensorList& tensors,
     return true;
 }
 
+// copy_ — a strided read laid down contiguously in the caller's block, through
+// MLX's copy corpus.
+//
+// This is the biggest single block of MLX-owned dispatches in a real workload,
+// and it hides behind other ops' names. ARDY's scaled_dot_product_attention
+// measured 960 MLX-owned dispatches over 160 calls; bisecting the same call by
+// input layout showed six per call, of which the attention kernel is ONE — the
+// other five are layout copies (q/k/v forced contiguous by the SDPA entry, plus
+// the mask's preprocessing). `reshape` and the rest of `cat`'s declines are the
+// same family. So the attention math was never the target: a transposed view
+// being made contiguous was.
+//
+// Routes when the DESTINATION is contiguous, the source is a non-overlapping
+// strided view of the same shape, and both dtypes have a Metal spelling. A
+// broadcast source (stride 0) is fine. Anything else declines to the existing
+// path, which stays byte-for-byte what it was.
+inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
+    if (!vendor_elementwise_route_enabled()) return false;
+    if (haganeOpsTapeRecording()) return false;   // capture records via MLX
+    if (!haganeOpsVendorElementwiseAvailable()) return false;
+
+    if (!dst.is_cuda() || !src.is_cuda()) return false;
+    if (!dst.is_contiguous()) return false;
+    const int64_t numel = dst.numel();
+    if (numel <= 0) return false;                 // let the existing path no-op
+    if (src.sizes() != dst.sizes()) return false;
+
+    const int dt_in = hagane_vendor_dtype(src.scalar_type());
+    const int dt_out = hagane_vendor_dtype(dst.scalar_type());
+    if (dt_in < 0 || dt_out < 0) return false;
+
+    const int64_t n = static_cast<int64_t>(dst.dim());
+    if (n > 16) return false;
+
+    // A parallel copy has no correct order when it reads what it writes, and no
+    // settle can give it one. Decline on ANY byte overlap rather than reason
+    // about which layouts happen to be safe.
+    {
+        const char* sb = static_cast<const char*>(src.const_data_ptr());
+        const char* db = static_cast<const char*>(dst.const_data_ptr());
+        // The source's span from its own base, which is what the strides index.
+        int64_t s_last = 0;
+        for (int64_t k = 0; k < n; ++k) {
+            const int64_t st = src.stride(k);
+            if (st < 0) return false;             // MLX indexes unsigned
+            s_last += (src.size(k) - 1) * st;
+        }
+        const char* se = sb + (s_last + 1) * src.element_size();
+        const char* de = db + numel * dst.element_size();
+        if (sb < de && db < se) return false;
+    }
+
+    // Collapse, outermost first: merge an inner dimension into the group
+    // outside it only when the SOURCE stays linear across the pair. The
+    // destination always does, being contiguous over the same extents.
+    int64_t ext[16], ss[16];
+    int ng = 0;
+    for (int64_t k = 0; k < n; ++k) {
+        const int64_t e = dst.size(k);
+        if (e == 1) continue;
+        const int64_t S = src.stride(k);
+        if (ng > 0 && ss[ng - 1] == S * e) { ext[ng - 1] *= e; ss[ng - 1] = S; }
+        else                               { ext[ng] = e; ss[ng] = S; ++ng; }
+    }
+    if (ng == 0) { ext[0] = 1; ss[0] = 0; ng = 1; }   // every dim was 1
+    if (ng > 8) return false;                          // beyond the corpus nest
+
+    // A single collapsed group of stride 1 is a flat copy — MLX's cheapest
+    // kernel, and the shape a plain copy or a dtype cast actually has.
+    const bool contiguous_src = (ng == 1 && ss[0] == 1);
+
+    if (haganeOpsVendorCopy(dt_in, dt_out, src.const_data_ptr(), dst.data_ptr(),
+                            contiguous_src ? 1 : 0, ext, ss, ng)
+        != HAGANE_OPS_SUCCESS)
+        return false;
+    note_native_launch(contiguous_src ? "mlx:v_copy" : "mlx:g_copy");
+    return true;
+}
+
 inline bool try_launch_unary_scalar_metallib(const std::string& kname,
                                              TensorIteratorBase& iter, float scalar) {
     if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct

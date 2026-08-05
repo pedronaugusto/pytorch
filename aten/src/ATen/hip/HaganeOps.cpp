@@ -2026,6 +2026,16 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
     }
   }
 
+  // #1010 — MLX's copy kernel, dispatched by us, writing the caller's block.
+  // A device→device copy is the biggest remaining MLX-owned block in a real
+  // step (ARDY: 5 of the 6 dispatches its SDPA is charged for are layout
+  // copies). Declines to the paths below for anything it cannot prove.
+  if (!gpu_to_cpu &&
+      hagane_dispatch::detail::try_vendor_copy(dst_t, src_t)) {
+    g_copy_lazy_count.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
   haganeOpsTensor_t src_d, dst_d;
   src_d.data = const_cast<void*>(src_t.data_ptr());
   src_d.shape = src_t.sizes().data();
