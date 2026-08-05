@@ -1355,6 +1355,7 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     const void* ptrs[2] = {nullptr, nullptr};
     bool is_scalar[2] = {false, false};
     uint64_t scalars[2] = {0, 0};
+    int src_dt[2] = {-1, -1};   // >=0: operand is stored in a dtype needing a cast
     for (int i = 0; i < 2; i++) {
         const int arg = i + 1;
         if (iter.is_cpu_scalar(arg)) {
@@ -1365,9 +1366,17 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
             continue;
         }
         const at::Tensor& t = iter.tensor(arg);
-        if (t.scalar_type() != compute)
-            return decline_dtypes(R, torch_op, "operand_dtype_promoted",
-                                  t.scalar_type(), compute);
+        if (t.scalar_type() != compute) {
+            // TensorIterator's own CUDA kernels cast this operand on load, so
+            // the tensor stays in its own dtype and the op computes in another.
+            // MLX has no mixed-dtype binary kernel, so the runtime casts the
+            // operand with MLX's v_copy first; a pair the corpus does not carry
+            // declines there and lands here as kernel_dispatch.
+            src_dt[i] = hagane_vendor_dtype(t.scalar_type());
+            if (src_dt[i] < 0)
+                return decline_dtypes(R, torch_op, "operand_dtype_unspellable",
+                                      t.scalar_type(), compute);
+        }
         const int64_t tn = t.dim();
         if (tn > n) return decline(R, torch_op, "operand_rank_gt_out");
         for (int64_t k = 0; k < n; ++k) {
@@ -1399,11 +1408,26 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     if (ng == 0) { ext[0] = 1; sa[0] = 0; sb[0] = 0; ng = 1; }   // all dims were 1
     if (ng > 3) return decline(R, torch_op, "groups_gt3");       // beyond g3_
 
-    if (haganeOpsVendorBinaryG(mlx_op, dt, dt_out, ptrs[0], ptrs[1],
-                               iter.data_ptr(0),
-                               is_scalar[0] ? 1 : 0, is_scalar[1] ? 1 : 0,
-                               scalars[0], scalars[1],
-                               ext, sa, sb, ng) != HAGANE_OPS_SUCCESS)
+    // A promoted operand is cast over its SPAN, and its strides are then reused
+    // against the scratch — so a broadcast one costs its own size, not the
+    // output's. The span can EXCEED the output when the operand is a narrow
+    // slice of a wide tensor (extent 1 x k, stride M x 1); casting more elements
+    // than the op computes is not a win, so decline under its own name and let
+    // the count say whether that shape ever occurs.
+    for (int i = 0; i < 2; i++) {
+        if (src_dt[i] < 0) continue;
+        const int64_t* s = i == 0 ? sa : sb;
+        int64_t span = 1;
+        for (int g = 0; g < ng; ++g) span += (ext[g] - 1) * s[g];
+        if (span > N) return decline(R, torch_op, "cast_span_gt_numel");
+    }
+
+    if (haganeOpsVendorBinaryGCast(mlx_op, dt, dt_out, ptrs[0], ptrs[1],
+                                   iter.data_ptr(0),
+                                   is_scalar[0] ? 1 : 0, is_scalar[1] ? 1 : 0,
+                                   scalars[0], scalars[1],
+                                   ext, sa, sb, ng,
+                                   src_dt[0], src_dt[1]) != HAGANE_OPS_SUCCESS)
         return decline(R, torch_op, "kernel_dispatch");
     note_native_launch(std::string("mlx:g_") + mlx_op);
     return true;
