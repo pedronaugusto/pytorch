@@ -1171,6 +1171,34 @@ inline bool vendor_scalar_bytes(TensorIteratorBase& iter, int arg,
     }
 }
 
+// The same convention for a caller that has a Scalar rather than an iterator
+// operand — try_vendor_fill/arange/clamp and the scalar-binary unary rows.
+inline bool vendor_scalar_bytes_of(const c10::Scalar& v, c10::ScalarType st,
+                                   uint64_t* out) {
+    *out = 0;
+    switch (st) {
+        case c10::ScalarType::Float:
+            { float x = v.to<float>();             std::memcpy(out, &x, 4); return true; }
+        case c10::ScalarType::Half:
+            { auto x = v.to<c10::Half>();          std::memcpy(out, &x, 2); return true; }
+        case c10::ScalarType::BFloat16:
+            { auto x = v.to<c10::BFloat16>();      std::memcpy(out, &x, 2); return true; }
+        case c10::ScalarType::Char:
+            { int8_t x = v.to<int8_t>();           std::memcpy(out, &x, 1); return true; }
+        case c10::ScalarType::Short:
+            { int16_t x = v.to<int16_t>();         std::memcpy(out, &x, 2); return true; }
+        case c10::ScalarType::Int:
+            { int32_t x = v.to<int32_t>();         std::memcpy(out, &x, 4); return true; }
+        case c10::ScalarType::Long:
+            { int64_t x = v.to<int64_t>();         std::memcpy(out, &x, 8); return true; }
+        case c10::ScalarType::Byte:
+            { uint8_t x = v.to<uint8_t>();         std::memcpy(out, &x, 1); return true; }
+        case c10::ScalarType::Bool:
+            { bool x = v.to<bool>();               std::memcpy(out, &x, 1); return true; }
+        default: return false;
+    }
+}
+
 // Dispatch one MLX elementwise kernel into iter's output. Returns false having
 // encoded NOTHING when anything is outside what we can prove correct.
 // ON by default -- writing into the caller's output IS the intended behaviour.
@@ -1568,7 +1596,14 @@ inline void note_general_alpha(const char* op, TensorIteratorBase& iter,
 // what makes "decline honestly" true at all.
 //
 // Not carried by MLX at all, so absent by nature: erfc, frac, lgamma, mish,
-// reciprocal, sinc, signbit, trunc, silu, hardsigmoid, exp2.
+// sinc, signbit, trunc, silu, hardsigmoid, exp2.
+//
+// `reciprocal` was on that list and did not belong there. MLX ships no
+// Reciprocal kernel, but 1/x IS sv_Divide, which it ships for every dtype — so
+// the op was absent under torch's name for it, not absent from the corpus. It
+// is handled by unary_as_scalar_binary below rather than by this table, because
+// what differs is the dispatch and not just the name. Same correction the
+// bitwise_not note above records, on the same table, one slice later.
 inline const char* mlx_unary_op_name(const char* op) {
     struct Row { const char* torch_name; const char* mlx_name; };
     static constexpr Row kMap[] = {
@@ -1606,12 +1641,53 @@ inline const char* mlx_unary_op_name(const char* op) {
     return nullptr;
 }
 
+// A unary op MLX has no kernel for, but which IS one of MLX's BINARY kernels
+// with a constant left operand. Separate from mlx_unary_op_name because the
+// dispatch differs and not just the name: these run binary_sv, which is
+// `Op()(a[0], b[index])`, so the tensor is the SECOND operand and the constant
+// crosses as raw bits in the compute dtype. Spelling it as a name remap would
+// put the tensor first and compute x/1.
+//
+// reciprocal is the only row. The shipped metallib carries no Reciprocal; it
+// carries sv_Divide for all 13 dtypes.
+//
+// Measured before this was written, exhaustively over every fp16 and bf16 bit
+// pattern and over 2^20 float32 ones: sv_Divide(1, x) is BIT-IDENTICAL to the
+// mx::reciprocal fallback it replaces, on all three float dtypes. The row is a
+// pure stash removal and changes no value anywhere.
+//
+// That is also why upstream's opmath question does not arise here. c10::Half's
+// operator/ is `static_cast<float>(a) / static_cast<float>(b)`, so torch divides
+// half in float32 and rounds TWICE while sv_Dividefloat16 divides natively and
+// rounds once — but for a reciprocal those never disagree, because float32
+// carries 2p+2 bits relative to both fp16 (24 >= 24) and bf16 (24 >= 18), which
+// is exactly when double rounding is harmless. 0 disagreeing values out of
+// 65536 for each, measured rather than left standing on the bound.
+struct UnaryAsScalarBinary {
+    const char* torch_name;
+    const char* mlx_op;
+    double lhs;                          // the constant LEFT operand
+};
+
+inline const UnaryAsScalarBinary* unary_as_scalar_binary(const char* op) {
+    static constexpr UnaryAsScalarBinary kMap[] = {
+        {"reciprocal", "Divide", 1.0},
+    };
+    for (const auto& r : kMap)
+        if (std::strcmp(op, r.torch_name) == 0) return &r;
+    return nullptr;
+}
+
 inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
     constexpr const char* R = "unary";
     route_enter(R, torch_op);
     if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
     const char* mlx_op = mlx_unary_op_name(torch_op);
-    if (!mlx_op) return decline(R, torch_op, "no_mlx_name");
+    // A scalar-binary row survives the name check and then takes every guard
+    // below unchanged: MLX's sv_ kernels are flat and unbroadcast in exactly the
+    // way the unary ones are, and walk the same single operand.
+    const UnaryAsScalarBinary* sb = mlx_op ? nullptr : unary_as_scalar_binary(torch_op);
+    if (!mlx_op && !sb) return decline(R, torch_op, "no_mlx_name");
     if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
     if (iter.ninputs() != 1) return decline(R, torch_op, "ninputs");
     if (!haganeOpsVendorElementwiseAvailable())
@@ -1645,40 +1721,31 @@ inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
     if (N <= 0) return true;                      // nothing to compute
     if (N > static_cast<int64_t>(UINT32_MAX)) return decline(R, torch_op, "numel_too_big");
 
+    if (sb) {
+        // Divide on an integer dtype is INTEGER division, which is not what
+        // reciprocal means. torch promotes above the kernel
+        // (AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES_AND2), so this is unreachable
+        // today — measured, int64/int32/int16/uint8/bool all arrive as Float. It
+        // stays so that it declines rather than truncating if that ever changes.
+        if (!c10::isFloatingType(st))
+            return decline(R, torch_op, "scalar_binary_needs_float");
+        uint64_t lhs_bits = 0;
+        if (!vendor_scalar_bytes_of(c10::Scalar(sb->lhs), st, &lhs_bits))
+            return decline(R, torch_op, "scalar_binary_lhs");
+        if (haganeOpsVendorBinary(sb->mlx_op, dt, dt, /*a=*/nullptr,
+                                  iter.data_ptr(1), iter.data_ptr(0), N,
+                                  /*a_is_scalar=*/1, /*b_is_scalar=*/0,
+                                  lhs_bits, 0) != HAGANE_OPS_SUCCESS)
+            return decline(R, torch_op, "kernel_dispatch");
+        note_native_launch(std::string("mlx:sv_") + sb->mlx_op);
+        return true;
+    }
+
     if (haganeOpsVendorUnary(mlx_op, dt, dt, iter.data_ptr(1), iter.data_ptr(0), N)
         != HAGANE_OPS_SUCCESS)
         return decline(R, torch_op, "kernel_dispatch");
     note_native_launch(std::string("mlx:") + mlx_op);
     return true;
-}
-
-// Raw bytes of a Scalar in `st`'s own representation — the same convention
-// vendor_scalar_bytes uses, for a caller that has a Scalar rather than an
-// iterator operand.
-inline bool vendor_scalar_bytes_of(const c10::Scalar& v, c10::ScalarType st,
-                                   uint64_t* out) {
-    *out = 0;
-    switch (st) {
-        case c10::ScalarType::Float:
-            { float x = v.to<float>();             std::memcpy(out, &x, 4); return true; }
-        case c10::ScalarType::Half:
-            { auto x = v.to<c10::Half>();          std::memcpy(out, &x, 2); return true; }
-        case c10::ScalarType::BFloat16:
-            { auto x = v.to<c10::BFloat16>();      std::memcpy(out, &x, 2); return true; }
-        case c10::ScalarType::Char:
-            { int8_t x = v.to<int8_t>();           std::memcpy(out, &x, 1); return true; }
-        case c10::ScalarType::Short:
-            { int16_t x = v.to<int16_t>();         std::memcpy(out, &x, 2); return true; }
-        case c10::ScalarType::Int:
-            { int32_t x = v.to<int32_t>();         std::memcpy(out, &x, 4); return true; }
-        case c10::ScalarType::Long:
-            { int64_t x = v.to<int64_t>();         std::memcpy(out, &x, 8); return true; }
-        case c10::ScalarType::Byte:
-            { uint8_t x = v.to<uint8_t>();         std::memcpy(out, &x, 1); return true; }
-        case c10::ScalarType::Bool:
-            { bool x = v.to<bool>();               std::memcpy(out, &x, 1); return true; }
-        default: return false;
-    }
 }
 
 // masked_fill_ through MLX's Select. self is contiguous and is both operands;
