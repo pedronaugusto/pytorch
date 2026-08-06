@@ -1918,6 +1918,114 @@ inline bool try_vendor_arange(at::Tensor& result, const c10::Scalar& start,
     return true;
 }
 
+// Raw bits of a clamp BOUND in the compute dtype, converted exactly the way
+// upstream's CUDA kernel converts it.
+//
+// launch_clamp_scalar does `lim.to<opmath_t>()`, and both halves of that matter:
+//
+//   * `.to<T>()` is c10::checked_convert, so a bound outside the compute dtype
+//     RAISES rather than truncating. clamp(int8_tensor, min=1000) throws
+//     upstream; passing 1000 through toFloat() and letting it land as -24 is
+//     the silent-wrong this replaces, and it was measured before this route
+//     existed (cpu=RuntimeError, dev=None).
+//   * opmath_t is FLOAT for Half/BFloat16, so a bound outside half's range but
+//     inside float's must NOT throw. Convert through float exactly as upstream
+//     does, then round to the tensor's dtype for the kernel immediate.
+//
+// Rounding the bound to the tensor's own dtype is measured equivalent to
+// upstream's clamp-in-float-then-cast, not assumed: rounding is monotone and
+// the result is either v (already representable) or a bound (which upstream
+// rounds too), so no representable value crosses the boundary. The ulp sweep in
+// scripts/test_scalar_ops.py pins it at 0/1/4/1/2/3/4/1 ulp either side of a
+// tick for both half types, and pins torch's own CPU kernel — which likewise
+// rounds the bound — against the float formula.
+inline bool vendor_bound_bits(c10::ScalarType st, const c10::Scalar& s,
+                              uint64_t* out) {
+    *out = 0;
+    switch (st) {
+        case c10::ScalarType::Float:
+            { float v = s.to<float>();  std::memcpy(out, &v, 4); return true; }
+        case c10::ScalarType::Half:
+            { auto v = static_cast<c10::Half>(s.to<float>());
+              std::memcpy(out, &v, 2); return true; }
+        case c10::ScalarType::BFloat16:
+            { auto v = static_cast<c10::BFloat16>(s.to<float>());
+              std::memcpy(out, &v, 2); return true; }
+        case c10::ScalarType::Char:
+            { int8_t v = s.to<int8_t>();   std::memcpy(out, &v, 1); return true; }
+        case c10::ScalarType::Short:
+            { int16_t v = s.to<int16_t>(); std::memcpy(out, &v, 2); return true; }
+        case c10::ScalarType::Int:
+            { int32_t v = s.to<int32_t>(); std::memcpy(out, &v, 4); return true; }
+        case c10::ScalarType::Long:
+            { int64_t v = s.to<int64_t>(); std::memcpy(out, &v, 8); return true; }
+        case c10::ScalarType::Byte:
+            { uint8_t v = s.to<uint8_t>(); std::memcpy(out, &v, 1); return true; }
+        case c10::ScalarType::Bool:
+            { bool v = s.to<bool>();       std::memcpy(out, &v, 1); return true; }
+        default: return false;      // Double: Metal has no float64
+    }
+}
+
+// clamp with scalar bounds — MLX's vs_Maximum then vs_Minimum, which IS
+// upstream's `::min(::max(v, lower), upper)` and not an approximation of it.
+// See haganeOpsVendorClamp for why composing the pair is faithful and why it is
+// one runtime entry rather than two vendor_binary calls.
+//
+// 98 stashes per ARDY step (#1024) with ZERO route ENTERs — no route at all,
+// which is a different fix from a decline. The path it replaces loses the bound
+// twice (min_val.toFloat() at the call site, then a float32 mx::array inside
+// haganeOpsClamp, which promotes the whole tensor), so this is a parity fix as
+// well as a stash removal.
+//
+// A NaN bound never arrives: TORCH_IMPL_FUNC(clamp_out) fills the result with
+// NaN above the stub and dispatches nothing. That matters because MLX's Maximum
+// would NOT reproduce CUDA's fmaxf on one — see hagane_clamp_scalar_common.
+inline bool try_vendor_clamp(at::TensorIteratorBase& iter,
+                             bool has_min, const c10::Scalar& min_val,
+                             bool has_max, const c10::Scalar& max_val) {
+    constexpr const char* R = "clamp";
+    route_enter(R, nullptr);
+    if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, nullptr, "corpus_unavailable");
+    // No bound left after normalisation is a copy, not a clamp; the caller
+    // handles it rather than having this route quietly become something else.
+    if (!has_min && !has_max) return decline(R, nullptr, "no_bounds");
+
+    // MLX has no strided vs_ kernel, and composing one out of gg*_copy plus a
+    // scratch would be inventing a kernel.
+    if (!iter.is_contiguous()) return decline(R, nullptr, "iter_not_contiguous");
+
+    const c10::ScalarType compute = iter.common_dtype();
+    if (iter.dtype(0) != compute)
+        return decline_dtypes(R, nullptr, "in_out_dtype_differ",
+                              iter.dtype(0), compute);
+    const int dt = hagane_vendor_dtype(compute);
+    if (dt < 0) return decline(R, nullptr, "dtype");
+
+    const int64_t N = iter.numel();
+    if (N <= 0) return true;                      // nothing to write
+    if (N > static_cast<int64_t>(UINT32_MAX)) return decline(R, nullptr, "numel_too_big");
+
+    // Deliberately BEFORE the dispatch and deliberately able to throw: a bound
+    // that will not fit the compute dtype raises upstream, and matching that is
+    // parity, not an error path.
+    uint64_t lo = 0, hi = 0;
+    if (has_min && !vendor_bound_bits(compute, min_val, &lo))
+        return decline(R, nullptr, "bound_dtype");
+    if (has_max && !vendor_bound_bits(compute, max_val, &hi))
+        return decline(R, nullptr, "bound_dtype");
+
+    if (haganeOpsVendorClamp(dt, iter.data_ptr(1), iter.data_ptr(0), N,
+                             has_min ? 1 : 0, lo,
+                             has_max ? 1 : 0, hi) != HAGANE_OPS_SUCCESS)
+        return decline(R, nullptr, "kernel_dispatch");
+    note_native_launch("mlx:Maximum/Minimum");
+    return true;
+}
+
 // copy_ — a strided read laid down contiguously in the caller's block, through
 // MLX's copy corpus.
 //

@@ -2347,31 +2347,81 @@ void hagane_clamp_kernel(TensorIteratorBase& iter) {
   clamp_stub(c10::DeviceType::CPU, iter);
 }
 
-void hagane_clamp_scalar_kernel(TensorIteratorBase& iter, const Scalar& min_val, const Scalar& max_val) {
+// #1010 1.7b — one implementation behind all three clamp scalar stubs.
+//
+// It is shared rather than duplicated because the fallback CHOICE has to be made
+// above both paths, or route-on and route-off disagree. Upstream's kernel is the
+// spec here (aten/src/ATen/native/cuda/TensorCompare.cu, launch_clamp_scalar),
+// read rather than recalled:
+//
+//   using opmath_t = at::opmath_type<scalar_t>;      // float for f16/bf16
+//   if (_isnan(v)) return v;
+//   ::min(::max(v, lim0.to<opmath_t>()), lim1.to<opmath_t>())
+//
+// An INTEGER compute dtype must never reach haganeOpsClamp, whose ABI takes
+// `float`: the bound is already lost in the signature, and mx::maximum then
+// promotes the whole tensor to float32, so clamp(int64, min=2^24+1) came back
+// one short and even clamp(int64, min=0) lost 2^53+1 out of the TENSOR. torch's
+// own CPU kernel is exact for these and raises on an out-of-range bound exactly
+// as CUDA's checked lim.to<opmath_t>() does, so it is the honest fallback for
+// the layouts the route declines (strided integer clamp; #996 owns retiring
+// that too). The float fallback stays on haganeOpsClamp unchanged: mx::maximum
+// promotes f16/bf16 to float32, which IS opmath_t, and float32 is exact in its
+// own dtype. Gated both ways by the ulp sweep in scripts/test_scalar_ops.py.
+//
+// A NaN BOUND needs NO handling here, and the first draft of this function
+// wrongly added some. MLX's Maximum genuinely does diverge from CUDA's ::max on
+// a NaN bound (`x > y ? x : y` returns the NaN; fmaxf returns the number), so
+// the arithmetic argument for normalising it away was sound — and irrelevant,
+// because TORCH_IMPL_FUNC(clamp_out) short-circuits ABOVE the stub with
+// `at::fill_(result, quiet_NaN())` and never dispatches a NaN bound to any
+// backend at all. Measured on both devices: all-NaN, identically, so we were
+// already at parity. Normalising would have been a silent-wrong of our own,
+// since torch's contract is all-NaN and not "drop the bound". The note stays
+// because the arithmetic claim is true and is exactly what would make someone
+// add the code back — the reference for a parity question is what torch DOES,
+// not what the kernel arithmetic implies.
+static void hagane_clamp_scalar_common(TensorIteratorBase& iter,
+                                       bool has_min, const Scalar& min_val,
+                                       bool has_max, const Scalar& max_val) {
+  if (hagane_dispatch::detail::try_vendor_clamp(iter, has_min, min_val,
+                                                has_max, max_val))
+    return;
+
+  auto cpu_fallback = [&]() {
+    HAGANE_BEFORE_RAW_READ();
+    if (has_min && has_max)
+      clamp_scalar_stub(c10::DeviceType::CPU, iter, min_val, max_val);
+    else if (has_min)
+      clamp_min_scalar_stub(c10::DeviceType::CPU, iter, min_val);
+    else
+      clamp_max_scalar_stub(c10::DeviceType::CPU, iter, max_val);
+  };
+
+  if (c10::isIntegralType(iter.common_dtype(), /*includeBool=*/true)) {
+    cpu_fallback();
+    return;
+  }
+
   auto out = make_ops_tensor(iter, 0);
   auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsClamp(&in, &out, 1, min_val.toFloat(), 1, max_val.toFloat()) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    clamp_scalar_stub(c10::DeviceType::CPU, iter, min_val, max_val);
-  }
+  if (haganeOpsClamp(&in, &out,
+                     has_min ? 1 : 0, has_min ? min_val.toFloat() : 0.0f,
+                     has_max ? 1 : 0, has_max ? max_val.toFloat() : 0.0f)
+      != HAGANE_OPS_SUCCESS)
+    cpu_fallback();
+}
+
+void hagane_clamp_scalar_kernel(TensorIteratorBase& iter, const Scalar& min_val, const Scalar& max_val) {
+  hagane_clamp_scalar_common(iter, /*has_min=*/true, min_val, /*has_max=*/true, max_val);
 }
 
 void hagane_clamp_min_scalar_kernel(TensorIteratorBase& iter, Scalar min_val) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsClamp(&in, &out, 1, min_val.toFloat(), 0, 0.0f) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    clamp_min_scalar_stub(c10::DeviceType::CPU, iter, min_val);
-  }
+  hagane_clamp_scalar_common(iter, /*has_min=*/true, min_val, /*has_max=*/false, min_val);
 }
 
 void hagane_clamp_max_scalar_kernel(TensorIteratorBase& iter, Scalar max_val) {
-  auto out = make_ops_tensor(iter, 0);
-  auto in = make_ops_tensor(iter, 1);
-  if (haganeOpsClamp(&in, &out, 0, 0.0f, 1, max_val.toFloat()) != HAGANE_OPS_SUCCESS) {
-    HAGANE_BEFORE_RAW_READ();
-    clamp_max_scalar_stub(c10::DeviceType::CPU, iter, max_val);
-  }
+  hagane_clamp_scalar_common(iter, /*has_min=*/false, max_val, /*has_max=*/true, max_val);
 }
 
 // ---------------------------------------------------------------------------
