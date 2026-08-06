@@ -259,6 +259,13 @@ struct UnaryIterOpConfig {
     int (*c_abi_fn)(const haganeOpsTensor_t*, const haganeOpsTensor_t*);
     void (*cpu_fallback)(TensorIterator&);
     Tensor (*at_fp64_fn)(const Tensor&);
+    // MLX's all_reduce operator name, for the ops whose FULL reduction can be
+    // dispatched into the caller's own block (#1010 1.9). nullptr means it
+    // cannot. sum/prod are nullptr deliberately: MLX's remap_reduce_types
+    // WIDENS their output for integers and torch has its own accumulation
+    // contract there, so routing them would be a numerics decision rather than
+    // an ownership one — and sum/mean already have the owned Tier-a reducer.
+    const char* mlx_reduce_op;
 };
 
 // A9: kSumCfg/kMeanCfg carry a non-null metallib_kernel sentinel ("reduce") so
@@ -266,19 +273,19 @@ struct UnaryIterOpConfig {
 // 2-pass) before the MLX c_abi_fn. The sentinel only gates the attempt; the
 // actual kernel names are picked by dtype inside the helper. All other reduce
 // configs keep nullptr → MLX (unchanged).
-inline constexpr UnaryIterOpConfig kSumCfg       = {"sum",        "reduce", &haganeOpsSum,       &cpu_dispatch_sum,        nullptr};
-inline constexpr UnaryIterOpConfig kMeanCfg      = {"mean",       "reduce", &haganeOpsMean,      &cpu_dispatch_mean,       nullptr};
-inline constexpr UnaryIterOpConfig kProdCfg      = {"prod",       nullptr, &haganeOpsProd,      &cpu_dispatch_prod,       nullptr};
-inline constexpr UnaryIterOpConfig kArgmaxCfg    = {"argmax",     nullptr, &haganeOpsArgmax,    &cpu_dispatch_argmax,     nullptr};
-inline constexpr UnaryIterOpConfig kArgminCfg    = {"argmin",     nullptr, &haganeOpsArgmin,    &cpu_dispatch_argmin,     nullptr};
-inline constexpr UnaryIterOpConfig kMaxValuesCfg = {"max_values", nullptr, &haganeOpsMaxValues, &cpu_dispatch_max_values, nullptr};
-inline constexpr UnaryIterOpConfig kMinValuesCfg = {"min_values", nullptr, &haganeOpsMinValues, &cpu_dispatch_min_values, nullptr};
+inline constexpr UnaryIterOpConfig kSumCfg       = {"sum",        "reduce", &haganeOpsSum,       &cpu_dispatch_sum,        nullptr, nullptr};
+inline constexpr UnaryIterOpConfig kMeanCfg      = {"mean",       "reduce", &haganeOpsMean,      &cpu_dispatch_mean,       nullptr, nullptr};
+inline constexpr UnaryIterOpConfig kProdCfg      = {"prod",       nullptr, &haganeOpsProd,      &cpu_dispatch_prod,       nullptr, nullptr};
+inline constexpr UnaryIterOpConfig kArgmaxCfg    = {"argmax",     nullptr, &haganeOpsArgmax,    &cpu_dispatch_argmax,     nullptr, nullptr};
+inline constexpr UnaryIterOpConfig kArgminCfg    = {"argmin",     nullptr, &haganeOpsArgmin,    &cpu_dispatch_argmin,     nullptr, nullptr};
+inline constexpr UnaryIterOpConfig kMaxValuesCfg = {"max_values", nullptr, &haganeOpsMaxValues, &cpu_dispatch_max_values, nullptr, "max"};
+inline constexpr UnaryIterOpConfig kMinValuesCfg = {"min_values", nullptr, &haganeOpsMinValues, &cpu_dispatch_min_values, nullptr, "min"};
 // and_stub is the reduction kernel behind `torch.all` (logical AND across
 // elements), or_stub backs `torch.any` (logical OR). The C-ABI names match
 // the semantic, not the stub name.
-inline constexpr UnaryIterOpConfig kAndCfg       = {"and",        nullptr, &haganeOpsAll,       &cpu_dispatch_and,        nullptr};
-inline constexpr UnaryIterOpConfig kOrCfg        = {"or",         nullptr, &haganeOpsAny,       &cpu_dispatch_or,         nullptr};
-inline constexpr UnaryIterOpConfig kHardswishCfg = {"hardswish",  nullptr, &haganeOpsHardswish, &cpu_dispatch_hardswish,  nullptr};
+inline constexpr UnaryIterOpConfig kAndCfg       = {"and",        nullptr, &haganeOpsAll,       &cpu_dispatch_and,        nullptr, "and"};
+inline constexpr UnaryIterOpConfig kOrCfg        = {"or",         nullptr, &haganeOpsAny,       &cpu_dispatch_or,         nullptr, "or"};
+inline constexpr UnaryIterOpConfig kHardswishCfg = {"hardswish",  nullptr, &haganeOpsHardswish, &cpu_dispatch_hardswish,  nullptr, nullptr};
 
 // ---- Reduce-with-flag op configuration (X+23) -----------------------------
 // `reduce_fn_flag = void(*)(TensorIterator&, const Scalar&)` stubs
@@ -320,11 +327,19 @@ struct CumOpConfig {
     // upstream stub signature. The dispatch templates select by which is set.
     void (*cpu_structured_fn)(const Tensor& self, const Tensor& result, int64_t dim);
     void (*cpu_mutable_fn)   (Tensor& result, const Tensor& self, int64_t dim);
+    // MLX's scan operator name, when the C-ABI above lands on MLX's scan kernel
+    // and this op can therefore be dispatched into the caller's own block
+    // (#1010 1.9). nullptr means it cannot, which is a statement about the
+    // FALLBACK and not about the corpus: logcumsumexp is nullptr because
+    // haganeOpsLogcumsumexp composes max/subtract/cumsum(exp)/log/add rather
+    // than calling the logaddexp scan the metallib does carry, so routing it
+    // would change the arithmetic instead of only the ownership.
+    const char* mlx_scan_op;
 };
 
-inline constexpr CumOpConfig kCumsumCfg       = {"cumsum",       &haganeOpsCumsum,       &cpu_dispatch_cumsum,     nullptr};
-inline constexpr CumOpConfig kCumprodCfg      = {"cumprod",      &haganeOpsCumprod,      &cpu_dispatch_cumprod,    nullptr};
-inline constexpr CumOpConfig kLogcumsumexpCfg = {"logcumsumexp", &haganeOpsLogcumsumexp, nullptr,                  &cpu_dispatch_logcumsumexp};
+inline constexpr CumOpConfig kCumsumCfg       = {"cumsum",       &haganeOpsCumsum,       &cpu_dispatch_cumsum,     nullptr, "sum"};
+inline constexpr CumOpConfig kCumprodCfg      = {"cumprod",      &haganeOpsCumprod,      &cpu_dispatch_cumprod,    nullptr, "prod"};
+inline constexpr CumOpConfig kLogcumsumexpCfg = {"logcumsumexp", &haganeOpsLogcumsumexp, nullptr,                  &cpu_dispatch_logcumsumexp, nullptr};
 
 // ---- Reduce-std/var op configuration (X+24) -------------------------------
 // std_var_stub takes (TensorIterator&, double correction, bool take_sqrt).
@@ -1733,15 +1748,32 @@ inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
     // unary_v is flat and unbroadcast: one linear index into each operand.
     if (!iter.is_contiguous()) return decline(R, torch_op, "iter_not_contiguous");
 
-    // Require in dtype == out dtype. MLX names a unary kernel by BOTH, so a
-    // widening or bool-producing variant is a DIFFERENT kernel; refusing here
-    // means the name we build is always the one we mean. logical_not over a
-    // float input lands here (bool out, float in) and correctly declines.
+    // The COMPUTE dtype is the output's. MLX names a unary kernel by BOTH
+    // dtypes and instantiates only matched pairs, so the kernel we name always
+    // computes in one type — but torch does not hand us one type.
+    //
+    // #1031: torch promotes a unary op's OUTPUT and leaves the INPUT alone,
+    // because upstream's gpu_kernel casts on the load. `reciprocal(int64)` and
+    // `sqrt(int64)` therefore arrive Long-in / Float-out, and this used to
+    // decline all of them (11 per ARDY step). The input is now CAST first with
+    // MLX's own v_copy, in the runtime, which is 1.4's operand-promotion pass
+    // one family over — and it guards the whole unary family, not one op.
+    //
+    // A BOOL output is still a decline and must stay one: `logical_not` over a
+    // float input is a different kernel, not a cast of this one, and casting the
+    // input would compute the wrong thing rather than fail to compute.
     const auto st = iter.dtype(0);
-    if (iter.dtype(1) != st)
-        return decline_dtypes(R, torch_op, "in_out_dtype_differ", iter.dtype(1), st);
+    const auto in_st = iter.dtype(1);
+    if (st == c10::ScalarType::Bool && in_st != st)
+        return decline_dtypes(R, torch_op, "bool_out_from_other_in", in_st, st);
     const int dt = hagane_vendor_dtype(st);
     if (dt < 0) return decline(R, torch_op, "dtype");
+    int src_dt = -1;
+    if (in_st != st) {
+        src_dt = hagane_vendor_dtype(in_st);
+        if (src_dt < 0)
+            return decline_dtypes(R, torch_op, "in_dtype_unspellable", in_st, st);
+    }
 
     // `~` on Bool IS logical negation in torch, and that is what MLX calls
     // LogicalNot — see the note on mlx_unary_op_name. Integer bitwise_not keeps
@@ -1759,16 +1791,35 @@ inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
     if (N > static_cast<int64_t>(UINT32_MAX)) return decline(R, torch_op, "numel_too_big");
 
     if (sb) {
-        // Divide on an integer dtype is INTEGER division, which is not what
-        // reciprocal means. torch promotes above the kernel
-        // (AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES_AND2), so this is unreachable
-        // today — measured, int64/int32/int16/uint8/bool all arrive as Float. It
-        // stays so that it declines rather than truncating if that ever changes.
+        // Divide on an integer COMPUTE dtype is INTEGER division, which is not
+        // what reciprocal means. torch promotes the output above the kernel
+        // (AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES_AND2), so `st` is float even
+        // when the INPUT is Long — which is exactly the #1031 case handled
+        // below. This guard stays for a compute dtype that is genuinely
+        // integral: decline rather than truncate.
         if (!c10::isFloatingType(st))
             return decline(R, torch_op, "scalar_binary_needs_float");
         uint64_t lhs_bits = 0;
         if (!vendor_scalar_bytes_of(c10::Scalar(sb->lhs), st, &lhs_bits))
             return decline(R, torch_op, "scalar_binary_lhs");
+        if (src_dt >= 0) {
+            // Promoted input: the cast pass lives on the binary_g entry, which
+            // already allocates its own scratch and runs v_copy before the op
+            // (1.4). The flat sv_ path below stays byte-identical for the
+            // un-promoted case, so 1.7c's bit-identity claim is untouched.
+            const int64_t ext[1] = {N};
+            const int64_t sa[1] = {0};      // the scalar rides at stride 0
+            const int64_t sbst[1] = {1};    // the tensor is contiguous
+            if (haganeOpsVendorBinaryGCast(sb->mlx_op, dt, dt, /*a=*/nullptr,
+                                           iter.data_ptr(1), iter.data_ptr(0),
+                                           /*a_is_scalar=*/1, /*b_is_scalar=*/0,
+                                           lhs_bits, 0, ext, sa, sbst, 1,
+                                           /*a_src_dtype=*/-1, src_dt)
+                != HAGANE_OPS_SUCCESS)
+                return decline(R, torch_op, "kernel_dispatch");
+            note_native_launch(std::string("mlx:g_") + sb->mlx_op);
+            return true;
+        }
         if (haganeOpsVendorBinary(sb->mlx_op, dt, dt, /*a=*/nullptr,
                                   iter.data_ptr(1), iter.data_ptr(0), N,
                                   /*a_is_scalar=*/1, /*b_is_scalar=*/0,
@@ -1778,8 +1829,8 @@ inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
         return true;
     }
 
-    if (haganeOpsVendorUnary(mlx_op, dt, dt, iter.data_ptr(1), iter.data_ptr(0), N)
-        != HAGANE_OPS_SUCCESS)
+    if (haganeOpsVendorUnaryCast(mlx_op, dt, dt, iter.data_ptr(1),
+                                 iter.data_ptr(0), N, src_dt) != HAGANE_OPS_SUCCESS)
         return decline(R, torch_op, "kernel_dispatch");
     note_native_launch(std::string("mlx:") + mlx_op);
     return true;
@@ -1857,6 +1908,192 @@ inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
                                   bits, ext, str, ng) != HAGANE_OPS_SUCCESS)
         return decline(R, nullptr, "kernel_dispatch");
     note_native_launch("mlx:Select");
+    return true;
+}
+
+// `where` through the SAME MLX Select kernels masked_fill_ uses — the general
+// form, where all three operands carry their own strides instead of two of them
+// being an immediate and a contiguous self.
+//
+// Geometry is taken the way try_vendor_binary_g takes it: each operand's stride
+// along every OUTPUT dimension, right-aligned, then collapsed outermost-first
+// wherever EVERY operand's index stays linear across the pair. That is what
+// makes a broadcast operand free — and it is not a corner case here. ARDY's 71
+// are 20 top-level `where.self` plus 51 nested inside hagane_index_on_device's
+// negative-index fixup (HaganeOps.cpp:2651), whose third operand is an
+// as_strided view of the caller's index tensor and may be broadcast.
+//
+// MLX instantiates Select by a SINGLE type name, so all three value operands
+// and the output share one dtype and the condition is bool. torch guarantees
+// exactly that above the stub — where_self_out casts self/other to result_type
+// and TORCH_CHECKs the condition is kBool — but the stub is public, so this
+// CHECKS rather than assumes and declines under its own name if it ever differs.
+inline bool try_vendor_where(TensorIteratorBase& iter) {
+    constexpr const char* R = "ternary";
+    constexpr const char* OP = "where";
+    route_enter(R, OP);
+    if (!vendor_elementwise_route_enabled()) return decline(R, OP, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, OP, "corpus_unavailable");
+    if (iter.ninputs() != 3) return decline(R, OP, "ninputs");
+
+    const auto out_st = iter.dtype(0);
+    const int dt = hagane_vendor_dtype(out_st);
+    if (dt < 0) return decline(R, OP, "dtype");
+    if (iter.dtype(1) != c10::ScalarType::Bool)
+        return decline(R, OP, "cond_not_bool");
+    // One kernel, one tname: a mixed value pair has no Select instantiation and
+    // must not be composed out of a cast the caller did not ask for.
+    if (iter.dtype(2) != out_st || iter.dtype(3) != out_st)
+        return decline_dtypes(R, OP, "operand_dtype_differ", iter.dtype(2), out_st);
+    if (iter.is_cpu_scalar(1)) return decline(R, OP, "cond_is_cpu_scalar");
+
+    const at::Tensor& out = iter.tensor(0);
+    if (!out.is_contiguous()) return decline(R, OP, "out_not_contiguous");
+    const int64_t N = iter.numel();
+    if (N <= 0) return true;                      // nothing to compute
+    if (N > static_cast<int64_t>(INT32_MAX)) return decline(R, OP, "numel_too_big");
+
+    const auto osz = out.sizes();
+    const int64_t n = static_cast<int64_t>(osz.size());
+    if (n > 16) return decline(R, OP, "rank_gt16");
+
+    int64_t st[3][16];
+    const void* ptrs[3] = {nullptr, nullptr, nullptr};
+    bool is_scalar[3] = {false, false, false};
+    uint64_t scalars[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++) {
+        const int arg = i + 1;
+        if (iter.is_cpu_scalar(arg)) {
+            if (!vendor_scalar_bytes(iter, arg, out_st, &scalars[i]))
+                return decline(R, OP, "scalar_dtype");
+            is_scalar[i] = true;
+            for (int64_t k = 0; k < n; ++k) st[i][k] = 0;
+            continue;
+        }
+        const at::Tensor& t = iter.tensor(arg);
+        const int64_t tn = t.dim();
+        if (tn > n) return decline(R, OP, "operand_rank_gt_out");
+        for (int64_t k = 0; k < n; ++k) {
+            const int64_t j = k - (n - tn);
+            if (j < 0)                    { st[i][k] = 0; continue; }
+            if (t.size(j) == osz[k])        st[i][k] = t.stride(j);
+            else if (t.size(j) == 1)        st[i][k] = 0;
+            else return decline(R, OP, "not_broadcastable");
+            if (st[i][k] < 0) return decline(R, OP, "negative_stride");
+        }
+        ptrs[i] = t.const_data_ptr();
+    }
+
+    int64_t ext[16], sc[16], sx[16], sy[16];
+    int ng = 0;
+    for (int64_t k = 0; k < n; ++k) {
+        if (osz[k] == 1) continue;
+        const int64_t e = osz[k], C = st[0][k], X = st[1][k], Y = st[2][k];
+        if (ng > 0 && sc[ng - 1] == C * e && sx[ng - 1] == X * e &&
+            sy[ng - 1] == Y * e) {
+            ext[ng - 1] *= e; sc[ng - 1] = C; sx[ng - 1] = X; sy[ng - 1] = Y;
+        } else {
+            ext[ng] = e; sc[ng] = C; sx[ng] = X; sy[ng] = Y; ++ng;
+        }
+    }
+    if (ng == 0) { ext[0] = 1; sc[0] = 0; sx[0] = 0; sy[0] = 0; ng = 1; }
+    if (ng > 3) return decline(R, OP, "groups_gt3");   // beyond g3_
+
+    if (haganeOpsVendorTernary(dt, ptrs[0], ptrs[1], ptrs[2], iter.data_ptr(0),
+                               is_scalar[1] ? 1 : 0, is_scalar[2] ? 1 : 0,
+                               scalars[1], scalars[2],
+                               ext, sc, sx, sy, ng) != HAGANE_OPS_SUCCESS)
+        return decline(R, OP, "kernel_dispatch");
+    note_native_launch("mlx:g_Select");
+    return true;
+}
+
+// A FULL reduction to one element through MLX's all_reduce kernels — torch's
+// `max()`, `min()`, `all()`, `any()` over a whole tensor.
+//
+// PARTIAL reductions decline: `all(x, dim=-1)` is MLX's row_reduce family, a
+// different kernel taking a whole reduction plan rather than a length, and it
+// picks between three kernels by row size. That is its own slice; here it keeps
+// the MLX fallback and is named in the decline table so the count is visible.
+inline bool try_vendor_reduce_all(const char* torch_op, const char* mlx_op,
+                                  const at::TensorBase& self,
+                                  const at::TensorBase& result) {
+    constexpr const char* R = "reduce_all";
+    route_enter(R, torch_op);
+    if (!mlx_op) return decline(R, torch_op, "no_mlx_reduce_op");
+    if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, torch_op, "corpus_unavailable");
+
+    if (result.numel() != 1) return decline(R, torch_op, "not_full_reduction");
+    if (!self.is_contiguous()) return decline(R, torch_op, "in_not_contiguous");
+    // MLX remaps the in/out pair only for sum and prod, which are not routed
+    // here; for max/min/and/or the two must already agree.
+    if (self.scalar_type() != result.scalar_type())
+        return decline_dtypes(R, torch_op, "in_out_dtype_differ",
+                              self.scalar_type(), result.scalar_type());
+    const int dt = hagane_vendor_dtype(self.scalar_type());
+    if (dt < 0) return decline(R, torch_op, "dtype");
+    const int64_t N = self.numel();
+    if (N <= 0) return decline(R, torch_op, "empty");
+
+    if (haganeOpsVendorReduceAll(mlx_op, dt, self.const_data_ptr(),
+                                 result.data_ptr(), N) != HAGANE_OPS_SUCCESS)
+        return decline(R, torch_op, "kernel_dispatch");
+    note_native_launch(std::string("mlx:all_reduce_") + mlx_op);
+    return true;
+}
+
+// cumsum / cumprod through MLX's own scan kernels, dispatched into the caller's
+// block. The fallback already runs these exact kernels via mx::cumsum /
+// mx::cumprod, so this is bit-identical to it and changes only who owns the
+// output — the same story as 1.7c's reciprocal.
+//
+// `dim` arrives already normalised to [0, ndim). The tensor is described to the
+// runtime by the scanned axis alone: its extent, its stride, and how many
+// independent scans there are.
+inline bool try_vendor_scan(const char* torch_op, const char* mlx_op,
+                            const at::TensorBase& self,
+                            const at::TensorBase& result,
+                            int64_t dim) {
+    constexpr const char* R = "scan";
+    route_enter(R, torch_op);
+    if (!mlx_op) return decline(R, torch_op, "no_mlx_scan_op");
+    if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, torch_op, "corpus_unavailable");
+
+    // MLX's Scan copies a non-contiguous input to a fresh contiguous array
+    // first; doing that here would allocate, which is the thing being removed.
+    if (!self.is_contiguous()) return decline(R, torch_op, "in_not_contiguous");
+    if (!result.is_contiguous()) return decline(R, torch_op, "out_not_contiguous");
+    if (self.scalar_type() != result.scalar_type())
+        return decline_dtypes(R, torch_op, "in_out_dtype_differ",
+                              self.scalar_type(), result.scalar_type());
+    const int dt = hagane_vendor_dtype(self.scalar_type());
+    if (dt < 0) return decline(R, torch_op, "dtype");
+    if (self.dim() == 0 || self.numel() <= 0)
+        return decline(R, torch_op, "empty_or_0d");
+    if (dim < 0 || dim >= self.dim()) return decline(R, torch_op, "dim_range");
+    if (self.sizes() != result.sizes()) return decline(R, torch_op, "shape_differ");
+
+    // For a contiguous tensor the scanned axis's stride is the product of the
+    // extents inside it, and `outer` is everything outside.
+    const int64_t axis_size = self.size(dim);
+    const int64_t stride = self.stride(dim);
+    if (axis_size <= 0 || stride <= 0) return decline(R, torch_op, "degenerate_axis");
+    const int64_t outer = self.numel() / (axis_size * stride);
+    if (outer <= 0) return decline(R, torch_op, "degenerate_axis");
+
+    if (haganeOpsVendorScan(mlx_op, dt, self.const_data_ptr(),
+                            result.data_ptr(), axis_size, stride, outer,
+                            /*reverse=*/0, /*inclusive=*/1) != HAGANE_OPS_SUCCESS)
+        return decline(R, torch_op, "kernel_dispatch");
+    note_native_launch(std::string("mlx:scan_") + mlx_op);
     return true;
 }
 
@@ -2365,7 +2602,19 @@ inline void hagane_kernel_bridge(TensorIteratorBase& iter) {
         iter.tensor(0).copy_(at::sign(iter.tensor(1)));
     } else {
         if constexpr (Cfg.metallib_kernel != nullptr) {
-            if (MetallibState<Cfg>::available && iter.is_contiguous()) {
+            // The kernel is named by the OUTPUT dtype and binds data_ptr(1) raw,
+            // so a PROMOTED INPUT would be read as the output's type: `iter.dtype()`
+            // is Float for `sqrt(int64)` while the buffer holds int64. That
+            // reinterpreted the bytes — sqrt(int64 1) came back 0.0, exp came back
+            // 1.0, log came back -inf — a silent-wrong across the whole owned
+            // unary family, and it predates 1.9. torch does this on purpose: it
+            // promotes a unary op's OUTPUT and leaves the INPUT alone, because
+            // upstream's gpu_kernel casts on the load and ours does not.
+            //
+            // Decline here and let try_vendor_unary below take it, which casts the
+            // input with MLX's own v_copy first (#1031).
+            if (MetallibState<Cfg>::available && iter.is_contiguous() &&
+                iter.dtype(1) == iter.dtype(0)) {
                 std::string kname =
                     metallib_kernel_name(Cfg.metallib_kernel, iter.dtype(), "");
                 if (!kname.empty() && try_launch_unary_metallib(kname, iter)) return;
@@ -2482,6 +2731,13 @@ inline void hagane_unary_iter_bridge(TensorIterator& iter) {
     // the bit-identical spine.
     if (Cfg.metallib_kernel != nullptr &&
         try_launch_reduction_metallib(iter, std::string(Cfg.op_name) == "mean"))
+        return;
+
+    // #1010 1.9: MLX's all_reduce, our output block. A partial reduction
+    // declines inside and falls through unchanged.
+    if (Cfg.mlx_reduce_op != nullptr &&
+        try_vendor_reduce_all(Cfg.op_name, Cfg.mlx_reduce_op,
+                              iter.tensor(1), iter.tensor(0)))
         return;
 
     auto out = make_ops_tensor_local(iter, 0);
@@ -2645,9 +2901,10 @@ inline haganeOpsTensor_t make_ops_tensor_from_tensor(const Tensor& t) {
 
 template <const CumOpConfig& Cfg>
 inline void hagane_cum_bridge_structured(const Tensor& self, const Tensor& result, int64_t dim) {
+    int32_t dim32 = static_cast<int32_t>(dim < 0 ? dim + self.dim() : dim);
+    if (try_vendor_scan(Cfg.op_name, Cfg.mlx_scan_op, self, result, dim32)) return;
     haganeOpsTensor_t in  = make_ops_tensor_from_tensor(self);
     haganeOpsTensor_t out = make_ops_tensor_from_tensor(result);
-    int32_t dim32 = static_cast<int32_t>(dim < 0 ? dim + self.dim() : dim);
     if (Cfg.c_abi_fn(&in, &out, dim32) != HAGANE_OPS_SUCCESS) {
         ::haganeOpsFlush();
         Cfg.cpu_structured_fn(self, result, dim);

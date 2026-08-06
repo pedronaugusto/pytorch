@@ -449,7 +449,20 @@ static int32_t hagane_dtype(c10::ScalarType st) {
   }
 }
 
+// THIS is where a full `torch.max(t)` lands — not hagane_max_all_kernel and not
+// the max_values bridge row. Both of those also call haganeOpsMaxValues, which
+// is why the stash attribution alone could not say which; only the route's own
+// ENTER counter could, and it read zero until the call went here.
+//
+// The CPU fallback below writes through a `float*` whatever the tensor's dtype,
+// so an int64 max would land as float32 bits in an int64 block. It is
+// unreachable today (haganeOpsMaxValues does not fail) and the route above does
+// not change that, but it is a latent silent-wrong of the same shape as 1.6's
+// empty-arange — recorded rather than quietly left.
 C10_EXPORT void max_all_launch_kernel(TensorIterator& iter) {
+  if (hagane_dispatch::detail::try_vendor_reduce_all("max_all", "max",
+                                                     iter.tensor(1), iter.tensor(0)))
+    return;
   // Use the same make_ops_tensor pattern that works for sum/argmax
   auto out = make_ops_tensor_ext(iter, 0);
   auto in = make_ops_tensor_ext(iter, 1);
@@ -464,6 +477,9 @@ C10_EXPORT void max_all_launch_kernel(TensorIterator& iter) {
 }
 
 C10_EXPORT void min_all_launch_kernel(TensorIterator& iter) {
+  if (hagane_dispatch::detail::try_vendor_reduce_all("min_all", "min",
+                                                     iter.tensor(1), iter.tensor(0)))
+    return;
   auto out = make_ops_tensor_ext(iter, 0);
   auto in = make_ops_tensor_ext(iter, 1);
   if (haganeOpsMinValues(&in, &out) != HAGANE_OPS_SUCCESS) {
@@ -554,8 +570,18 @@ C10_EXPORT void launch_gather_topk_kernel(
 // Level B: Scan launch_kernel functions (called from compiled ScanKernels.cpp)
 // ---------------------------------------------------------------------------
 
+// THIS is the live cumsum/cumprod path, not hagane_cum_bridge_structured.
+// `cumsum_stub` has TWO registrations — torch's own hipified ScanKernels.cpp
+// (which calls these) and HaganeMetallibBridge.cpp's bridge row — and whichever
+// static initialiser runs last wins. Both end in the same C-ABI so it has never
+// mattered, but 1.9's scan route entered ZERO times when it was wired only into
+// the bridge. So the route goes in both places rather than in whichever one is
+// believed to win.
 C10_EXPORT void launch_cumsum_cuda_kernel(
     const TensorBase& result, const TensorBase& self, int64_t dim) {
+  const int64_t d = dim < 0 ? dim + self.dim() : dim;
+  if (hagane_dispatch::detail::try_vendor_scan("cumsum", "sum", self, result, d))
+    return;
   auto in_d = make_tensor_desc(self);
   auto out_d = make_tensor_desc(result);
   if (haganeOpsCumsum(&in_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
@@ -568,6 +594,9 @@ C10_EXPORT void launch_cumsum_cuda_kernel(
 
 C10_EXPORT void launch_cumprod_cuda_kernel(
     const TensorBase& result, const TensorBase& self, int64_t dim) {
+  const int64_t d = dim < 0 ? dim + self.dim() : dim;
+  if (hagane_dispatch::detail::try_vendor_scan("cumprod", "prod", self, result, d))
+    return;
   auto in_d = make_tensor_desc(self);
   auto out_d = make_tensor_desc(result);
   if (haganeOpsCumprod(&in_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
@@ -2307,7 +2336,13 @@ void hagane_softplus_kernel(TensorIteratorBase& iter, const Scalar& beta, const 
 // dispatch bug (silent CPU-only); bridge migration fixes it.
 
 // ReduceAllOps: max_all, min_all — different signature: (Tensor& result, const Tensor& self)
+//
+// This is where ARDY's `max()` lands — max_all_stub, ONE output, 20 stashes a
+// step — not max.dim, which returns values AND indices. Routed through MLX's
+// all_reduce into the caller's block (#1010 1.9).
 void hagane_max_all_kernel(Tensor& result, const Tensor& self) {
+  if (hagane_dispatch::detail::try_vendor_reduce_all("max_all", "max", self, result))
+    return;
   haganeOpsTensor_t out_d = { result.data_ptr(), result.sizes().data(), result.strides().data(),
     static_cast<int32_t>(result.dim()), to_hagane_dtype(result.scalar_type()) };
   haganeOpsTensor_t in_d = { const_cast<void*>(self.const_data_ptr()), self.sizes().data(), self.strides().data(),
@@ -2319,6 +2354,8 @@ void hagane_max_all_kernel(Tensor& result, const Tensor& self) {
 }
 
 void hagane_min_all_kernel(Tensor& result, const Tensor& self) {
+  if (hagane_dispatch::detail::try_vendor_reduce_all("min_all", "min", self, result))
+    return;
   haganeOpsTensor_t out_d = { result.data_ptr(), result.sizes().data(), result.strides().data(),
     static_cast<int32_t>(result.dim()), to_hagane_dtype(result.scalar_type()) };
   haganeOpsTensor_t in_d = { const_cast<void*>(self.const_data_ptr()), self.sizes().data(), self.strides().data(),
@@ -2434,6 +2471,10 @@ void hagane_clamp_max_scalar_kernel(TensorIteratorBase& iter, Scalar max_val) {
 // ---------------------------------------------------------------------------
 
 void hagane_where_kernel(TensorIterator& iter) {
+  // MLX's own Select kernels, dispatched into the caller's block (#1010 1.9).
+  // Declines leave the block untouched and fall through to the MLX C-ABI below,
+  // which is correct and stashes.
+  if (hagane_dispatch::detail::try_vendor_where(iter)) return;
   auto out = make_ops_tensor(iter, 0);
   auto cond = make_ops_tensor(iter, 1);
   auto a = make_ops_tensor(iter, 2);
