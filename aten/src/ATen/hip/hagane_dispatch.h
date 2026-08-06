@@ -1468,6 +1468,31 @@ inline const char* alpha_effective_op(const char* op, const c10::Scalar& alpha) 
     return nullptr;
 }
 
+// #1026 — can `out = a + alpha*b` be evaluated in FLOAT32 without changing the
+// answer? That is the question the MLX C-ABI actually asks, because
+// `haganeOpsAdd` takes a `float alpha` and builds it as a float32 mx::array, so
+// the alpha multiply happens in float32 whatever the tensors are.
+//
+//   float dtypes  YES, and it is what parity requires: torch's CUDA kernel
+//                 accumulates this in at::acc_type<scalar_t, true>, which is
+//                 float for Half, BFloat16 and Float alike. The only extra
+//                 condition is that the alpha itself survive double -> float.
+//   integer       NO. torch computes in int64; float32 carries 24 bits. Neither
+//                 the alpha nor the operand values are safe, and the values
+//                 cannot be checked from here without reading device memory.
+//   complex       NO. toFloat() would drop the imaginary part outright.
+//
+// alpha == 1 and alpha == -1 never reach this test — alpha_effective_op maps
+// those onto MLX's Add and Subtract exactly — so it only ever judges a general
+// alpha. Measured on the shipped build: torch.add(int64, 3, alpha=2**24+1) came
+// back 4 off, silently.
+inline bool alpha_expressible_in_float(c10::ScalarType st,
+                                       const c10::Scalar& alpha) {
+    if (c10::isIntegralType(st, /*includeBool=*/true)) return false;
+    if (alpha.isComplex()) return false;
+    return static_cast<double>(alpha.toFloat()) == alpha.toDouble();
+}
+
 // torch's unary stub name -> MLX's operator name. nullptr means "not ours".
 //
 // Availability was checked against the shipped corpus, but availability is not
@@ -2284,6 +2309,23 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
     // sub.Tensor at 187 MLX-owned dispatches and zero owned.
     if (const char* eop = alpha_effective_op(Cfg.op_name, alpha))
         if (try_vendor_binary(eop, iter)) return;
+
+    // #1026 — everything past here evaluates `a + alpha*b` in FLOAT32, because
+    // the C-ABI takes a `float alpha` and haganeOpsAdd builds it as a float32
+    // mx::array. Faithful for the float dtypes (CUDA's accscalar_t is float
+    // there too), not faithful for the integer ones. Take torch's own exact
+    // implementation rather than return a plausible wrong answer — measured, the
+    // wrong answer was torch.add(int64, 3, alpha=2**24+1) off by 4.
+    //
+    // This is a decline, not a route: the route is `tmp = alpha*b; out = a+tmp`
+    // as two owned dispatches, which is 1.7b's shape and a follow-on. Keeping a
+    // silent-wrong until then is not an option the project has.
+    if (!alpha_expressible_in_float(iter.common_dtype(), alpha)) {
+        (void)decline("bin_alpha", Cfg.op_name, "alpha_not_float_exact");
+        ::haganeOpsFlush();
+        Cfg.cpu_fallback(iter, alpha);
+        return;
+    }
 
     auto out = make_ops_tensor_local(iter, 0);
     at::Tensor sa, sb;

@@ -7692,21 +7692,47 @@ at::Tensor hagane_slice_tensor(const at::Tensor& self,
   return result;
 }
 
-// Sprint VIII Lane B2 — scalar-arity binary ops. PyTorch's default
-// CompositeImplicitAutograd implementations route Tensor*Scalar (and Scalar
-// *Tensor for `__radd__`/`__rsub__`) through `at::wrapped_scalar_tensor`,
-// which on the Hagane fork produces a CPU scalar tensor that gets cross-
-// device-broadcast against the CUDA tensor. The cross-device broadcast goes
-// through a path with a dtype-promotion bug surfaced by Sprint VI Lane B1
-// (max_diff ~6.65 on `__radd__`/`__rsub__`).
+// #1010 1.7a — the five `.Scalar` overrides that used to live here
+// (add/sub/rsub/mul/div) are DELETED, not routed. What they said, and what
+// each claim measured out to, because the reasoning is the reusable part:
 //
-// Sprint X+1 Lane B.2 — direct Scalar-overload C-ABI. Was: `at::full_like
-// (self, scalar)` + re-dispatch through `at::add(self, rhs)` (~5-10 μs/call
-// of broadcast-tensor allocation + ~5-10 μs of TensorIterator setup, ×30
-// Scalar calls/token = 150-300 μs/token). New: `haganeOpsAddScalar` etc.
-// pass the scalar inline — MLX broadcasts a 0-dim mx::array natively, no
-// broadcast-tensor allocation, no re-dispatch. Output dtype matches self's
-// dtype (matches the previous path's `at::full_like + at::add` semantic).
+//   "PyTorch's default implementations route Tensor*Scalar through
+//    `at::wrapped_scalar_tensor`, and the cross-device broadcast has a
+//    dtype-promotion bug (max_diff ~6.65 on __radd__/__rsub__)."
+//      -> DEAD. A probe over {f32,f16,bf16,i64,i32} x {add,sub,rsub,mul,div},
+//         both operand orders, and the in-place composites `add_`/`sub_`/`mul_`
+//         (which were never overridden and so run the real wrapped-number path)
+//         matches CPU 79/79. The bug was fixed elsewhere; only the workaround
+//         outlived it.
+//
+//   "at::full_like + re-dispatch costs 5-10 us of broadcast-tensor allocation
+//    plus 5-10 us of TensorIterator setup per call."
+//      -> STALE BY CONSTRUCTION. That measured the override against a 2024
+//         alternative. Today `add.Scalar` decomposes to `add.Tensor` with a
+//         0-dim CPU operand, TensorIterator marks it `is_cpu_scalar`, and
+//         try_vendor_binary_flat dispatches MLX's `vs_Add` with the scalar as a
+//         setBytes immediate — no allocation, no broadcast tensor, and the
+//         caller's block is the output. `rsub.Scalar` lands on `sv_Subtract`
+//         the same way.
+//
+// Keeping them cost three live defects, none of which the C-ABI could express:
+//   1. NO TYPE PROMOTION. `at::empty_like(self)` fixes the output to self's
+//      dtype, so `int32_tensor` rsub `1.5` returned int32 where torch returns
+//      float32. Measured.
+//   2. THE SCALAR WENT THROUGH double AND THEN float. `other.toDouble()` here,
+//      `static_cast<float>(scalar)` in the runtime: `rsub(int64, 2^53+1)` was
+//      off by one. Same defect class 1.6 removed from arange.
+//   3. Autograd was never verified through an m.impl on a CUDA-key override.
+//      It is fine — all five are CompositeExplicitAutograd with derivatives.yaml
+//      formulas, so the Autograd key sits ABOVE CUDA and cannot be shadowed
+//      from below — but that was checked, not assumed, and it is recorded here
+//      because the plan had asserted the opposite.
+//
+// The five `haganeOps*Scalar` runtime entries STAY. Nothing in the torch tree
+// calls them now (checked), but they are shipped ABI and the replay tape
+// records scalar binaries through them (#999).
+//
+// hagane_make_tensor_desc survives for cdist/pdist below.
 static haganeOpsTensor_t hagane_make_tensor_desc(const at::Tensor& t) {
   haganeOpsTensor_t desc;
   desc.data    = t.data_ptr();
@@ -7715,61 +7741,6 @@ static haganeOpsTensor_t hagane_make_tensor_desc(const at::Tensor& t) {
   desc.ndim    = static_cast<int32_t>(t.dim());
   desc.dtype   = to_hagane_dtype(t.scalar_type());
   return desc;
-}
-
-at::Tensor hagane_add_Scalar(const at::Tensor& self,
-                             const at::Scalar& other,
-                             const at::Scalar& alpha) {
-  auto result = at::empty_like(self);
-  auto self_d   = hagane_make_tensor_desc(self);
-  auto result_d = hagane_make_tensor_desc(result);
-  haganeOpsAddScalar(&self_d, other.toDouble(), alpha.toDouble(),
-                     to_hagane_dtype(self.scalar_type()), &result_d);
-  return result;
-}
-
-at::Tensor hagane_sub_Scalar(const at::Tensor& self,
-                             const at::Scalar& other,
-                             const at::Scalar& alpha) {
-  auto result = at::empty_like(self);
-  auto self_d   = hagane_make_tensor_desc(self);
-  auto result_d = hagane_make_tensor_desc(result);
-  haganeOpsSubScalar(&self_d, other.toDouble(), alpha.toDouble(),
-                     to_hagane_dtype(self.scalar_type()), &result_d);
-  return result;
-}
-
-at::Tensor hagane_rsub_Scalar(const at::Tensor& self,
-                              const at::Scalar& other,
-                              const at::Scalar& alpha) {
-  // rsub(self, other, alpha) == other - alpha * self
-  auto result = at::empty_like(self);
-  auto self_d   = hagane_make_tensor_desc(self);
-  auto result_d = hagane_make_tensor_desc(result);
-  haganeOpsRsubScalar(&self_d, other.toDouble(), alpha.toDouble(),
-                      to_hagane_dtype(self.scalar_type()), &result_d);
-  return result;
-}
-
-// Sprint VIII Lane B4 → Sprint X+1 Lane B.2. _refs.* decompositions
-// dispatch `value * tensor1` / `tensor1 / 2.0` to `aten::mul.Scalar` /
-// `aten::div.Scalar`. Same direct C-ABI path; output dtype matches self.
-at::Tensor hagane_mul_Scalar(const at::Tensor& self, const at::Scalar& other) {
-  auto result = at::empty_like(self);
-  auto self_d   = hagane_make_tensor_desc(self);
-  auto result_d = hagane_make_tensor_desc(result);
-  haganeOpsMulScalar(&self_d, other.toDouble(),
-                     to_hagane_dtype(self.scalar_type()), &result_d);
-  return result;
-}
-
-at::Tensor hagane_div_Scalar(const at::Tensor& self, const at::Scalar& other) {
-  auto result = at::empty_like(self);
-  auto self_d   = hagane_make_tensor_desc(self);
-  auto result_d = hagane_make_tensor_desc(result);
-  haganeOpsDivScalar(&self_d, other.toDouble(),
-                     to_hagane_dtype(self.scalar_type()), &result_d);
-  return result;
 }
 
 // Sprint X+2 Lane B — distance ops cdist/pdist. Composes pairwise p-norm
@@ -7810,11 +7781,9 @@ at::Tensor hagane_pdist_forward(const at::Tensor& self, double p) {
 TORCH_LIBRARY_IMPL(aten, CUDA, m) {
   m.impl("select.int",  TORCH_FN(hagane_select_int));
   m.impl("slice.Tensor", TORCH_FN(hagane_slice_tensor));
-  m.impl("add.Scalar",  TORCH_FN(hagane_add_Scalar));
-  m.impl("sub.Scalar",  TORCH_FN(hagane_sub_Scalar));
-  m.impl("rsub.Scalar", TORCH_FN(hagane_rsub_Scalar));
-  m.impl("mul.Scalar",  TORCH_FN(hagane_mul_Scalar));
-  m.impl("div.Scalar",  TORCH_FN(hagane_div_Scalar));
+  // add/sub/rsub/mul/div .Scalar are deliberately NOT overridden — see 1.7a
+  // above. Their upstream CompositeExplicitAutograd decomposition reaches the
+  // vendor scalar route, promotes correctly, and keeps the Scalar exact.
   m.impl("_cdist_forward", TORCH_FN(hagane_cdist_forward));
   m.impl("_pdist_forward", TORCH_FN(hagane_pdist_forward));
 }

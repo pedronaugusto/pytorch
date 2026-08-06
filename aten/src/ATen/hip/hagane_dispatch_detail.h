@@ -402,19 +402,25 @@ inline void cpu_dispatch_hardtanh_backward(TensorIterator& iter,
 // add_stub / sub_stub have no CPU kernel registration; the retired form ran
 // lift + clone + in-place + copy directly.
 
+// #1026 — OUT-OF-PLACE, deliberately. These built the result as
+// `iter.tensor(1).cpu().clone()` and then `add_`d operand 2 into it, which
+// cannot broadcast operand 1 UP: an in-place op keeps the destination's shape.
+// `rsub.Scalar` decomposes to `sub.Tensor(wrapped_scalar, self)`, so operand 1
+// is 0-dim and operand 2 is the tensor, and the clone raised
+// "output with shape [] doesn't match the broadcast shape [N]".
+//
+// Latent until 1.7 — c_abi_fn essentially never returned UNSUPPORTED, so this
+// path was only ever entered with matching shapes. Adding the alpha decline
+// above made it reachable, the same way 1.6's size fix made an empty mx::arange
+// reachable. at::add/at::sub broadcast and promote exactly as torch does, and
+// copy_ handles the output's dtype and device.
 inline void cpu_fallback_add(TensorIteratorBase& iter, const Scalar& alpha) {
-    auto cpu_a = iter.tensor(1).cpu();
-    auto cpu_b = iter.tensor(2).cpu();
-    auto r = cpu_a.clone();
-    r.add_(cpu_b, alpha);
-    iter.tensor(0).copy_(r);
+    iter.tensor(0).copy_(
+        at::add(iter.tensor(1).cpu(), iter.tensor(2).cpu(), alpha));
 }
 inline void cpu_fallback_sub(TensorIteratorBase& iter, const Scalar& alpha) {
-    auto cpu_a = iter.tensor(1).cpu();
-    auto cpu_b = iter.tensor(2).cpu();
-    auto r = cpu_a.clone();
-    r.sub_(cpu_b, alpha);
-    iter.tensor(0).copy_(r);
+    iter.tensor(0).copy_(
+        at::sub(iter.tensor(1).cpu(), iter.tensor(2).cpu(), alpha));
 }
 
 // ---- Unary-scalar C-ABI trampolines ---------------------------------------
