@@ -1493,6 +1493,49 @@ inline bool alpha_expressible_in_float(c10::ScalarType st,
     return static_cast<double>(alpha.toFloat()) == alpha.toDouble();
 }
 
+// A general alpha that reaches the MLX path records NOTHING today, so its
+// stashes arrive with no named reason — 60/step on ARDY with an empty decline
+// table. Name them. The three facts here are the ones that decide whether the
+// caller could be folded onto a vs_ kernel instead:
+//
+//   b=cpu_scalar   alpha*b is ONE number and can be folded on the host.
+//                  b=tensor means it cannot, whatever else is true.
+//   dtype          float32 and the integers can fold; Half/BFloat16 must not,
+//                  because CUDA's ufunc computes those in opmath_t = float
+//                  (UfuncCUDA_add.cu: CUDAFunctorOnSelf_add holds other_ and
+//                  alpha_ at opmath_t) while a fold has to materialise the
+//                  product in the narrow dtype.
+//   prod_exact     whether alpha*b is exactly representable in the compute
+//                  dtype. Only then is `a + p` a single rounding, which is
+//                  what CUDA's fma-contracted `self + alpha*other` computes.
+//
+// A count alone would not distinguish "51 foldable" from "51 that cannot be",
+// which is the whole lesson of 1.7a.
+inline void note_general_alpha(const char* op, TensorIteratorBase& iter,
+                               const c10::Scalar& alpha) {
+    if (!decline_trace_on()) return;
+    const auto ct = iter.common_dtype();
+    std::string w = std::string("general_alpha[") + c10::toString(ct);
+    const bool b_scalar = iter.is_cpu_scalar(2);
+    w += b_scalar ? "|b=cpu_scalar" : "|b=tensor";
+    if (iter.is_cpu_scalar(1)) w += "|a=cpu_scalar";
+    if (b_scalar) {
+        bool exact = false;
+        if (c10::isIntegralType(ct, /*includeBool=*/true)) {
+            exact = true;                    // integer multiply, exact mod 2^N
+        } else if (ct == c10::ScalarType::Float) {
+            // double holds the product of two float32s exactly, so this is a
+            // representability test and not an approximation of one
+            const double p = static_cast<double>(alpha.toFloat())
+                           * static_cast<double>(iter.scalar_value<float>(2));
+            exact = (static_cast<double>(static_cast<float>(p)) == p);
+        }
+        w += exact ? "|prod_exact" : "|prod_inexact";
+    }
+    w += "]";
+    haganeOpsDeclineNote("bin_alpha", op, w.c_str());
+}
+
 // torch's unary stub name -> MLX's operator name. nullptr means "not ours".
 //
 // Availability was checked against the shipped corpus, but availability is not
@@ -2434,6 +2477,8 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
         Cfg.cpu_fallback(iter, alpha);
         return;
     }
+
+    note_general_alpha(Cfg.op_name, iter, alpha);
 
     auto out = make_ops_tensor_local(iter, 0);
     at::Tensor sa, sb;

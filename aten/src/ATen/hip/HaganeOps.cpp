@@ -318,44 +318,24 @@ C10_EXPORT Tensor empty_strided_cuda(
 
 namespace at::native {
 
-// Forward declaration for the F.1 fix below — defined at line ~358.
-static haganeOpsTensor_t make_tensor_desc(const at::TensorBase& t);
-
+// This carried a Sprint F.1 bypass: when `out` or either input was
+// non-contiguous it contiguified the inputs, computed into a FRESH buffer via
+// haganeOpsAdd directly, and did `out.set_(fresh)`. It was written for a
+// capture-tape problem (copy_result's eager path did not record
+// HAGANE_CAPTURE_RECORD_OUTPUT), and it was two silent-wrongs:
+//   - `torch.add(a, b, out=base[::2])` left `base` UNTOUCHED. set_ rebinds the
+//     caller's tensor to the fresh storage, so an out= argument never received
+//     the result and its strides silently changed. Measured all-zeros where
+//     CPU gives [3,0,3,0,3,0,3,0].
+//   - `add(x.t(), y).stride()` came back (4,1) against CPU/CUDA's (1,6).
+//     torch's meta function assigns the first input's strides; substituting a
+//     contiguous buffer is an observable layout change.
+// sub/mul/div never had it and are correct, and Double already took add_stub
+// while non-contiguous — so the bypass was not load-bearing. The tape concern
+// it was written for is #1003's, which is fixed; the capture/replay
+// conformance suite (#994) is the gate that says so.
 TORCH_IMPL_FUNC(ufunc_add_CUDA)(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha, const at::Tensor& out) {
-  // Sprint F.1 — ADR-027 Invariant C. PyTorch's meta function allocates
-  // `out` with strides matching the first input; for non-contig inputs
-  // (e.g. Whisper's inputs_embeds = conv2_out.permute(0,2,1)) the output
-  // ends up non-contig too. add_stub → hagane_add_kernel can compute
-  // correctly but its writeback into a non-contig destination falls into
-  // copy_result's eager path which doesn't record HAGANE_CAPTURE_RECORD_
-  // OUTPUT — the op drops from the tape and fresh-input replay can't
-  // propagate the chain. Fix: pre-contiguify inputs and SUBSTITUTE `out`'s
-  // storage with a freshly-allocated contig buffer. The structured-
-  // kernel wrapper returns this buffer to the caller, so the user's view
-  // of the result is contig — same logical values, different physical
-  // layout. Mirrors cat_out_cuda + _hagane_sdpa_forward.
-  if (out.is_contiguous() && self.is_contiguous() && other.is_contiguous()) {
-    add_stub(device_type(), *this, alpha);
-    return;
-  }
-  if (out.scalar_type() == c10::ScalarType::Double) {
-    add_stub(device_type(), *this, alpha);
-    return;
-  }
-  auto a = self.is_contiguous() ? self : self.contiguous();
-  auto b = other.is_contiguous() ? other : other.contiguous();
-  auto fresh = at::empty(out.sizes(), out.options());
-  auto a_d = make_tensor_desc(a);
-  auto b_d = make_tensor_desc(b);
-  auto fresh_d = make_tensor_desc(fresh);
-  if (haganeOpsAdd(&a_d, &b_d, &fresh_d, alpha.toFloat()) == HAGANE_OPS_SUCCESS) {
-    const_cast<at::Tensor&>(out).set_(fresh);
-    return;
-  }
-  HAGANE_BEFORE_RAW_READ();
-  auto cpu_r = at::add(a.cpu(), b.cpu(), alpha);
-  fresh.copy_(cpu_r);
-  const_cast<at::Tensor&>(out).set_(fresh);
+  add_stub(device_type(), *this, alpha);
 }
 
 // ---------------------------------------------------------------------------
