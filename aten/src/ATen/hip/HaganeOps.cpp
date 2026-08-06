@@ -946,6 +946,16 @@ C10_EXPORT Tensor index_select_cuda(
   result_sizes[dim] = index.numel();
   auto result = at::empty(result_sizes, self.options());
 
+  // 1.10-A: the Hagane-owned gather (hagane/kernels/index.hip), writing the
+  // caller's own block. Carries `embedding` too — embedding_symint IS
+  // weight.index_select(0, idx), unconditionally (native/Embedding.cpp:37), so
+  // 60 of ARDY's 91 ride this. Declines (having encoded nothing) for a dtype,
+  // rank or layout the kernel does not cover; the MLX path below then runs
+  // unchanged.
+  if (hagane_dispatch::detail::try_index_gather_axis(
+          "index_select", self, index, result, dim, /*index_1d_along_dim=*/true))
+    return result;
+
   auto in_d = make_tensor_desc(self);
   auto idx_d = make_tensor_desc(index);
   auto out_d = make_tensor_desc(result);
@@ -2490,6 +2500,15 @@ void hagane_where_kernel(TensorIterator& iter) {
 
 void hagane_gather_kernel(const Tensor& result, const Tensor& self,
                           int64_t dim, const Tensor& index) {
+  // 1.10-C: the SAME owned kernel A routes, with the index addressed by the
+  // full output coordinate instead of by coord[dim] — that is the only
+  // difference between torch's gather and its index_select. ARDY's index is
+  // BROADCAST ((3,1,1,3) stride (1,1,1,0)), which rides as strides here rather
+  // than being materialised.
+  if (hagane_dispatch::detail::try_index_gather_axis(
+          "gather", self, index, result, dim, /*index_1d_along_dim=*/false))
+    return;
+
   auto in_d = make_tensor_desc(self);
   auto idx_d = make_tensor_desc(index);
   auto out_d = make_tensor_desc(result);
@@ -2501,6 +2520,13 @@ void hagane_gather_kernel(const Tensor& result, const Tensor& self,
 
 void hagane_scatter_kernel(const Tensor& self, int64_t dim,
                            const Tensor& index, const Tensor& src) {
+  // 1.10-D: the owned scatter (hagane/kernels/index.hip), writing `self`'s own
+  // block. `self` is the output here — the structured op cloned it — and the
+  // kernel writes only the scattered positions, so the route materialises any
+  // stale stash first rather than superseding it (#1014).
+  if (hagane_dispatch::detail::try_index_scatter_axis(self, dim, index, src))
+    return;
+
   auto self_d = make_tensor_desc(self);
   auto idx_d = make_tensor_desc(index);
   auto src_d = make_tensor_desc(src);
@@ -2581,6 +2607,15 @@ void hagane_scatter_reduce_two_kernel(const Tensor& self, int64_t dim,
 static bool hagane_index_on_device(TensorIteratorBase& iter,
                                    IntArrayRef indexed_sizes,
                                    IntArrayRef indexed_strides) {
+  // 1.10-B: the Hagane-owned advanced-index gather (hagane/kernels/index.hip),
+  // one dispatch into the caller's own block. Same arithmetic as both paths
+  // below, without the stash (haganeOpsIndexGather) and without the ~12 aten
+  // dispatches (the at:: composition). Declines during capture and for any
+  // shape it does not cover, and then those paths run unchanged.
+  if (hagane_dispatch::detail::try_index_gather_advanced(iter, indexed_sizes,
+                                                         indexed_strides))
+    return true;
+
   const int ntensor = iter.ntensors();
   const int n_idx = ntensor - 2;
   if (n_idx <= 0 || (int)indexed_sizes.size() != n_idx ||

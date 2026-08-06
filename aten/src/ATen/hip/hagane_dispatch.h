@@ -2550,6 +2550,408 @@ inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
     return true;
 }
 
+// ---- 1.10: the index family, Hagane-owned (see hagane/kernels/index.hip) -----
+// PyTorch's real index kernels do not transpile — ScatterGatherKernel.hip 27
+// errors / 0 kernels (an atomicCAS overload gap), IndexKernel.hip 25 errors / 1
+// irrelevant kernel, Indexing.hip 1163 errors / 0 kernels — so we own generic
+// gather/scatter primitives, exactly as reduce.hip owns the block reducer and
+// for the same stated reason. Route-off (HAGANE_USE_METALLIB_ROUTE=0) skips
+// registration → MLX (mx::take / take_along_axis / put_along_axis), the spine
+// these replace.
+inline bool index_metallib_available() {
+    static const bool available = [] {
+        const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+        if (route && route[0] == '0') return false;
+        std::string path = metallib_dir() + "/index.metallib";
+        if (haganeRegisterMetallibAll(path.c_str()) != hipSuccess) {
+            std::fprintf(stderr,
+                "[hagane-path-alpha] failed to register %s; index ops stay on MLX\n",
+                path.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+            "[hagane-path-alpha] index metallib registered (gather/scatter, 24 kernels)\n");
+        return true;
+    }();
+    return available;
+}
+
+// Mirrors HaganeGatherDims in hagane/kernels/index.hip. Rides as ONE setBytes
+// scalar, so the per-dim strides cost no device allocation and no upload.
+// KEEP IN SYNC with the kernel source — a mismatch is a silent-wrong, which is
+// why both sides name MAX_DIMS from the same literal and the gate runs every
+// rank 1..8.
+#define HAGANE_INDEX_MAX_DIMS 8
+struct HaganeGatherDimsHost {
+    int64_t shape[HAGANE_INDEX_MAX_DIMS];
+    int64_t a_es[HAGANE_INDEX_MAX_DIMS];
+    int64_t b_es[HAGANE_INDEX_MAX_DIMS];
+    int64_t c_es[HAGANE_INDEX_MAX_DIMS];
+};
+
+// Element span an operand's strides actually reach over `shape`, so the input
+// settle covers exactly the bytes the kernel reads and the output mark covers
+// exactly the bytes it writes. Same quantity the vendor routes compute.
+inline int64_t index_span_elems(const int64_t* shape, const int64_t* es, int ndim) {
+    int64_t span = 1;
+    for (int d = 0; d < ndim; ++d)
+        if (shape[d] > 1) span += (shape[d] - 1) * es[d];
+    return span;
+}
+
+// The element-size arm. Selection is a pure element copy, so b1/b2/b4/b8 cover
+// every torch dtype EXACTLY — there is no per-dtype numerics here at all.
+inline const char* index_bsuffix(int64_t esz) {
+    switch (esz) {
+        case 1: return "b1";
+        case 2: return "b2";
+        case 4: return "b4";
+        case 8: return "b8";
+        default: return nullptr;
+    }
+}
+
+// A + C — gather along one axis. ONE route, because index_select and gather
+// compute the same thing and differ only in how the index is addressed:
+//   index_select / embedding : index is 1-D along `dim`  -> b_es[d]=0 for d!=dim
+//   gather                   : index carries out's shape -> b_es = its strides
+// Callers pass `index_1d_along_dim` to say which. Every operand is addressed
+// through its own strides, so a non-contiguous input, output or (ARDY's real
+// shape) a BROADCAST index all route rather than declining.
+inline bool try_index_gather_axis(const char* torch_op, const at::Tensor& in,
+                                  const at::Tensor& index, const at::Tensor& out,
+                                  int64_t dim, bool index_1d_along_dim) {
+    const char* R = "index_axis";
+    if (!index_metallib_available()) return false;
+    route_enter(R, torch_op);
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (!in.defined() || !index.defined() || !out.defined())
+        return decline(R, torch_op, "undefined_operand");
+    if (!in.is_cuda() || !index.is_cuda() || !out.is_cuda())
+        return decline(R, torch_op, "not_device");
+    // Raw element copy: a dtype mismatch would move bytes between
+    // representations, which is a silent-wrong and not something the caller can
+    // see. index_select and gather both preserve dtype, so this only fires if
+    // an unexpected caller appears.
+    if (in.scalar_type() != out.scalar_type())
+        return decline_dtypes(R, torch_op, "in_out_dtype_differ",
+                              in.scalar_type(), out.scalar_type());
+    const int64_t esz = out.element_size();
+    const char* bsfx = index_bsuffix(esz);
+    if (!bsfx) return decline(R, torch_op, "element_size");
+
+    const auto ist = index.scalar_type();
+    const char* isfx = ist == at::kLong ? "i64" : (ist == at::kInt ? "i32" : nullptr);
+    if (!isfx) return decline_dtypes(R, torch_op, "index_dtype", ist, out.scalar_type());
+
+    const int ndim = static_cast<int>(out.dim());
+    if (ndim <= 0 || ndim > HAGANE_INDEX_MAX_DIMS)
+        return decline(R, torch_op, "ndim");
+    if (dim < 0 || dim >= static_cast<int64_t>(in.dim()))
+        return decline(R, torch_op, "dim_out_of_range");
+    if (in.dim() != out.dim()) return decline(R, torch_op, "rank_mismatch");
+    const int64_t total = out.numel();
+    if (total <= 0) return decline(R, torch_op, "empty");
+    const int64_t dim_size = in.size(dim);
+    if (dim_size <= 0) return decline(R, torch_op, "empty_indexed_dim");
+
+    HaganeGatherDimsHost d{};
+    for (int k = 0; k < ndim; ++k) {
+        d.shape[k] = out.size(k);
+        d.a_es[k]  = in.stride(k);
+        d.c_es[k]  = out.stride(k);
+        if (index_1d_along_dim)
+            d.b_es[k] = (k == dim) ? (index.dim() ? index.stride(0) : 0) : 0;
+        else
+            d.b_es[k] = index.stride(k);
+        // A negative stride would index below data_ptr(); the buffer resolution
+        // is base+offset and cannot promise that is inside the allocation.
+        // Rare in torch (as_strided only) and honestly declined.
+        if (d.a_es[k] < 0 || d.b_es[k] < 0 || d.c_es[k] < 0)
+            return decline(R, torch_op, "negative_stride");
+        // `in` is addressed at coord k for every k != dim, so out must not
+        // exceed it there. gather guarantees this; assert rather than trust.
+        if (k != dim && d.shape[k] > in.size(k))
+            return decline(R, torch_op, "out_exceeds_in");
+    }
+    if (!index_1d_along_dim && index.dim() != out.dim())
+        return decline(R, torch_op, "index_rank_mismatch");
+    if (index_1d_along_dim && index.numel() != out.size(dim))
+        return decline(R, torch_op, "index_len_mismatch");
+
+    // Spans: `in` is read over its OWN extent along dim (any index may select
+    // any row), the index over the iteration shape, the output over the same.
+    int64_t in_shape[HAGANE_INDEX_MAX_DIMS];
+    for (int k = 0; k < ndim; ++k) in_shape[k] = (k == dim) ? dim_size : d.shape[k];
+    const int64_t in_span  = index_span_elems(in_shape, d.a_es, ndim);
+    const int64_t idx_span = index_span_elems(d.shape, d.b_es, ndim);
+    const int64_t out_span = index_span_elems(d.shape, d.c_es, ndim);
+
+    void* p_in  = const_cast<void*>(in.const_data_ptr());
+    void* p_idx = const_cast<void*>(index.const_data_ptr());
+    void* p_out = out.data_ptr();
+
+    flush_or_commit_metallib_input(p_in,  in_span  * esz);
+    flush_or_commit_metallib_input(p_idx, idx_span * index.element_size());
+    // Settle the OUTPUT's stale stash before writing its block. Which settle
+    // depends on whether the write covers every byte of the span — the same
+    // question vendor_settle_output asks, and getting it backwards is #1014:
+    // superseding a strided write drops live values in the holes.
+    if (out_span == total) haganeOpsFlushForWrite(p_out, out_span * esz);
+    else                   haganeOpsFlushRegion(p_out, out_span * esz);
+
+    std::string kname = std::string("hagane_gather_axis_") + bsfx + "_" + isfx;
+    int64_t c_ndim = ndim, c_total = total, c_dim = dim, c_dimsz = dim_size;
+    void*  args[]  = {p_in, p_idx, p_out, &d, &c_ndim, &c_total, &c_dim, &c_dimsz};
+    int    at_[]   = {0, 0, 0, 1, 1, 1, 1, 1};
+    size_t as_[]   = {0, 0, 0, sizeof(d), sizeof(int64_t), sizeof(int64_t),
+                      sizeof(int64_t), sizeof(int64_t)};
+    int64_t nb = (total + 255) / 256;
+    if (nb < 1) nb = 1;
+    if (nb > 65535) nb = 65535;          // the grid-stride loop covers the rest
+    dim3 block(256, 1, 1), grid(static_cast<unsigned>(nb), 1, 1);
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, at_, as_, 8) != hipSuccess)
+        return decline(R, torch_op, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(p_out, static_cast<size_t>(out_span * esz));
+    return true;
+}
+
+// D — scatter along one axis (torch `scatter.src`). The only WRITER in the
+// family, so its risk surface is the settle, not the arithmetic:
+//
+//   `self` here IS the output (the structured op already cloned it for the
+//   out-of-place variant), and the kernel writes ONLY the scattered positions.
+//   Every other element must already be present in the block, so a stale stash
+//   on `self` has to be MATERIALISED, never dropped — dropping it is exactly
+//   #1014 / RW-8.0, and it would silently zero everything the scatter does not
+//   touch. That is why this uses haganeOpsFlushRegion where the gather routes
+//   use haganeOpsFlushForWrite.
+//
+// Duplicate indices are a plain write with an UNSPECIFIED winner in torch (it
+// is scatter_ADD that accumulates), so no atomics are needed — which is also
+// why the atomicCAS transpiler gap does not block this slice.
+inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
+                                   const at::Tensor& index, const at::Tensor& src) {
+    const char* R = "index_axis";
+    const char* OP = "scatter";
+    if (!index_metallib_available()) return false;
+    route_enter(R, OP);
+    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+    if (!self.defined() || !index.defined() || !src.defined())
+        return decline(R, OP, "undefined_operand");
+    if (!self.is_cuda() || !index.is_cuda() || !src.is_cuda())
+        return decline(R, OP, "not_device");
+    if (self.scalar_type() != src.scalar_type())
+        return decline_dtypes(R, OP, "self_src_dtype_differ",
+                              src.scalar_type(), self.scalar_type());
+    if (index.scalar_type() != at::kLong)
+        return decline_dtypes(R, OP, "index_dtype", index.scalar_type(),
+                              self.scalar_type());
+    const int64_t esz = self.element_size();
+    const char* bsfx = index_bsuffix(esz);
+    if (!bsfx) return decline(R, OP, "element_size");
+
+    const int ndim = static_cast<int>(self.dim());
+    if (ndim <= 0 || ndim > HAGANE_INDEX_MAX_DIMS) return decline(R, OP, "ndim");
+    if (index.dim() != ndim || src.dim() != ndim)
+        return decline(R, OP, "rank_mismatch");
+    if (dim < 0 || dim >= ndim) return decline(R, OP, "dim_out_of_range");
+    const int64_t total = index.numel();
+    if (total <= 0) return decline(R, OP, "empty");
+    const int64_t dim_size = self.size(dim);
+    if (dim_size <= 0) return decline(R, OP, "empty_indexed_dim");
+
+    HaganeGatherDimsHost d{};
+    for (int k = 0; k < ndim; ++k) {
+        d.shape[k] = index.size(k);
+        d.a_es[k]  = self.stride(k);
+        d.b_es[k]  = index.stride(k);
+        d.c_es[k]  = src.stride(k);
+        if (d.a_es[k] < 0 || d.b_es[k] < 0 || d.c_es[k] < 0)
+            return decline(R, OP, "negative_stride");
+        if (d.shape[k] > src.size(k)) return decline(R, OP, "index_exceeds_src");
+        if (k != dim && d.shape[k] > self.size(k))
+            return decline(R, OP, "index_exceeds_self");
+    }
+
+    int64_t self_shape[HAGANE_INDEX_MAX_DIMS];
+    for (int k = 0; k < ndim; ++k) self_shape[k] = self.size(k);
+    const int64_t self_span = index_span_elems(self_shape, d.a_es, ndim);
+    const int64_t idx_span  = index_span_elems(d.shape, d.b_es, ndim);
+    const int64_t src_span  = index_span_elems(d.shape, d.c_es, ndim);
+
+    void* p_self = self.data_ptr();
+    void* p_idx  = const_cast<void*>(index.const_data_ptr());
+    void* p_src  = const_cast<void*>(src.const_data_ptr());
+
+    flush_or_commit_metallib_input(p_idx, idx_span * index.element_size());
+    flush_or_commit_metallib_input(p_src, src_span * esz);
+    // MATERIALISE, never drop — see the header comment. The write is partial by
+    // construction (that is what scatter IS), so there is no branch here.
+    haganeOpsFlushRegion(p_self, self_span * esz);
+
+    std::string kname = std::string("hagane_scatter_axis_") + bsfx;
+    int64_t c_ndim = ndim, c_total = total, c_dim = dim, c_dimsz = dim_size;
+    void*  args[] = {p_self, p_idx, p_src, &d, &c_ndim, &c_total, &c_dim, &c_dimsz};
+    int    at_[]  = {0, 0, 0, 1, 1, 1, 1, 1};
+    size_t as_[]  = {0, 0, 0, sizeof(d), sizeof(int64_t), sizeof(int64_t),
+                     sizeof(int64_t), sizeof(int64_t)};
+    int64_t nb = (total + 255) / 256;
+    if (nb < 1) nb = 1;
+    if (nb > 65535) nb = 65535;
+    dim3 block(256, 1, 1), grid(static_cast<unsigned>(nb), 1, 1);
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, at_, as_, 8) != hipSuccess)
+        return decline(R, OP, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(p_self, static_cast<size_t>(self_span * esz));
+    return true;
+}
+
+// Mirrors HaganeIndexGatherDims in hagane/kernels/index.hip.
+#define HAGANE_INDEX_MAX_IDX 3
+struct HaganeIndexGatherDimsHost {
+    int64_t shape[HAGANE_INDEX_MAX_DIMS];
+    int64_t base_es[HAGANE_INDEX_MAX_DIMS];
+    int64_t out_es[HAGANE_INDEX_MAX_DIMS];
+    int64_t idx_es[HAGANE_INDEX_MAX_IDX * HAGANE_INDEX_MAX_DIMS];
+    int64_t isize[HAGANE_INDEX_MAX_IDX];
+    int64_t istride[HAGANE_INDEX_MAX_IDX];
+};
+
+// B — advanced indexing (`index.Tensor`) as ONE dispatch:
+//   out[i] = base[ SUM_d coord_d*base_es[d] + SUM_j wrap(idx_j[coord])*istride[j] ]
+//
+// This is exactly the arithmetic haganeOpsIndexGather does with mx:: ops and
+// hagane_index_on_device does with ~12 at:: dispatches. Do NOT "fix" this by
+// forcing the at:: composition: every op in it is now routed (arange 1.6,
+// clamp 1.7b, where 1.9, mul/add 1.4), so that would reach zero stashes while
+// re-adding the ~1.9 ms/call — 13.2% of an ARDY denoise step — that
+// haganeOpsIndexGather was written to remove. Trading a stash for a measured
+// regression is the workaround this project forbids.
+//
+// Unlike index_select/gather, advanced indexing DOES wrap a negative index
+// (torch semantics), which is what hagane_wrap_index's wrap is for. Out of
+// range is clamped, not diagnosed — #1000, pre-existing on all three paths.
+inline bool try_index_gather_advanced(TensorIteratorBase& iter,
+                                      at::IntArrayRef indexed_sizes,
+                                      at::IntArrayRef indexed_strides) {
+    const char* R = "index_adv";
+    const char* OP = "index";
+    if (!index_metallib_available()) return false;
+    route_enter(R, OP);
+    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+
+    const int n_idx = static_cast<int>(iter.ntensors()) - 2;
+    if (n_idx <= 0 || n_idx > HAGANE_INDEX_MAX_IDX)
+        return decline(R, OP, "n_idx");
+    if ((int)indexed_sizes.size() != n_idx || (int)indexed_strides.size() != n_idx)
+        return decline(R, OP, "indexed_arity_mismatch");
+
+    const at::Tensor& out  = iter.tensor(0);
+    const at::Tensor& base = iter.tensor(1);
+    if (!out.defined() || !base.defined()) return decline(R, OP, "undefined_operand");
+    if (!out.is_cuda() || !base.is_cuda()) return decline(R, OP, "not_device");
+    if (base.scalar_type() != out.scalar_type())
+        return decline_dtypes(R, OP, "in_out_dtype_differ",
+                              base.scalar_type(), out.scalar_type());
+
+    const int64_t esz = out.element_size();
+    const char* bsfx = index_bsuffix(esz);
+    if (!bsfx) return decline(R, OP, "element_size");
+
+    const auto shape = iter.shape();
+    const int ndim = static_cast<int>(shape.size());
+    if (ndim <= 0 || ndim > HAGANE_INDEX_MAX_DIMS) return decline(R, OP, "ndim");
+    const int64_t total = out.numel();
+    if (total <= 0) return decline(R, OP, "empty");
+
+    // The iterator reports BYTE strides; the kernel works in elements. A stride
+    // that is not a whole element means this operand cannot be addressed in
+    // element space at all — decline rather than round.
+    auto elem_strides = [&](int arg, int64_t item, int64_t* dst) -> bool {
+        if (item <= 0) return false;
+        const auto st = iter.strides(arg);
+        if ((int)st.size() != ndim) return false;
+        for (int k = 0; k < ndim; ++k) {
+            if (st[k] % item != 0) return false;
+            dst[k] = st[k] / item;
+            if (dst[k] < 0) return false;   // see try_index_gather_axis
+        }
+        return true;
+    };
+
+    HaganeIndexGatherDimsHost d{};
+    for (int k = 0; k < ndim; ++k) d.shape[k] = shape[k];
+    if (!elem_strides(0, esz, d.out_es)) return decline(R, OP, "out_strides");
+    if (!elem_strides(1, esz, d.base_es)) return decline(R, OP, "base_strides");
+
+    void* p_idx[HAGANE_INDEX_MAX_IDX] = {nullptr, nullptr, nullptr};
+    int64_t idx_span[HAGANE_INDEX_MAX_IDX] = {0, 0, 0};
+    for (int j = 0; j < n_idx; ++j) {
+        const at::Tensor& ib = iter.tensor(2 + j);
+        if (!ib.defined()) return decline(R, OP, "undefined_index");
+        // The kernel has one index arm and it is int64, which is what the
+        // caller's own guard already requires. An int32 index here would be
+        // read as int64 garbage, so this is a silent-wrong guard, not a
+        // capability limit.
+        if (ib.scalar_type() != at::kLong)
+            return decline_dtypes(R, OP, "index_dtype", ib.scalar_type(),
+                                  out.scalar_type());
+        if (!elem_strides(2 + j, ib.element_size(),
+                          d.idx_es + j * HAGANE_INDEX_MAX_DIMS))
+            return decline(R, OP, "index_strides");
+        if (indexed_strides[j] % esz != 0) return decline(R, OP, "indexed_stride");
+        d.isize[j]   = indexed_sizes[j];
+        d.istride[j] = indexed_strides[j] / esz;
+        if (d.isize[j] <= 0) return decline(R, OP, "empty_indexed_dim");
+        if (d.istride[j] < 0) return decline(R, OP, "negative_indexed_stride");
+        p_idx[j] = iter.data_ptr(2 + j);
+        idx_span[j] = index_span_elems(d.shape, d.idx_es + j * HAGANE_INDEX_MAX_DIMS,
+                                       ndim) * ib.element_size();
+    }
+
+    // `base` is read at the largest coordinate AND the largest wrapped index on
+    // every indexed dim, so the settle must cover both terms.
+    int64_t base_span = index_span_elems(d.shape, d.base_es, ndim);
+    for (int j = 0; j < n_idx; ++j) base_span += (d.isize[j] - 1) * d.istride[j];
+    const int64_t out_span = index_span_elems(d.shape, d.out_es, ndim);
+
+    void* p_base = iter.data_ptr(1);
+    void* p_out  = iter.data_ptr(0);
+    flush_or_commit_metallib_input(p_base, base_span * esz);
+    for (int j = 0; j < n_idx; ++j)
+        flush_or_commit_metallib_input(p_idx[j], idx_span[j]);
+    if (out_span == total) haganeOpsFlushForWrite(p_out, out_span * esz);
+    else                   haganeOpsFlushRegion(p_out, out_span * esz);
+
+    std::string kname = "hagane_index_gather" + std::to_string(n_idx) + "_" + bsfx;
+    int64_t c_ndim = ndim, c_total = total;
+    void*  args[8];
+    int    at_[8];
+    size_t as_[8];
+    int n = 0;
+    args[n] = p_base; at_[n] = 0; as_[n] = 0; ++n;
+    for (int j = 0; j < n_idx; ++j) { args[n] = p_idx[j]; at_[n] = 0; as_[n] = 0; ++n; }
+    args[n] = p_out;  at_[n] = 0; as_[n] = 0; ++n;
+    args[n] = &d;      at_[n] = 1; as_[n] = sizeof(d); ++n;
+    args[n] = &c_ndim; at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
+    args[n] = &c_total; at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
+
+    int64_t nb = (total + 255) / 256;
+    if (nb < 1) nb = 1;
+    if (nb > 65535) nb = 65535;
+    dim3 block(256, 1, 1), grid(static_cast<unsigned>(nb), 1, 1);
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, at_, as_, n) != hipSuccess)
+        return decline(R, OP, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(p_out, static_cast<size_t>(out_span * esz));
+    return true;
+}
+
 inline bool try_launch_unary_scalar_metallib(const std::string& kname,
                                              TensorIteratorBase& iter, float scalar) {
     if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
