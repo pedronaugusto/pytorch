@@ -344,6 +344,18 @@ TORCH_IMPL_FUNC(ufunc_add_CUDA)(const at::Tensor& self, const at::Tensor& other,
 // ---------------------------------------------------------------------------
 
 C10_EXPORT void GeluCUDAKernelImpl(TensorIteratorBase& iter, GeluType approximate) {
+  // 1.8: our own transpiled kernel first — MLX ships no gelu, so this is the
+  // only path that computes it in one dispatch into the caller's own block.
+  // Both `approximate` arms are harvested from upstream's own lambdas, so
+  // selecting by the argument here is the whole of the parity fix: everything
+  // below this point used to ignore it and always compute erf.
+  namespace hd = hagane_dispatch::detail;
+  if (hd::gelu_metallib_available() && iter.is_contiguous()) {
+    std::string kname = hd::metallib_kernel_name(
+        hd::gelu_metallib_base(approximate), iter.dtype(), "");
+    if (!kname.empty() && hd::try_launch_unary_metallib(kname, iter)) return;
+  }
+
   // Route through hagane_ops MLX GPU implementation
   haganeOpsTensor_t out, in;
   const at::Tensor& out_t = iter.tensor(0);
@@ -359,7 +371,12 @@ C10_EXPORT void GeluCUDAKernelImpl(TensorIteratorBase& iter, GeluType approximat
   else if (st == c10::ScalarType::BFloat16) dt = HAGANE_DTYPE_BFLOAT16;
   out.dtype = dt;
   in.dtype = dt;
-  if (haganeOpsGelu(&in, &out) != HAGANE_OPS_SUCCESS) {
+  // haganeOpsGeluApprox, not haganeOpsGelu: the declined path has to honour
+  // `approximate` too, or a non-contiguous input (or HAGANE_USE_METALLIB_ROUTE=0)
+  // silently reverts to the exact formula for a tanh request. 1.7b's lesson —
+  // route-on and route-off must BOTH be right, not just the default.
+  int approx = (approximate == GeluType::Tanh) ? 1 : 0;
+  if (haganeOpsGeluApprox(&in, &out, approx) != HAGANE_OPS_SUCCESS) {
     // CPU fallback via GeluKernel DispatchStub
     GeluKernel(c10::DeviceType::CPU, iter, approximate);
   }

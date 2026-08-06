@@ -595,6 +595,43 @@ inline bool norm_metallib_available() {
     return available;
 }
 
+// ---- 1.8: native gelu route -------------------------------------------------
+// GeluCUDAKernelImpl is a direct C10_EXPORT that upstream's Activation.cpp
+// calls, not a DispatchStub with an OpConfig row, so registration goes through a
+// standalone once-init exactly as the norms above do rather than through
+// MetallibState<Cfg>. MLX ships no gelu kernel at all (checked with `strings`
+// over mlx.metallib), which is why this is transpiler-owned like silu.
+inline bool gelu_metallib_available() {
+    static const bool available = [] {
+        const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+        if (route && route[0] == '0') return false;
+        std::string path = metallib_dir() + "/gelu.metallib";
+        if (haganeRegisterMetallibAll(path.c_str()) != hipSuccess) {
+            std::fprintf(stderr,
+                "[hagane-path-alpha] failed to register %s; gelu stays on MLX\n",
+                path.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+            "[hagane-path-alpha] gelu metallib registered (erf + tanh arms, "
+            "all dtype arms)\n");
+        return true;
+    }();
+    return available;
+}
+
+// The two `approximate` arms are two GPU_LAMBDAs inside one function, so they
+// collide on the transpiler's function-derived name and the second takes an
+// ordinal. Which arm holds which name is POSITIONAL — see the gelu row in
+// tools/metallib_manifest.txt, the collision diagnostic hagane-compile prints,
+// and scripts/test_gelu_route.py, which separates the arms numerically so a
+// swap fails loudly instead of silently changing the activation.
+inline const char* gelu_metallib_base(at::native::GeluType approximate) {
+    return approximate == at::native::GeluType::Tanh
+        ? "hagane_GeluCUDAKernelImpl"       // arm 1 — tanh, ActivationGeluKernel.hip:24
+        : "hagane_GeluCUDAKernelImpl__2";   // arm 2 — erf,  ActivationGeluKernel.hip:35
+}
+
 // Per-thread persistent scratch for the moments outputs, reused across calls so
 // the hot decode path never frees a buffer with an in-flight metallib write —
 // which would trip the unconditional FREE-boundary drain and serialize the
