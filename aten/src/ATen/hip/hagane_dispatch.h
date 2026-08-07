@@ -173,6 +173,25 @@ struct BinaryOpConfig {
     int (*c_abi_fn)(const haganeOpsTensor_t*, const haganeOpsTensor_t*, const haganeOpsTensor_t*);
     void (*cpu_fallback)(TensorIteratorBase&);
     Tensor (*at_fp64_fn)(const Tensor&, const Tensor&);
+
+    // Does this op's CUDA kernel take a DIFFERENT code path when an operand is
+    // a CPU scalar AND the dtype is floating?
+    //
+    // div_floor and div_trunc do: they trade the division for a reciprocal
+    // multiply (`(a - fmod(a,b)) * inv_b`), and upstream's own comment says it
+    // "may lose one bit of precision". So for those the harvested `_a1_sA` /
+    // `_a1_sB` kernels are wrappers of the GENERAL-float functor, which is a
+    // branch torch never dispatches for a float cpu scalar — and the two are
+    // not interchangeable: over 300k adversarial cases they agree exactly at
+    // float32 but differ on 2537/300k at fp16 and 2275/300k at bf16, by far
+    // more than 1 ULP (e.g. -3776 vs -3760). MEASURED, not argued.
+    //
+    // So when this is true the metallib scalar arm is restricted to INTEGRAL
+    // dtypes (where torch has no such branch and the harvest is exact) and the
+    // float case is owned separately. fmod/remainder set it false: their
+    // gpu_kernel_with_scalars presents ONE functor for every operand shape, so
+    // the harvested arms are exactly what torch dispatches.
+    bool float_cpu_scalar_differs = false;
 };
 
 inline constexpr BinaryOpConfig kEqCfg  = {"eq",  nullptr, &haganeOpsEq,  &cpu_dispatch_eq,  &fp64_eq };
@@ -186,10 +205,31 @@ inline constexpr BinaryOpConfig kMulCfg = {"mul", "hagane_MulFunctor", &haganeOp
 inline constexpr BinaryOpConfig kPowTtCfg     = {"pow_tt",    nullptr, &haganeOpsPow,       &cpu_dispatch_pow_tt,    nullptr  };
 inline constexpr BinaryOpConfig kAtan2Cfg     = {"atan2",     nullptr, &haganeOpsAtan2,     &cpu_dispatch_atan2,     nullptr  };
 inline constexpr BinaryOpConfig kRemainderCfg = {"remainder", nullptr, &haganeOpsRemainder, &cpu_dispatch_remainder, nullptr  };
-inline constexpr BinaryOpConfig kFmodCfg      = {"fmod",      nullptr, &haganeOpsFmod,      &cpu_dispatch_fmod,      nullptr  };
 inline constexpr BinaryOpConfig kDivTrueCfg   = {"div_true",  "hagane_DivFunctor", &haganeOpsDiv,       &cpu_dispatch_div_true,  &fp64_div};
-inline constexpr BinaryOpConfig kDivFloorCfg  = {"div_floor", nullptr, &haganeOpsDivFloor,  &cpu_dispatch_div_floor, nullptr  };
-inline constexpr BinaryOpConfig kDivTruncCfg  = {"div_trunc", nullptr, &haganeOpsDivTrunc,  &cpu_dispatch_div_trunc, nullptr  };
+
+// 1.11-A — div_floor / div_trunc / fmod run NATIVE from PyTorch's OWN harvested
+// kernels, and `c_abi_fn = nullptr` is what does the work: it removes
+// haganeOps{DivFloor,DivTrunc,Fmod} from the path entirely, so the stash AND
+// the silent-wrong go in one edit, and a DECLINE lands on torch's own exact CPU
+// kernel instead of a wrong device answer. kGcdCfg is the precedent.
+//
+// Why these three and not `remainder`: 1.11 step 0 classified all four against
+// the shipped build. `mx::divide` round-trips integers through float32, so
+// div_floor took 34 divergences and div_trunc 23 — `16777217 // 1` -> 16777216
+// at BOTH int32 and int64 (the giveaway), `INT_MIN // -1` saturating to
+// +INT_MAX, bf16 `4.0 // 0.4` = 10 against CUDA's 9. fmod took 4 (fp16 loses
+// the sign of a zero result). `remainder` ALREADY routes through MLX's
+// `Remainder` kernel, which is torch's exact formula for integers and floats
+// alike, and stashes zero — it keeps the same 4 fp16 signed-zero rows, and its
+// own kernel does NOT harvest (an `if` in the functor body, #1069), so it is
+// filed rather than folded in here.
+//
+// div_floor/div_trunc set float_cpu_scalar_differs: upstream has a CUDA-only
+// reciprocal branch for a floating cpu scalar and the harvest does not carry
+// it. fmod has no such branch.
+inline constexpr BinaryOpConfig kFmodCfg      = {"fmod",      "hagane_fmod_kernel_cuda",      nullptr, &cpu_dispatch_fmod,      nullptr, false};
+inline constexpr BinaryOpConfig kDivFloorCfg  = {"div_floor", "hagane_div_floor_kernel_cuda", nullptr, &cpu_dispatch_div_floor, nullptr, true };
+inline constexpr BinaryOpConfig kDivTruncCfg  = {"div_trunc", "hagane_div_trunc_kernel_cuda", nullptr, &cpu_dispatch_div_trunc, nullptr, true };
 
 // X+21 Lane D — 6 binary ops on `structured_binary_fn` (TensorIteratorBase&).
 inline constexpr BinaryOpConfig kBitwiseAndCfg = {"bitwise_and", nullptr, &haganeOpsBitwiseAnd, &cpu_dispatch_bitwise_and, nullptr};
@@ -2981,6 +3021,101 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     return true;
 }
 
+// 1.11-A — the binary family's CPU-SCALAR arms (`_a1_sA` / `_a1_sB`).
+//
+// Distinct from try_launch_unary_scalar_metallib above in the one way that
+// matters: **the scalar crosses as RAW BITS in the compute dtype**, not as a
+// float. Pushing an int64 divisor through a float loses everything past 2^24 —
+// the same defect class 1.6 removed from arange and 1.7b from clamp, and
+// exactly what 1.11 step 0 measured as `16777217 // 1 -> 16777216`.
+//
+// `in_idx` is the TENSOR operand (1 or 2); the scalar is the other one. The
+// KERNEL NAME already encodes which side the scalar is on, so this function
+// never reasons about operand order — it binds the one buffer it is handed,
+// and the caller's name choice is what makes the arithmetic right. The gate
+// carries an operand-order case precisely because that pairing is the thing
+// that can silently invert.
+inline bool try_launch_binary_scalar_metallib(const std::string& kname,
+                                              TensorIteratorBase& iter,
+                                              int in_idx, uint64_t scalar_bits) {
+    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
+    void* d_out = iter.data_ptr(0);
+    void* d_in  = iter.data_ptr(in_idx);
+    int N = static_cast<int>(iter.numel());
+    if (N <= 0) return true;
+    flush_or_commit_metallib_input(
+        d_in, static_cast<int64_t>(N) * iter.element_size(in_idx));
+    // The scalar param is declared at the STORAGE dtype in the harvested
+    // kernel (gpu_kernel_with_scalars keeps the functor's arg at scalar_t), so
+    // setBytes gets exactly element_size bytes — the low bytes of `sc` on this
+    // little-endian target, which is where vendor_scalar_bytes wrote them.
+    uint64_t sc = scalar_bits;
+    const size_t esz = static_cast<size_t>(iter.element_size(0));
+    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int nthreads = (N + wpt - 1) / wpt;
+    dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
+    void*  args[]      = {d_in, d_out, &sc, &N};
+    int    arg_types[] = {0, 0, 1, 1};
+    size_t arg_sizes[] = {0, 0, esz, sizeof(int)};
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, arg_types, arg_sizes, 4) != hipSuccess)
+        return false;
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
+    return true;
+}
+
+// Run torch's own CPU kernel for a DECLINED binary op.
+//
+// A `c_abi_fn == nullptr` config declines onto the CPU stub, which is the
+// correct answer by construction. But the CPU loops cannot be handed a
+// CUDA-built iterator that still carries an unpromoted CPU SCALAR: TensorIterator
+// leaves such an operand at Double and lets the CUDA kernel read it with a
+// checked cast (that is what gpu_kernel_with_scalars is FOR), while upstream's
+// CPU loops assert `!needs_dynamic_casting` and abort. Measured, not assumed —
+// `torch.floor_divide(float_tensor, 0.4)` raised that internal assert the
+// moment div_floor's C-ABI was removed, i.e. a crash where the contract says
+// honest fallback.
+//
+// So hand the operands to a FRESH CPU iterator and let TensorIterator do its
+// own promotion, exactly as a real CPU dispatch would.
+//
+// The cpu-scalar operand is passed THROUGH UNCHANGED. `iter.tensor(i)` is still
+// the original wrapped-number tensor precisely because no cast was applied to
+// it, and rebuilding it at the compute dtype would be a REAL divergence, not a
+// detail: torch reads that scalar back at `accscalar_t` on BOTH backends — CUDA
+// `scalar_value<accscalar_t>(2)`, CPU `original_scalar_value<accscalar_t>(2)`,
+// each inside its own reciprocal branch. Measured: a first version that
+// narrowed it gave `half(4.0) // 0.4 = 10` against the 9 that CUDA and CPU
+// both produce.
+//
+// Everything else — no cpu scalar in play — runs the stub directly on the
+// caller's iterator, unchanged, which keeps gcd/lcm byte-identical.
+inline void run_binary_cpu_fallback(TensorIteratorBase& iter,
+                                    void (*stub)(TensorIteratorBase&)) {
+    if (iter.ninputs() != 2) { ::haganeOpsFlush(); stub(iter); return; }
+
+    // Every operand is brought over with torch's own `.to(CPU)`, which is a
+    // real D2H copy and therefore respects the deferred-write barrier. Handing
+    // the CPU kernel the CUDA iterator directly — which is what this path used
+    // to do, and still does for gcd/lcm's non-binary shapes — punning device
+    // pointers as host ones because UMA makes that *appear* to work, reads
+    // STALE BYTES for any lazily produced operand. Found by the 1.11-A gate: a
+    // broadcast `floor_divide` raised "ZeroDivisionError" because the divisor
+    // buffer still read as zeros, and haganeOpsFlush() alone did not settle it.
+    // #1025's rule again — enumerate the readers of a deferred write by the
+    // QUEUE they run on, not by function name.
+    at::Tensor in[2];
+    for (int i = 1; i <= 2; ++i)
+        in[i - 1] = iter.tensor(i).to(c10::DeviceType::CPU);
+    at::Tensor out_cpu = at::empty(
+        iter.tensor(0).sizes(),
+        at::TensorOptions().dtype(iter.dtype(0)).device(c10::DeviceType::CPU));
+    auto cpu_iter = at::TensorIterator::binary_op(out_cpu, in[0], in[1]);
+    stub(cpu_iter);
+    iter.tensor(0).copy_(out_cpu);
+}
+
 // ---- Templated dispatch bridges -------------------------------------------
 // One instantiation per config row. `if constexpr` branches eliminate dead
 // paths per-instantiation. Each instantiation generates a unique symbol so
@@ -3068,15 +3203,57 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
         }
     }
 
+    // 1.11-A — the CPU-SCALAR arms. A cpu scalar has stride 0, so
+    // iter.is_contiguous() is FALSE and the `_a2` guard above can never take
+    // one; that is precisely why all 12 of ARDY's floor_divides fell past the
+    // metallib to the C-ABI, and why the stash survived every earlier slice.
+    //
+    // AUnaryFunctor holds the scalar as operand ONE, BUnaryFunctor as operand
+    // TWO (Loops.cuh:140/154), so the arm is chosen from is_cpu_scalar rather
+    // than inferred — get it backwards and every non-commutative op computes
+    // `scalar OP tensor`.
+    if constexpr (Cfg.metallib_kernel != nullptr) {
+        if (MetallibState<Cfg>::available && iter.ninputs() == 2) {
+            const bool s1 = iter.is_cpu_scalar(1);
+            const bool s2 = iter.is_cpu_scalar(2);
+            // Upstream's CUDA-only reciprocal branch for a FLOATING cpu scalar
+            // is a different formula from the general one the harvest carries
+            // (see BinaryOpConfig::float_cpu_scalar_differs), so those decline
+            // here and are owned separately. Integral dtypes have no such
+            // branch and the harvested arm is exactly what torch dispatches.
+            const bool arm_faithful =
+                !Cfg.float_cpu_scalar_differs ||
+                c10::isIntegralType(iter.dtype(), /*includeBool=*/true);
+            const int tin = s1 ? 2 : 1;
+            if ((s1 != s2) && arm_faithful
+                && iter.tensor(tin).scalar_type() == iter.dtype()
+                && iter.tensor(tin).is_contiguous()
+                && iter.tensor(0).is_contiguous()
+                && iter.tensor(tin).sizes() == iter.tensor(0).sizes()) {
+                uint64_t bits = 0;
+                if (vendor_scalar_bytes(iter, s1 ? 1 : 2, iter.dtype(), &bits)) {
+                    std::string kname = metallib_kernel_name(
+                        Cfg.metallib_kernel, iter.dtype(), s1 ? "_a1_sA" : "_a1_sB");
+                    if (!kname.empty() &&
+                        try_launch_binary_scalar_metallib(kname, iter, tin, bits))
+                        return;
+                }
+            }
+        }
+    }
+
     // #1010: MLX's kernel, our output block. Tried after our own metallib (that
     // one is already ours end-to-end) and before the MLX C-ABI (which is the
     // path that makes MLX allocate).
     if (try_vendor_binary(Cfg.op_name, iter)) return;
 
     if constexpr (Cfg.c_abi_fn == nullptr) {
-        // No MLX path (e.g. integer gcd/lcm): the metallib is the only device
-        // route; fall to the CPU stub on fallthrough (route-off/unsupported).
-        Cfg.cpu_fallback(iter);
+        // No MLX path (e.g. integer gcd/lcm, and 1.11-A's div/mod family): the
+        // metallib is the only device route; fall to torch's own CPU kernel on
+        // fallthrough (route-off/unsupported). run_binary_cpu_fallback is the
+        // plain stub call unless the iterator carries an unpromoted cpu scalar,
+        // which the CPU loops abort on — see its comment.
+        run_binary_cpu_fallback(iter, Cfg.cpu_fallback);
     } else {
         auto out = make_ops_tensor_local(iter, 0);
         at::Tensor sa, sb;
