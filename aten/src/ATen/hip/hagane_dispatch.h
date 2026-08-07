@@ -2087,6 +2087,87 @@ inline bool try_vendor_reduce_all(const char* torch_op, const char* mlx_op,
     return true;
 }
 
+// The PARTIAL reduction — `all(dim=)`, `any(dim=)`, `amax(dim=)`, `amin(dim=)`
+// — through MLX's row_reduce family, dispatched into the caller's own block.
+// #1010 1.9b; 1.9 shipped the full-reduce arm and named this one as its own
+// slice because the row kernels take a reduction PLAN rather than a length.
+//
+// Bit-identical to the path it replaces by construction: `haganeOpsAll`'s
+// partial arm is `mx::all(in, axes, true)`, which reaches the same
+// row_reduce_general_dispatch. Only who owns the output changes.
+//
+// `self` and `result` are the reduction iterator's operands, so `result`
+// carries the INPUT's rank with extent 1 at every reduced axis — that is
+// review_reduce_result's doing (ReduceOpsUtils.h:170), and it is what lets the
+// reduced axes be identified here without the dim list being threaded through
+// every stub signature.
+//
+// Scope is "contiguous input, reduced axes all TRAILING", which is exactly
+// MLX's ContiguousReduce plan with one merged row and therefore two numbers.
+// A reduced axis in the middle is a col_reduce with a whole different kernel
+// family and declines by name.
+inline bool try_vendor_reduce_dim(const char* torch_op, const char* mlx_op,
+                                  const at::TensorBase& self,
+                                  const at::TensorBase& result) {
+    constexpr const char* R = "reduce_dim";
+    route_enter(R, torch_op);
+    if (!mlx_op) return decline(R, torch_op, "no_mlx_reduce_op");
+    if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (!haganeOpsVendorElementwiseAvailable())
+        return decline(R, torch_op, "corpus_unavailable");
+
+    // The full reduction belongs to try_vendor_reduce_all, which runs first.
+    // Declining here keeps the two routes' ENTER counts disjoint.
+    if (result.numel() <= 1) return decline(R, torch_op, "full_reduction");
+    if (!self.is_contiguous()) return decline(R, torch_op, "in_not_contiguous");
+    if (!result.is_contiguous()) return decline(R, torch_op, "out_not_contiguous");
+    // `all`/`any` over a non-bool input lands here: get_allany_iter keeps the
+    // INPUT's dtype on CUDA (ReduceOps.cpp) while the result is Bool, and MLX's
+    // remap_reduce_types would map that pair to a bool-output kernel with its
+    // own conversion rule. Not a numerics decision to take inside a stash
+    // removal — decline, and the MLX fallback answers as it does today.
+    if (self.scalar_type() != result.scalar_type())
+        return decline_dtypes(R, torch_op, "in_out_dtype_differ",
+                              self.scalar_type(), result.scalar_type());
+    const int dt = hagane_vendor_dtype(self.scalar_type());
+    if (dt < 0) return decline(R, torch_op, "dtype");
+
+    const int64_t nd = self.dim();
+    if (nd < 1) return decline(R, torch_op, "rank_0");
+    if (result.dim() != nd) return decline(R, torch_op, "rank_differs");
+    if (self.numel() <= 0) return decline(R, torch_op, "empty");
+
+    // Walk in from the last axis while it is reduced (or extent 1, which
+    // reduces to itself either way and so belongs to whichever side keeps the
+    // block trailing). What is left below `p` must contain no reduced axis.
+    int64_t row_size = 1;
+    int64_t p = nd;
+    while (p > 0) {
+        const int64_t d = p - 1;
+        const bool unit = self.size(d) == 1;
+        const bool reduced = result.size(d) == 1 && !unit;
+        if (!reduced && !unit) break;
+        row_size *= self.size(d);
+        --p;
+    }
+    for (int64_t d = 0; d < p; ++d)
+        if (result.size(d) == 1 && self.size(d) != 1)
+            return decline(R, torch_op, "reduced_axis_not_trailing");
+    if (row_size <= 1) return decline(R, torch_op, "no_reduced_axis");
+
+    const int64_t n_rows = self.numel() / row_size;
+    if (n_rows != result.numel()) return decline(R, torch_op, "shape_mismatch");
+    if (n_rows <= 0) return decline(R, torch_op, "empty");
+
+    if (haganeOpsVendorReduceDim(mlx_op, dt, self.const_data_ptr(),
+                                 result.data_ptr(), n_rows,
+                                 row_size) != HAGANE_OPS_SUCCESS)
+        return decline(R, torch_op, "kernel_dispatch");
+    note_native_launch(std::string("mlx:row_reduce_") + mlx_op);
+    return true;
+}
+
 // cumsum / cumprod through MLX's own scan kernels, dispatched into the caller's
 // block. The fallback already runs these exact kernels via mx::cumsum /
 // mx::cumprod, so this is bit-identical to it and changes only who owns the
@@ -3317,9 +3398,16 @@ inline void hagane_unary_iter_bridge(TensorIterator& iter) {
         return;
 
     // #1010 1.9: MLX's all_reduce, our output block. A partial reduction
-    // declines inside and falls through unchanged.
+    // declines inside and falls through to the row_reduce route below; anything
+    // neither of them covers falls through to the MLX C-ABI unchanged.
     if (Cfg.mlx_reduce_op != nullptr &&
         try_vendor_reduce_all(Cfg.op_name, Cfg.mlx_reduce_op,
+                              iter.tensor(1), iter.tensor(0)))
+        return;
+
+    // #1010 1.9b: MLX's row_reduce, our output block.
+    if (Cfg.mlx_reduce_op != nullptr &&
+        try_vendor_reduce_dim(Cfg.op_name, Cfg.mlx_reduce_op,
                               iter.tensor(1), iter.tensor(0)))
         return;
 
