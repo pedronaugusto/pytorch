@@ -3005,6 +3005,144 @@ inline bool try_triangle(const char* torch_op, bool upper,
     return true;
 }
 
+// 1.11-D — the Philox4x32-10 normal sampler. Its own metallib rather than a row
+// in index.metallib: index.hip is pure selection with no numerics, and this is
+// the opposite (a whole arithmetic spec), so sharing an artefact would make one
+// gate's failure ambiguous about which family broke.
+inline bool random_metallib_available() {
+    static const bool available = [] {
+        const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+        if (route && route[0] == '0') return false;
+        std::string path = metallib_dir() + "/random.metallib";
+        if (haganeRegisterMetallibAll(path.c_str()) != hipSuccess) {
+            std::fprintf(stderr,
+                "[hagane-path-alpha] failed to register %s; randn stays on MLX\n",
+                path.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+            "[hagane-path-alpha] random metallib registered (normal, 3 kernels)\n");
+        return true;
+    }();
+    return available;
+}
+
+// PyTorch's calc_execution_policy (native/hip/DistributionTemplates.h:52),
+// UNCLAMPED. This is the one design decision in 1.11-D that departs from
+// upstream's code, so here is the whole argument.
+//
+// The grid is part of the STREAM: it sets the grid-stride step that decides
+// which Philox counter lands at which element. Upstream then clamps the grid by
+// `multiProcessorCount * (maxThreadsPerMultiProcessor / block)`, which means an
+// A100 and an H100 already produce different randn for the same seed once numel
+// is large. There is no device-independent CUDA answer to reproduce — only a
+// rule applied to a device.
+//
+// Applying that rule to Hagane's properties is what the plan called for, and it
+// was tried and MEASURED: it produces grid == 1, because hipGetDeviceProperties
+// writes a private 316-byte struct while callers read the public 1472-byte one,
+// so multiProcessorCount reads 0 at the caller's offset and
+// maxThreadsPerMultiProcessor was never filled at all (#1078). 16M randn took
+// 11.8 ms against MLX's 0.218 ms — a 54x regression from generating the whole
+// tensor with 256 threads. Building the stream on a property that lies would
+// also mean the stream silently MOVES when #1078 is fixed.
+//
+// So: keep upstream's formula and its clamp, but take the cap from a FIXED
+// CONSTANT instead of a device property. kGridCap = 2048 blocks (524288
+// threads). The consequences are all good and all stated:
+//   - Every tensor with numel <= 256*2048 = 524288 gets the IDENTICAL stream to
+//     any CUDA device whose own cap is at least 2048 blocks — which is every
+//     current datacentre GPU. That is the strong parity result, over the whole
+//     range where CUDA itself is device-independent.
+//   - Above that, CUDA devices already disagree with each other, and we differ
+//     as one more device in that set. Same class of difference, no new one.
+//   - The geometry depends only on (numel, block), so it is deterministic, it
+//     needs no device property, and #1078 cannot silently move it.
+//   - The clamp is also what makes the unroll pay: once it binds, each thread
+//     loops and USES all four values of its hiprand_normal4 draw instead of
+//     discarding three. Measured on 16M randn: grid=1 (the property bug) 11.8
+//     ms, fully unclamped 1.595 ms, clamped here 0.243 ms.
+// The cap is a CHOICE, so it is a constant with a name and a comment, not a
+// number derived from something that happens to be lying.
+//
+// counter_offset must be handed to philox_engine_inputs() by the CALLER, so the
+// generator advances by what the kernel actually consumes. `unroll` is 4 because
+// hiprand_normal4 yields four values per draw; the trailing literal 4 is
+// upstream's max_generator_offsets_per_curand_call and is NOT the same quantity.
+struct HaganeDistPolicy {
+    uint32_t block_size;
+    uint32_t grid_x;
+    uint64_t counter_offset;
+};
+inline HaganeDistPolicy hagane_dist_policy(int64_t numel) {
+    const uint32_t block_size = 256;   // upstream block_size_bound
+    const uint32_t unroll = 4;
+    const uint64_t kGridCap = 2048;
+    const uint64_t n = numel > 0 ? static_cast<uint64_t>(numel) : 1;
+    uint64_t grid = (n + block_size - 1) / block_size;
+    if (grid > kGridCap) grid = kGridCap;
+    if (grid < 1) grid = 1;
+    HaganeDistPolicy p;
+    p.block_size = block_size;
+    p.grid_x = static_cast<uint32_t>(grid);
+    p.counter_offset =
+        ((n - 1) / (static_cast<uint64_t>(block_size) * grid * unroll) + 1) * 4;
+    return p;
+}
+
+// normal_ / randn onto the owned Philox kernel, writing the CALLER's block.
+// Replaces mx::random::normal, whose threefry key was derived by hashing
+// (seed, offset) — a stream with no spec at all, which is why this slice is a
+// deliberate one-time re-baseline of sampled outputs and not a silent change.
+inline bool try_normal_metallib(const char* torch_op, const at::TensorBase& out,
+                                double mean, double std,
+                                uint64_t seed, uint64_t offset,
+                                const HaganeDistPolicy& policy) {
+    const char* R = "normal";
+    if (!random_metallib_available()) return false;
+    route_enter(R, torch_op);
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (!out.defined()) return decline(R, torch_op, "undefined_operand");
+    if (!out.is_cuda()) return decline(R, torch_op, "not_device");
+    const char* dsfx = nullptr;
+    switch (out.scalar_type()) {
+        case at::kFloat:    dsfx = "f32";  break;
+        case at::kHalf:     dsfx = "f16";  break;
+        case at::kBFloat16: dsfx = "bf16"; break;
+        default: break;   // float64 has no Metal arm; complex/int never dispatch here
+    }
+    if (!dsfx) return decline_dtypes(R, torch_op, "dtype",
+                                     out.scalar_type(), out.scalar_type());
+    // The kernel addresses out[] flat. A strided destination keeps the MLX path,
+    // which goes through copy_result's strides.
+    if (!out.is_contiguous()) return decline(R, torch_op, "out_not_contiguous");
+    const int64_t numel = out.numel();
+    if (numel <= 0) return decline(R, torch_op, "empty");
+
+    void* p_out = const_cast<void*>(out.const_data_ptr());
+    const size_t bytes = static_cast<size_t>(numel) * out.element_size();
+    // A sample covers every byte of a contiguous output and reads nothing, so
+    // this is the unambiguous pre-write barrier — the fill/arange case, not
+    // triu's aliased one.
+    haganeOpsFlushForWrite(p_out, static_cast<int64_t>(bytes));
+
+    std::string kname = std::string("hagane_normal_") + dsfx;
+    int64_t  c_numel = numel;
+    uint64_t c_seed = seed, c_off = offset;
+    float    c_mean = static_cast<float>(mean), c_std = static_cast<float>(std);
+    void*  args[]  = {p_out, &c_numel, &c_seed, &c_off, &c_mean, &c_std};
+    int    at_[]   = {0, 1, 1, 1, 1, 1};
+    size_t as_[]   = {0, sizeof(int64_t), sizeof(uint64_t), sizeof(uint64_t),
+                      sizeof(float), sizeof(float)};
+    dim3 block(policy.block_size, 1, 1), grid(policy.grid_x, 1, 1);
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, at_, as_, 6) != hipSuccess)
+        return decline(R, torch_op, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(p_out, bytes);
+    return true;
+}
+
 // Mirrors HaganeIndexGatherDims in hagane/kernels/index.hip.
 #define HAGANE_INDEX_MAX_IDX 3
 struct HaganeIndexGatherDimsHost {

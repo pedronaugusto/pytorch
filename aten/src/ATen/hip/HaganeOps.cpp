@@ -1727,17 +1727,26 @@ C10_EXPORT void _amp_foreach_non_finite_check_and_unscale_cuda_(
 
 // The PRNG state for one draw, taken from the caller's generator or the device
 // default. `seed` names the stream; `offset` is the generator's counter, which
-// we advance by the number of values this call consumes so the next draw lands
-// on fresh ground. Without this the runtime falls back to MLX's own thread-local
-// time-seeded key and torch.manual_seed does nothing. Mirrors what every ROCm
-// RNG kernel does with PhiloxCudaState.
+// this call advances so the next draw lands on fresh ground. Without this the
+// runtime falls back to MLX's own thread-local time-seeded key and
+// torch.manual_seed does nothing. Mirrors what every ROCm RNG kernel does with
+// PhiloxCudaState.
+//
+// `increment` is what the caller will actually CONSUME, in single 32-bit values.
+// For an op with an owned Philox kernel that is calc_execution_policy's
+// counter_offset (see hagane_dist_policy), NOT the element count: a thread draws
+// four values per hiprand_normal4 and the grid is clamped, so the two differ.
+// Every other caller still passes numel, which OVER-advances — safe (successive
+// draws cannot overlap) but not CUDA's offset sequence, so those ops stay
+// stream-incompatible with CUDA until they get owned kernels too. Recorded so
+// the asymmetry is not mistaken for coverage.
 static std::pair<uint64_t, uint64_t> hagane_rng_state(
-    const std::optional<Generator>& gen, int64_t consumed) {
+    const std::optional<Generator>& gen, int64_t increment) {
   auto* impl = at::get_generator_or_default<at::CUDAGeneratorImpl>(
       gen, at::cuda::detail::getDefaultCUDAGenerator());
   std::lock_guard<std::mutex> lock(impl->mutex_);
   return impl->philox_engine_inputs(
-      static_cast<uint64_t>(std::max<int64_t>(consumed, 1)));
+      static_cast<uint64_t>(std::max<int64_t>(increment, 1)));
 }
 
 // randperm: generate random permutation
@@ -2916,8 +2925,17 @@ void hagane_cat_serial_kernel(const Tensor& result,
 
 void hagane_normal_kernel(const TensorBase& self, double mean, double std,
                           std::optional<Generator> gen) {
+  // The offset the generator advances by must equal what the kernel consumes,
+  // so the policy is computed BEFORE the state is drawn and the same (block,
+  // grid) is handed to the launch. Deriving it twice would be a silent-wrong
+  // the moment the two derivations drift.
+  const auto policy = hagane_dispatch::detail::hagane_dist_policy(self.numel());
+  auto [rng_seed, rng_offset] =
+      hagane_rng_state(gen, static_cast<int64_t>(policy.counter_offset));
+  if (hagane_dispatch::detail::try_normal_metallib("normal", self, mean, std,
+                                                   rng_seed, rng_offset, policy))
+    return;
   auto out_d = make_tensor_desc(self);
-  auto [rng_seed, rng_offset] = hagane_rng_state(gen, self.numel());
   if (haganeOpsNormal(&out_d, mean, std, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     // CPU fallback: generate on CPU, copy to "GPU" (UMA)
     auto cpu_t = at::empty(self.sizes(), self.options().device(c10::kCPU));
