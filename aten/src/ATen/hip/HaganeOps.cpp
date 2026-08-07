@@ -162,6 +162,23 @@
 // full host round-trips, so the settle is not the expensive part.
 #define HAGANE_BEFORE_RAW_READ() ::haganeOpsSettleForCpuKernel()
 
+// #996 / 1.11 step 0 — and "already a full host round-trip" is precisely the
+// thing nothing was counting. #1023 counts declines and #1024 counts stashes;
+// an op running on the host had no instrument at all, which is the same blind
+// spot that kept the stash problem invisible until #1024. `__func__` names the
+// delegating kernel automatically, so there is no list to drift.
+//
+// This is deliberately NOT folded into HAGANE_BEFORE_RAW_READ, even though
+// that would instrument all 71 sites in one edit. The two answer different
+// questions: the settle is about memory ORDERING and is taken once per raw
+// read, while this counts the DELEGATION and must be taken once per call. Nine
+// two-output ops (max.dim, min.dim, aminmax, mode ×2, kthvalue, median, sort
+// ×2) settle twice inside one fallback branch — once before each output's
+// memcpy — so a count living in the settle would report those ops twice.
+// Keeping them separate makes the number mean one thing.
+#define HAGANE_HOST_FALLBACK(reason) \
+    ::haganeOpsHostFallbackNote(__func__, (reason))
+
 // Erase stale pending entries when PyTorch's caching allocator frees a block.
 // Without this, address reuse causes lazy results to be read as wrong-dtype data.
 static std::atomic<int> g_erase_count{0};
@@ -469,6 +486,7 @@ C10_EXPORT void max_all_launch_kernel(TensorIterator& iter) {
   if (haganeOpsMaxValues(&in, &out) != HAGANE_OPS_SUCCESS) {
     // Fallback: compute on CPU
     const at::Tensor& in_t = iter.tensor(1);
+    HAGANE_HOST_FALLBACK("at_cpu");
     auto cpu_in = in_t.cpu();
     auto cpu_max = cpu_in.max();
     auto* out_ptr = static_cast<float*>(iter.data_ptr(0));
@@ -484,6 +502,7 @@ C10_EXPORT void min_all_launch_kernel(TensorIterator& iter) {
   auto in = make_ops_tensor_ext(iter, 1);
   if (haganeOpsMinValues(&in, &out) != HAGANE_OPS_SUCCESS) {
     const at::Tensor& in_t = iter.tensor(1);
+    HAGANE_HOST_FALLBACK("at_cpu");
     auto cpu_in = in_t.cpu();
     auto cpu_min = cpu_in.min();
     auto* out_ptr = static_cast<float*>(iter.data_ptr(0));
@@ -519,6 +538,7 @@ C10_EXPORT void sortKeyValueInplace(
     Tensor key_t(key), val_t(value);
     auto key_cpu = key_t.cpu();
     auto [sorted_key, sorted_idx] = key_cpu.sort(dim, descending, stable);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(key.const_data_ptr()), sorted_key.const_data_ptr(),
                 key.numel() * key.itemsize());
@@ -532,6 +552,7 @@ C10_EXPORT void launch_stable_sort_kernel(
     const TensorBase& self, int64_t dim, bool descending,
     const TensorBase& values, const TensorBase& indices) {
   // Copy input to values
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   std::memcpy(const_cast<void*>(values.const_data_ptr()),
               self.const_data_ptr(), self.numel() * self.itemsize());
@@ -545,6 +566,7 @@ C10_EXPORT void launch_stable_sort_kernel(
   auto idx_d = make_tensor_desc(indices);
   if (haganeOpsSort(&val_d, &idx_d, static_cast<int32_t>(dim), descending ? 1 : 0) != HAGANE_OPS_SUCCESS) {
     Tensor self_t(self);
+    HAGANE_HOST_FALLBACK("at_cpu");
     auto self_cpu = self_t.cpu();
     auto [sorted, sorted_idx] = self_cpu.sort(dim, descending, /*stable=*/true);
     Tensor(values).copy_(sorted);
@@ -560,6 +582,7 @@ C10_EXPORT void launch_gather_topk_kernel(
   auto idx_d = make_tensor_desc(indices);
   if (haganeOpsTopk(&in_d, &val_d, &idx_d, k, static_cast<int32_t>(dim), largest ? 1 : 0) != HAGANE_OPS_SUCCESS) {
     Tensor self_t(self);
+    HAGANE_HOST_FALLBACK("at_cpu");
     auto [topk_vals, topk_idx] = self_t.cpu().topk(k, dim, largest, /*sorted=*/true);
     Tensor(values).copy_(topk_vals);
     Tensor(indices).copy_(topk_idx);
@@ -586,6 +609,7 @@ C10_EXPORT void launch_cumsum_cuda_kernel(
   auto out_d = make_tensor_desc(result);
   if (haganeOpsCumsum(&in_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto result_cpu = Tensor(self).cpu().cumsum(dim);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(result.const_data_ptr()), result_cpu.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -601,6 +625,7 @@ C10_EXPORT void launch_cumprod_cuda_kernel(
   auto out_d = make_tensor_desc(result);
   if (haganeOpsCumprod(&in_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto result_cpu = Tensor(self).cpu().cumprod(dim);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(result.const_data_ptr()), result_cpu.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -660,6 +685,7 @@ C10_EXPORT void max_launch_kernel(TensorIterator& iter) {
   if (haganeOpsMaxDim(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = Tensor(self).cpu();
     auto [cpu_vals, cpu_idx] = cpu_self.max(dim, /*keepdim=*/true);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(values.data_ptr(), cpu_vals.const_data_ptr(), values.numel() * values.itemsize());
     HAGANE_BEFORE_RAW_READ();
@@ -679,6 +705,7 @@ C10_EXPORT void min_launch_kernel(TensorIterator& iter) {
   if (haganeOpsMinDim(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = Tensor(self).cpu();
     auto [cpu_vals, cpu_idx] = cpu_self.min(dim, /*keepdim=*/true);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(values.data_ptr(), cpu_vals.const_data_ptr(), values.numel() * values.itemsize());
     HAGANE_BEFORE_RAW_READ();
@@ -699,6 +726,7 @@ C10_EXPORT void aminmax_launch_kernel(TensorIterator& iter) {
   if (haganeOpsAminmax(&in_d, &min_d, &max_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = Tensor(self).cpu();
     auto [cpu_min, cpu_max] = cpu_self.aminmax(dim, /*keepdim=*/true);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(min_result.data_ptr(), cpu_min.const_data_ptr(), min_result.numel() * min_result.itemsize());
     HAGANE_BEFORE_RAW_READ();
@@ -717,6 +745,7 @@ C10_EXPORT void aminmax_allreduce_launch_kernel(TensorIterator& iter) {
   if (haganeOpsAminmaxAll(&in_d, &min_d, &max_d) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = Tensor(self).cpu();
     auto [cpu_min, cpu_max] = cpu_self.aminmax();
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(min_result.data_ptr(), cpu_min.const_data_ptr(), min_result.numel() * min_result.itemsize());
     HAGANE_BEFORE_RAW_READ();
@@ -734,6 +763,7 @@ C10_EXPORT void powsum_launch_kernel(TensorIterator& iter, double p) {
   if (haganeOpsPowsum(&in_d, &out_d, p, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = Tensor(self).cpu().abs().pow(p);
     auto cpu_result = cpu_self.sum(dim, /*keepdim=*/true);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(), result.numel() * result.itemsize());
   }
@@ -749,6 +779,7 @@ C10_EXPORT void norm_launch_kernel(TensorIterator& iter, double p) {
   if (haganeOpsNormVal(&in_d, &out_d, p, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = Tensor(self).cpu();
     auto cpu_result = cpu_self.norm(p, dim, /*keepdim=*/true);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(), result.numel() * result.itemsize());
   }
@@ -771,6 +802,7 @@ C10_EXPORT void launch_fused_mode_kernel(
   if (haganeOpsMode(&in_d, &val_d, &idx_d, dim) != HAGANE_OPS_SUCCESS) {
     Tensor self_cpu = Tensor(self).cpu();
     auto [mode_vals, mode_idx] = self_cpu.mode(dim);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(values.const_data_ptr()),
                 mode_vals.const_data_ptr(), values.numel() * values.itemsize());
@@ -789,6 +821,7 @@ C10_EXPORT void launch_apply_mode_kernel(
   if (haganeOpsMode(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     Tensor self_cpu = Tensor(self).cpu();
     auto [mode_vals, mode_idx] = self_cpu.mode(dim);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(values.const_data_ptr()),
                 mode_vals.const_data_ptr(), values.numel() * values.itemsize());
@@ -807,6 +840,7 @@ C10_EXPORT void launch_kthvalue_kernel(
   if (haganeOpsKthvalue(&in_d, &val_d, &idx_d, static_cast<int32_t>(dim), k) != HAGANE_OPS_SUCCESS) {
     Tensor self_cpu = Tensor(self).cpu();
     auto [kth_vals, kth_idx] = self_cpu.kthvalue(k, dim, /*keepdim=*/true);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(values.const_data_ptr()),
                 kth_vals.const_data_ptr(), values.numel() * values.itemsize());
@@ -826,6 +860,7 @@ C10_EXPORT void launch_median_kernel(
                       ignore_nan ? 1 : 0) != HAGANE_OPS_SUCCESS) {
     Tensor in_cpu = Tensor(in).cpu();
     auto [med_vals, med_idx] = in_cpu.median(dim, /*keepdim=*/true);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(vals.const_data_ptr()),
                 med_vals.const_data_ptr(), vals.numel() * vals.itemsize());
@@ -890,6 +925,7 @@ C10_EXPORT Tensor& arange_cuda_out(
     if (!arange_double_is_exact(start, step, size) ||
         haganeOpsArange(&out_d, start.toDouble(), step.toDouble()) != HAGANE_OPS_SUCCESS) {
       auto cpu_r = at::arange(start, end, step, result.options().device(c10::kCPU));
+      HAGANE_HOST_FALLBACK("raw_read");
       HAGANE_BEFORE_RAW_READ();
       std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
     }
@@ -905,6 +941,7 @@ C10_EXPORT Tensor& linspace_cuda_out(
     auto out_d = make_tensor_desc(result);
     if (haganeOpsLinspace(&out_d, start.toDouble(), end.toDouble(), steps) != HAGANE_OPS_SUCCESS) {
       auto cpu_r = at::linspace(start, end, steps, result.options().device(c10::kCPU));
+      HAGANE_HOST_FALLBACK("raw_read");
       HAGANE_BEFORE_RAW_READ();
       std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
     }
@@ -918,6 +955,7 @@ C10_EXPORT Tensor& eye_out_cuda(int64_t n, Tensor& result) {
   auto out_d = make_tensor_desc(result);
   if (haganeOpsEye(&out_d, n, n) != HAGANE_OPS_SUCCESS) {
     auto cpu_r = at::eye(n, result.options().device(c10::kCPU));
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
   }
@@ -930,6 +968,7 @@ C10_EXPORT Tensor& eye_out_cuda(int64_t n, int64_t m, Tensor& result) {
   auto out_d = make_tensor_desc(result);
   if (haganeOpsEye(&out_d, n, m) != HAGANE_OPS_SUCCESS) {
     auto cpu_r = at::eye(n, m, result.options().device(c10::kCPU));
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(), result.numel() * result.itemsize());
   }
@@ -961,6 +1000,7 @@ C10_EXPORT Tensor index_select_cuda(
   auto out_d = make_tensor_desc(result);
   if (haganeOpsIndexSelect(&in_d, &idx_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
     auto cpu_result = self.cpu().index_select(dim, index.cpu());
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -979,6 +1019,7 @@ C10_EXPORT Tensor& masked_fill__cuda(
   if (haganeOpsMaskedFill(&self_d, &mask_d, value.toFloat()) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = self.cpu();
     cpu_self.masked_fill_(mask.cpu(), value);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(self.data_ptr(), cpu_self.const_data_ptr(),
                 self.numel() * self.itemsize());
@@ -1003,6 +1044,7 @@ C10_EXPORT Tensor roll_cuda(
     int64_t s = shifts[0];
     int32_t d = 0;
     if (haganeOpsRoll(&in_d, &out_d, &s, &d, 1) != HAGANE_OPS_SUCCESS) {
+      HAGANE_HOST_FALLBACK("at_cpu");
       auto cpu_result = self.cpu().roll(shifts, dims);
       return cpu_result.to(self.device());
     }
@@ -1019,6 +1061,7 @@ C10_EXPORT Tensor roll_cuda(
   if (haganeOpsRoll(&in_d, &out_d, shifts_vec.data(), dims_vec.data(),
                      static_cast<int32_t>(shifts.size())) != HAGANE_OPS_SUCCESS) {
     auto cpu_result = self.cpu().roll(shifts, dims);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -1040,6 +1083,7 @@ C10_EXPORT Tensor repeat_interleave_cuda(
   auto res_d = make_tensor_desc(result);
   if (haganeOpsRepeatInterleave(&rep_d, &res_d) != HAGANE_OPS_SUCCESS) {
     auto cpu_result = at::repeat_interleave(repeat.cpu(), output_size);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -1055,6 +1099,7 @@ C10_EXPORT Tensor& nonzero_out_cuda(const Tensor& self, Tensor& out) {
   if (haganeOpsNonzero(&in_d, nullptr, &num_nonzero) != HAGANE_OPS_SUCCESS) {
     auto cpu_result = self.cpu().nonzero();
     out.resize_({cpu_result.size(0), cpu_result.size(1)});
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(out.data_ptr(), cpu_result.const_data_ptr(),
                 out.numel() * out.itemsize());
@@ -1278,6 +1323,7 @@ C10_EXPORT void foreach_tensor_copy_list_kernel_cuda_(
     auto sd = make_tensor_desc(src[i]);
     auto dd = make_tensor_desc(self[i]);
     dd.data = const_cast<void*>(self[i].const_data_ptr());
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(dd.data, sd.data, self[i].numel() * self[i].itemsize());
   }
@@ -1760,6 +1806,7 @@ C10_EXPORT Tensor& range_cuda_out(
       (!arange_double_is_exact(start, step, size) ||
        haganeOpsArange(&rd, s, st) != HAGANE_OPS_SUCCESS)) {
     auto cpu_r = at::range(start, end, step, result.options().device(c10::kCPU));
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_r.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -2164,6 +2211,7 @@ void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
   if (hagane_dispatch::detail::try_vendor_fill(iter, value)) return;
   auto out = make_ops_tensor(iter, 0);
   if (haganeOpsFill(&out, value.toDouble()) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     fill_stub(c10::DeviceType::CPU, iter, value);
   }
@@ -2226,6 +2274,7 @@ void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
 
 void hagane_silu_backward_kernel(TensorIteratorBase& iter) {
   // Training only — CPU fallback
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   silu_backward_stub(c10::DeviceType::CPU, iter);
 }
@@ -2301,6 +2350,7 @@ void hagane_threshold_kernel(TensorIteratorBase& iter, const Scalar& threshold, 
     rc = haganeOpsThresholdBackward(&self, &other, &out, threshold.toFloat(), value.toFloat());
   }
   if (rc != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     threshold_stub(c10::DeviceType::CPU, iter, threshold, value);
   }
@@ -2310,6 +2360,7 @@ void hagane_elu_kernel(TensorIteratorBase& iter, const Scalar& alpha, const Scal
   auto out = make_ops_tensor(iter, 0);
   auto in = make_ops_tensor(iter, 1);
   if (haganeOpsElu(&in, &out, alpha.toFloat(), scale.toFloat(), input_scale.toFloat()) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     elu_stub(c10::DeviceType::CPU, iter, alpha, scale, input_scale);
   }
@@ -2319,6 +2370,7 @@ void hagane_softplus_kernel(TensorIteratorBase& iter, const Scalar& beta, const 
   auto out = make_ops_tensor(iter, 0);
   auto in = make_ops_tensor(iter, 1);
   if (haganeOpsSoftplus(&in, &out, beta.toFloat(), threshold.toFloat()) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     softplus_stub(c10::DeviceType::CPU, iter, beta, threshold);
   }
@@ -2358,6 +2410,7 @@ void hagane_max_all_kernel(Tensor& result, const Tensor& self) {
   haganeOpsTensor_t in_d = { const_cast<void*>(self.const_data_ptr()), self.sizes().data(), self.strides().data(),
     static_cast<int32_t>(self.dim()), to_hagane_dtype(self.scalar_type()) };
   if (haganeOpsMaxValues(&in_d, &out_d) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     max_all_stub(c10::DeviceType::CPU, result, self);
   }
@@ -2371,6 +2424,7 @@ void hagane_min_all_kernel(Tensor& result, const Tensor& self) {
   haganeOpsTensor_t in_d = { const_cast<void*>(self.const_data_ptr()), self.sizes().data(), self.strides().data(),
     static_cast<int32_t>(self.dim()), to_hagane_dtype(self.scalar_type()) };
   if (haganeOpsMinValues(&in_d, &out_d) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     min_all_stub(c10::DeviceType::CPU, result, self);
   }
@@ -2387,6 +2441,7 @@ void hagane_clamp_kernel(TensorIteratorBase& iter) {
   auto max_t = make_ops_tensor(iter, 3);
   // tensor-based clamp — use where(x < min, min, where(x > max, max, x))
   // For now CPU delegation since this needs 4-operand support
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   clamp_stub(c10::DeviceType::CPU, iter);
 }
@@ -2433,6 +2488,7 @@ static void hagane_clamp_scalar_common(TensorIteratorBase& iter,
     return;
 
   auto cpu_fallback = [&]() {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     if (has_min && has_max)
       clamp_scalar_stub(c10::DeviceType::CPU, iter, min_val, max_val);
@@ -2513,6 +2569,7 @@ void hagane_gather_kernel(const Tensor& result, const Tensor& self,
   auto idx_d = make_tensor_desc(index);
   auto out_d = make_tensor_desc(result);
   if (haganeOpsGather(&in_d, &idx_d, &out_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     gather_stub(c10::DeviceType::CPU, result, self, dim, index);
   }
@@ -2531,6 +2588,7 @@ void hagane_scatter_kernel(const Tensor& self, int64_t dim,
   auto idx_d = make_tensor_desc(index);
   auto src_d = make_tensor_desc(src);
   if (haganeOpsScatter(&self_d, &idx_d, &src_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     scatter_stub(c10::DeviceType::CPU, self, dim, index, src);
   }
@@ -2541,6 +2599,7 @@ void hagane_scatter_fill_kernel(const Tensor& self, int64_t dim,
   auto self_d = make_tensor_desc(self);
   auto idx_d = make_tensor_desc(index);
   if (haganeOpsScatterFill(&self_d, &idx_d, src.toFloat(), static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     scatter_fill_stub(c10::DeviceType::CPU, self, dim, index, src);
   }
@@ -2552,6 +2611,7 @@ void hagane_scatter_add_kernel(const Tensor& self, int64_t dim,
   auto idx_d = make_tensor_desc(index);
   auto src_d = make_tensor_desc(src);
   if (haganeOpsScatterAdd(&self_d, &idx_d, &src_d, static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     scatter_add_stub(c10::DeviceType::CPU, self, dim, index, src);
   }
@@ -2561,6 +2621,7 @@ void hagane_scatter_reduce_kernel(const Tensor& self, int64_t dim,
                                   const Tensor& index, const Tensor& src,
                                   const ReductionType& reduce) {
   // Scatter with reduce — UMA allows CPU path on same memory
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   scatter_reduce_stub(c10::DeviceType::CPU, self, dim, index, src, reduce);
 }
@@ -2568,6 +2629,7 @@ void hagane_scatter_reduce_kernel(const Tensor& self, int64_t dim,
 void hagane_scatter_scalar_reduce_kernel(const Tensor& self, int64_t dim,
                                          const Tensor& index, const Scalar& value,
                                          const ReductionType& reduce) {
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   scatter_scalar_reduce_stub(c10::DeviceType::CPU, self, dim, index, value, reduce);
 }
@@ -2575,6 +2637,7 @@ void hagane_scatter_scalar_reduce_kernel(const Tensor& self, int64_t dim,
 void hagane_scatter_reduce_two_kernel(const Tensor& self, int64_t dim,
                                        const Tensor& index, const Tensor& src,
                                        const ReductionType& reduce) {
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   scatter_reduce_two_stub(c10::DeviceType::CPU, self, dim, index, src, reduce);
 }
@@ -2756,6 +2819,7 @@ static bool hagane_index_on_device(TensorIteratorBase& iter,
 void hagane_index_kernel(TensorIteratorBase& iter, IntArrayRef indexed_sizes,
                          IntArrayRef indexed_strides) {
   if (hagane_index_on_device(iter, indexed_sizes, indexed_strides)) return;
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   index_stub(c10::DeviceType::CPU, iter, indexed_sizes, indexed_strides);
 }
@@ -2763,18 +2827,21 @@ void hagane_index_kernel(TensorIteratorBase& iter, IntArrayRef indexed_sizes,
 void hagane_index_fill_kernel(TensorIterator& iter, int64_t dim,
                               int64_t self_dim_size, int64_t self_dim_stride,
                               const Scalar& source) {
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   index_fill_stub(c10::DeviceType::CPU, iter, dim, self_dim_size, self_dim_stride, source);
 }
 
 void hagane_index_copy_kernel(TensorIterator& iter, int64_t dim,
                               int64_t self_dim_size, int64_t self_dim_stride) {
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   index_copy_stub(c10::DeviceType::CPU, iter, dim, self_dim_size, self_dim_stride);
 }
 
 void hagane_index_put_kernel(TensorIterator& iter, IntArrayRef indexed_sizes,
                              IntArrayRef indexed_strides, bool accumulate) {
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   index_put_stub(c10::DeviceType::CPU, iter, indexed_sizes, indexed_strides, accumulate);
 }
@@ -2788,6 +2855,7 @@ void hagane_flip_kernel(TensorIterator& iter, const bool quantized) {
   const auto& result = iter.tensor(0);
   // Flip through TensorIterator — the iterator handles the flip logic,
   // we just need to do the copy. UMA makes CPU path work on same memory.
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   flip_stub(c10::DeviceType::CPU, iter, quantized);
 }
@@ -2805,6 +2873,7 @@ void hagane_masked_fill_kernel(TensorIterator& iter, const Scalar& value) {
   const auto& mask = iter.tensor(1);
   auto mask_d = make_tensor_desc(mask);
   if (haganeOpsMaskedFill(&self_d, &mask_d, value.toFloat()) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     masked_fill_stub(c10::DeviceType::CPU, iter, value);
   }
@@ -2836,6 +2905,7 @@ void hagane_cat_serial_kernel(const Tensor& result,
                    &out_d, static_cast<int32_t>(dim)) == HAGANE_OPS_SUCCESS) {
     return;
   }
+  HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   cat_serial_stub(c10::DeviceType::CPU, result, tensors, dim);
 }
@@ -2852,6 +2922,7 @@ void hagane_normal_kernel(const TensorBase& self, double mean, double std,
     // CPU fallback: generate on CPU, copy to "GPU" (UMA)
     auto cpu_t = at::empty(self.sizes(), self.options().device(c10::kCPU));
     cpu_t.normal_(mean, std);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(self.const_data_ptr()),
                 cpu_t.const_data_ptr(), self.numel() * self.itemsize());
@@ -2863,6 +2934,7 @@ void hagane_uniform_kernel(TensorIteratorBase& iter, double from, double to,
   auto out = make_ops_tensor(iter, 0);
   auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
   if (haganeOpsUniform(&out, from, to, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     uniform_stub(c10::DeviceType::CPU, iter, from, to, gen);
   }
@@ -2876,6 +2948,7 @@ void hagane_bernoulli_tensor_kernel(const TensorBase& self, const TensorBase& p_
   if (haganeOpsBernoulliTensor(&out_d, &p_d, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = at::empty(self.sizes(), self.options().device(c10::kCPU));
     cpu_self.bernoulli_(Tensor(p_).cpu());
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(self.const_data_ptr()),
                 cpu_self.const_data_ptr(), self.numel() * self.itemsize());
@@ -2889,6 +2962,7 @@ void hagane_bernoulli_scalar_kernel(const TensorBase& self, double p,
   if (haganeOpsBernoulliScalar(&out_d, p, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
     auto cpu_self = at::empty(self.sizes(), self.options().device(c10::kCPU));
     cpu_self.bernoulli_(p);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(const_cast<void*>(self.const_data_ptr()),
                 cpu_self.const_data_ptr(), self.numel() * self.itemsize());
@@ -2901,6 +2975,7 @@ void hagane_random_from_to_kernel(TensorIteratorBase& iter, uint64_t range,
   auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
   if (haganeOpsRandomFromTo(&out, base, base + static_cast<int64_t>(range),
                             rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     random_from_to_stub(c10::DeviceType::CPU, iter, range, base, gen);
   }
@@ -2910,6 +2985,7 @@ void hagane_random_full_kernel(TensorIteratorBase& iter, std::optional<Generator
   auto out = make_ops_tensor(iter, 0);
   auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
   if (haganeOpsRandom(&out, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     random_full_64_bits_range_stub(c10::DeviceType::CPU, iter, gen);
   }
@@ -2919,6 +2995,7 @@ void hagane_random_kernel(TensorIteratorBase& iter, std::optional<Generator> gen
   auto out = make_ops_tensor(iter, 0);
   auto [rng_seed, rng_offset] = hagane_rng_state(gen, iter.numel());
   if (haganeOpsRandom(&out, rng_seed, rng_offset) != HAGANE_OPS_SUCCESS) {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     random_stub(c10::DeviceType::CPU, iter, gen);
   }
@@ -2934,6 +3011,7 @@ void hagane_log_normal_kernel(TensorIteratorBase& iter, double mean, double std,
     auto in = make_ops_tensor(iter, 0);
     haganeOpsExp(&in, &out);
   } else {
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     log_normal_stub(c10::DeviceType::CPU, iter, mean, std, gen);
   }
@@ -3498,6 +3576,7 @@ void hagane_cdist_dispatch_kernel(at::Tensor& result, const at::Tensor& x1,
   auto out_d = make_tensor_desc(result);
   if (haganeOpsCdist(&x1_d, &x2_d, p, &out_d) != HAGANE_OPS_SUCCESS) {
     auto cpu_result = at::cdist(x1.cpu(), x2.cpu(), p);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -3510,6 +3589,7 @@ void hagane_pdist_forward_dispatch_kernel(at::Tensor& result, const at::Tensor& 
   auto out_d = make_tensor_desc(result);
   if (haganeOpsPdist(&in_d, p, &out_d) != HAGANE_OPS_SUCCESS) {
     auto cpu_result = at::pdist(self.cpu(), p);
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(result.data_ptr(), cpu_result.const_data_ptr(),
                 result.numel() * result.itemsize());
@@ -4961,6 +5041,7 @@ C10_EXPORT void add_padding_kernelLauncher(
     int64_t in_size = 1;
     for (int d = 0; d < input_dim; d++) in_size *= input_sizes[b * input_dim + d];
     // Copy input to padded output slot
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(output + (int64_t)b * output_stride, input + offset, in_size * sizeof(T));
     // Fill remaining with padding_value
@@ -4983,6 +5064,7 @@ C10_EXPORT void remove_padding_kernelLauncher(
     int offset = offsets[b];
     int64_t size = 1;
     for (int d = 0; d < (int)output_dim; d++) size *= output_sizes[b * output_dim + d];
+    HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(output + offset, input + b * size, size * sizeof(T));
   }
