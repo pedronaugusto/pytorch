@@ -2691,7 +2691,8 @@ inline bool index_metallib_available() {
             return false;
         }
         std::fprintf(stderr,
-            "[hagane-path-alpha] index metallib registered (gather/scatter, 24 kernels)\n");
+            "[hagane-path-alpha] index metallib registered "
+            "(gather/scatter/triangle, 32 kernels)\n");
         return true;
     }();
     return available;
@@ -2928,6 +2929,79 @@ inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
         return decline(R, OP, "kernel_dispatch");
     note_native_launch(kname);
     haganeOpsMarkMetallibWrite(p_self, static_cast<size_t>(self_span * esz));
+    return true;
+}
+
+// 1.11-C — triu / tril, into the caller's own block.
+//
+//   triu: out[..., r, c] = (r <= c - diagonal) ? in[..., r, c] : 0
+//   tril: out[..., r, c] = (r >= c - diagonal) ? in[..., r, c] : 0
+//
+// What this replaces is not just a stash: haganeOpsTriu built the predicate out
+// of FIVE MLX ops per call (arange, two reshape, subtract, less_equal, where,
+// zeros_like), allocating an index ramp and a zeros tensor each time, and it
+// cast the int64 `diagonal` through `int` on the way. The owned kernel takes
+// the int64 directly and allocates nothing.
+//
+// Both operands are required CONTIGUOUS and same-shape, so the flat index
+// carries any batch dims as pure outer stride — a batched (…, H, W) needs no
+// extra arm. `out` may alias `in` (torch's triu_), and the SETTLE is the part
+// that has to be right there, not the kernel: FlushForWrite ERASES a stash
+// whose out_ptr is in range, which for an aliased operand would drop the value
+// the kernel is about to read (#1014). So an alias takes FlushRegion, which
+// materialises instead.
+inline bool try_triangle(const char* torch_op, bool upper,
+                         const at::Tensor& in, const at::Tensor& out,
+                         int64_t diagonal) {
+    const char* R = "triangle";
+    if (!index_metallib_available()) return false;
+    route_enter(R, torch_op);
+    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    if (!in.defined() || !out.defined())
+        return decline(R, torch_op, "undefined_operand");
+    if (!in.is_cuda() || !out.is_cuda()) return decline(R, torch_op, "not_device");
+    // A raw element copy: a dtype mismatch would move bytes between
+    // representations. triu/tril preserve dtype, so this only fires if an
+    // unexpected caller appears.
+    if (in.scalar_type() != out.scalar_type())
+        return decline_dtypes(R, torch_op, "in_out_dtype_differ",
+                              in.scalar_type(), out.scalar_type());
+    const int64_t esz = out.element_size();
+    const char* bsfx = index_bsuffix(esz);
+    if (!bsfx) return decline(R, torch_op, "element_size");
+    if (in.dim() < 2) return decline(R, torch_op, "rank_lt2");
+    if (in.sizes() != out.sizes()) return decline(R, torch_op, "shape_differ");
+    // The flat index assumes both sides are packed. A strided `out=` keeps the
+    // MLX fallback, which addresses through copy_result's strides.
+    if (!in.is_contiguous()) return decline(R, torch_op, "in_not_contiguous");
+    if (!out.is_contiguous()) return decline(R, torch_op, "out_not_contiguous");
+    const int64_t total = out.numel();
+    if (total <= 0) return decline(R, torch_op, "empty");
+
+    const int64_t H = in.size(in.dim() - 2), W = in.size(in.dim() - 1);
+    void* p_in  = const_cast<void*>(in.const_data_ptr());
+    void* p_out = out.data_ptr();
+    const size_t bytes = static_cast<size_t>(total) * esz;
+
+    flush_or_commit_metallib_input(p_in, bytes);
+    if (p_in == p_out) haganeOpsFlushRegion(p_out, static_cast<int64_t>(bytes));
+    else               haganeOpsFlushForWrite(p_out, static_cast<int64_t>(bytes));
+
+    std::string kname = std::string(upper ? "hagane_triu_" : "hagane_tril_") + bsfx;
+    int64_t c_total = total, c_H = H, c_W = W, c_diag = diagonal;
+    void*  args[]  = {p_in, p_out, &c_total, &c_H, &c_W, &c_diag};
+    int    at_[]   = {0, 0, 1, 1, 1, 1};
+    size_t as_[]   = {0, 0, sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
+                      sizeof(int64_t)};
+    int64_t nb = (total + 255) / 256;
+    if (nb < 1) nb = 1;
+    if (nb > 65535) nb = 65535;          // the grid-stride loop covers the rest
+    dim3 block(256, 1, 1), grid(static_cast<unsigned>(nb), 1, 1);
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, at_, as_, 6) != hipSuccess)
+        return decline(R, torch_op, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(p_out, bytes);
     return true;
 }
 

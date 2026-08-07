@@ -4874,6 +4874,9 @@ C10_EXPORT Tensor& replication_pad3d_backward_out_cuda(
 
 TORCH_IMPL_FUNC(tril_cuda)(const Tensor& self, int64_t diagonal, const Tensor& output) {
   auto self_c = self.contiguous();
+  if (hagane_dispatch::detail::try_triangle("tril", /*upper=*/false,
+                                            self_c, output, diagonal))
+    return;
   auto id = make_tensor_desc(self_c);
   auto od = make_tensor_desc(output);
   haganeOpsTril(&id, &od, diagonal);
@@ -4881,6 +4884,9 @@ TORCH_IMPL_FUNC(tril_cuda)(const Tensor& self, int64_t diagonal, const Tensor& o
 
 TORCH_IMPL_FUNC(triu_cuda)(const Tensor& self, int64_t diagonal, const Tensor& output) {
   auto self_c = self.contiguous();
+  if (hagane_dispatch::detail::try_triangle("triu", /*upper=*/true,
+                                            self_c, output, diagonal))
+    return;
   auto id = make_tensor_desc(self_c);
   auto od = make_tensor_desc(output);
   haganeOpsTriu(&id, &od, diagonal);
