@@ -2819,7 +2819,13 @@ inline bool try_index_gather_axis(const char* torch_op, const at::Tensor& in,
     // depends on whether the write covers every byte of the span — the same
     // question vendor_settle_output asks, and getting it backwards is #1014:
     // superseding a strided write drops live values in the holes.
-    if (out_span == total) haganeOpsFlushForWrite(p_out, out_span * esz);
+    //
+    // J (#1080): the writer below is a KERNEL on the Hagane queue, so the
+    // DEVICE-write entry, not the host-write one. The queue is totally ordered
+    // and this dispatch is sequenced after every queued write to p_out by the
+    // shared event — which is the same guarantee haganeOpsMarkMetallibWrite
+    // relies on a dozen lines down.
+    if (out_span == total) haganeOpsSettleForDeviceWrite(p_out, out_span * esz);
     else                   haganeOpsFlushRegion(p_out, out_span * esz);
 
     std::string kname = std::string("hagane_gather_axis_") + bsfx + "_" + isfx;
@@ -2849,7 +2855,8 @@ inline bool try_index_gather_axis(const char* torch_op, const at::Tensor& in,
 //   on `self` has to be MATERIALISED, never dropped — dropping it is exactly
 //   #1014 / RW-8.0, and it would silently zero everything the scatter does not
 //   touch. That is why this uses haganeOpsFlushRegion where the gather routes
-//   use haganeOpsFlushForWrite.
+//   use haganeOpsSettleForDeviceWrite (J/#1080; it was haganeOpsFlushForWrite
+//   before J moved the full-span cases off the host-write entry).
 //
 // Duplicate indices are a plain write with an UNSPECIFIED winner in torch (it
 // is scatter_ADD that accumulates), so no atomics are needed — which is also
@@ -2984,8 +2991,9 @@ inline bool try_triangle(const char* torch_op, bool upper,
     const size_t bytes = static_cast<size_t>(total) * esz;
 
     flush_or_commit_metallib_input(p_in, bytes);
+    // J (#1080): device write — see the note in try_index_gather_axis.
     if (p_in == p_out) haganeOpsFlushRegion(p_out, static_cast<int64_t>(bytes));
-    else               haganeOpsFlushForWrite(p_out, static_cast<int64_t>(bytes));
+    else               haganeOpsSettleForDeviceWrite(p_out, static_cast<int64_t>(bytes));
 
     std::string kname = std::string(upper ? "hagane_triu_" : "hagane_tril_") + bsfx;
     int64_t c_total = total, c_H = H, c_W = W, c_diag = diagonal;
@@ -3124,7 +3132,8 @@ inline bool try_normal_metallib(const char* torch_op, const at::TensorBase& out,
     // A sample covers every byte of a contiguous output and reads nothing, so
     // this is the unambiguous pre-write barrier — the fill/arange case, not
     // triu's aliased one.
-    haganeOpsFlushForWrite(p_out, static_cast<int64_t>(bytes));
+    // J (#1080): device write — see the note in try_index_gather_axis.
+    haganeOpsSettleForDeviceWrite(p_out, static_cast<int64_t>(bytes));
 
     std::string kname = std::string("hagane_normal_") + dsfx;
     int64_t  c_numel = numel;
@@ -3257,7 +3266,8 @@ inline bool try_index_gather_advanced(TensorIteratorBase& iter,
     flush_or_commit_metallib_input(p_base, base_span * esz);
     for (int j = 0; j < n_idx; ++j)
         flush_or_commit_metallib_input(p_idx[j], idx_span[j]);
-    if (out_span == total) haganeOpsFlushForWrite(p_out, out_span * esz);
+    // J (#1080): device write — see the note in try_index_gather_axis.
+    if (out_span == total) haganeOpsSettleForDeviceWrite(p_out, out_span * esz);
     else                   haganeOpsFlushRegion(p_out, out_span * esz);
 
     std::string kname = "hagane_index_gather" + std::to_string(n_idx) + "_" + bsfx;
