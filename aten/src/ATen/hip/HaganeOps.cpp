@@ -2876,8 +2876,24 @@ void hagane_index_copy_kernel(TensorIterator& iter, int64_t dim,
   index_copy_stub(c10::DeviceType::CPU, iter, dim, self_dim_size, self_dim_stride);
 }
 
+// S3 (#996) — the Hagane-owned advanced-index WRITE (hagane/kernels/index.hip),
+// one dispatch into the caller's own block. This was the last op on a real
+// workload's path that left the GPU: 11 calls per ARDY replan, all of the
+// host_fallbacks counter, and a hard blocker on deleting the stash — a
+// host-side kernel cannot write the caller's block as a queued GPU write.
+//
+// The CPU delegation stays as the DECLINED path, and stays COUNTED. That is
+// deliberate and it is the same shape as hagane_index_kernel above: refusing
+// outright would break non-routed shapes that work today, while a silent
+// fallback is what the counter exists to prevent. accumulate=true never
+// reaches here (aten routes it to index_put_with_sort_stub, which Hagane does
+// not register, so it aborts loudly) — the guard inside the route is belt and
+// braces, not the mechanism.
 void hagane_index_put_kernel(TensorIterator& iter, IntArrayRef indexed_sizes,
                              IntArrayRef indexed_strides, bool accumulate) {
+  if (hagane_dispatch::detail::try_index_put_advanced(iter, indexed_sizes,
+                                                      indexed_strides, accumulate))
+    return;
   HAGANE_HOST_FALLBACK("raw_read");
   HAGANE_BEFORE_RAW_READ();
   index_put_stub(c10::DeviceType::CPU, iter, indexed_sizes, indexed_strides, accumulate);

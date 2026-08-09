@@ -2692,7 +2692,7 @@ inline bool index_metallib_available() {
         }
         std::fprintf(stderr,
             "[hagane-path-alpha] index metallib registered "
-            "(gather/scatter/triangle, 32 kernels)\n");
+            "(gather/scatter/index_put/triangle/compact, 52 kernels)\n");
         return true;
     }();
     return available;
@@ -3292,6 +3292,169 @@ inline bool try_index_gather_advanced(TensorIteratorBase& iter,
         return decline(R, OP, "kernel_dispatch");
     note_native_launch(kname);
     haganeOpsMarkMetallibWrite(p_out, static_cast<size_t>(out_span * esz));
+    return true;
+}
+
+// B' (S3 / #996) — advanced indexing as a WRITE, `index_put` with
+// accumulate=false:
+//
+//   base[ SUM_d coord_d*base_es[d] + SUM_j wrap(idx_j[coord])*istride[j] ]
+//       = value[value_es . coord]
+//
+// The mirror of try_index_gather_advanced. What it replaces is not a slower
+// route, it is an UNCONDITIONAL HOP TO THE CPU — index_put_stub(CPU, ...) —
+// which was the last op leaving the GPU on a real workload (11 calls per ARDY
+// replan, the entire host_fallbacks count) and a hard blocker on deleting the
+// stash: a host-side kernel cannot write the caller's block as a queued GPU
+// write, by construction, so while one remains pending_/LazyGraph cannot go.
+//
+// OPERAND ROLES ARE THE OTHER WAY ROUND FROM THE GATHER, and that is the one
+// thing to get right here. aten builds this iterator (make_index_put_iterator)
+// as: operand 0 = `self` RESTRIDED with stride 0 on the indexed dims — the
+// DESTINATION, and the tensor the index arithmetic applies to; operand 1 =
+// `value` — the source; operands 2.. = the int64 indices. The shared
+// HaganeIndexGatherDims keeps its meaning under that swap because `base_es`
+// always strides the INDEXED operand and `out_es` always strides the other
+// one, whichever happens to be written.
+//
+// THE SETTLE IS THE PART THAT IS NOT SYMMETRIC WITH THE GATHER. This write is
+// PARTIAL by construction — it touches the indexed positions and nothing else
+// — so a stash on `base` has to be MATERIALISED, never dropped. That is
+// haganeOpsFlushRegion, unconditionally, exactly as try_index_scatter_axis
+// does and for exactly the same reason: haganeOpsSettleForDeviceWrite ERASES a
+// stash whose out_ptr is in range, which here would silently zero everything
+// the put does not write (#1014 / RW-8.0). The gather's `out_span == total`
+// branch has no analogue: we cannot know without reading the indices whether
+// the put covers its base, so it is always treated as partial.
+//
+// Two behaviours are deliberately inherited rather than fixed here:
+//   * Out-of-range indices WRAP then CLAMP (#1000), which is what every other
+//     route in this family does. The CPU stub this replaces raised IndexError;
+//     CUDA fires a device-side assert. Memory safety holds either way, and the
+//     family needs one answer, not a special case on the writer.
+//   * Duplicate indices race, with the winner one of the sources. torch
+//     documents accumulate=false with duplicates as undefined and CUDA's own
+//     kernel is an unordered store, so this IS the parity behaviour — the CPU
+//     stub's last-wins was the accident.
+inline bool try_index_put_advanced(TensorIterator& iter,
+                                   at::IntArrayRef indexed_sizes,
+                                   at::IntArrayRef indexed_strides,
+                                   bool accumulate) {
+    const char* R = "index_adv";
+    const char* OP = "index_put";
+    if (!index_metallib_available()) return false;
+    route_enter(R, OP);
+    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+    // accumulate=true is a different op: it needs atomics and torch routes it
+    // to index_put_with_sort_stub long before here. Guarded anyway, because
+    // quietly overwriting instead of adding is the worst failure available.
+    if (accumulate) return decline(R, OP, "accumulate");
+
+    const int n_idx = static_cast<int>(iter.ntensors()) - 2;
+    if (n_idx <= 0 || n_idx > HAGANE_INDEX_MAX_IDX)
+        return decline(R, OP, "n_idx");
+    if ((int)indexed_sizes.size() != n_idx || (int)indexed_strides.size() != n_idx)
+        return decline(R, OP, "indexed_arity_mismatch");
+
+    const at::Tensor& base  = iter.tensor(0);   // `self`, restrided — WRITTEN
+    const at::Tensor& value = iter.tensor(1);   // the source
+    if (!base.defined() || !value.defined()) return decline(R, OP, "undefined_operand");
+    if (!base.is_cuda() || !value.is_cuda()) return decline(R, OP, "not_device");
+    if (base.scalar_type() != value.scalar_type())
+        return decline_dtypes(R, OP, "self_value_dtype_differ",
+                              value.scalar_type(), base.scalar_type());
+
+    const int64_t esz = base.element_size();
+    const char* bsfx = index_bsuffix(esz);
+    if (!bsfx) return decline(R, OP, "element_size");
+
+    const auto shape = iter.shape();
+    const int ndim = static_cast<int>(shape.size());
+    if (ndim <= 0 || ndim > HAGANE_INDEX_MAX_DIMS) return decline(R, OP, "ndim");
+    const int64_t total = iter.numel();
+    if (total <= 0) return decline(R, OP, "empty");
+
+    // Byte strides must be whole elements: the kernel works in element space,
+    // and a partial-element stride cannot be expressed there at all.
+    auto elem_strides = [&](int arg, int64_t item, int64_t* dst) -> bool {
+        if (item <= 0) return false;
+        const auto st = iter.strides(arg);
+        if ((int)st.size() != ndim) return false;
+        for (int k = 0; k < ndim; ++k) {
+            if (st[k] % item != 0) return false;
+            dst[k] = st[k] / item;
+            if (dst[k] < 0) return false;   // see try_index_gather_axis
+        }
+        return true;
+    };
+
+    HaganeIndexGatherDimsHost d{};
+    for (int k = 0; k < ndim; ++k) d.shape[k] = shape[k];
+    if (!elem_strides(0, esz, d.base_es)) return decline(R, OP, "base_strides");
+    if (!elem_strides(1, esz, d.out_es)) return decline(R, OP, "value_strides");
+
+    void* p_idx[HAGANE_INDEX_MAX_IDX] = {nullptr, nullptr, nullptr};
+    int64_t idx_span[HAGANE_INDEX_MAX_IDX] = {0, 0, 0};
+    for (int j = 0; j < n_idx; ++j) {
+        const at::Tensor& ib = iter.tensor(2 + j);
+        if (!ib.defined()) return decline(R, OP, "undefined_index");
+        // int64 is the kernel's only index arm and the caller's own guard
+        // already requires it. An int32 index would be read as int64 garbage,
+        // so this is a silent-wrong guard, not a capability limit.
+        if (ib.scalar_type() != at::kLong)
+            return decline_dtypes(R, OP, "index_dtype", ib.scalar_type(),
+                                  base.scalar_type());
+        if (!elem_strides(2 + j, ib.element_size(),
+                          d.idx_es + j * HAGANE_INDEX_MAX_DIMS))
+            return decline(R, OP, "index_strides");
+        if (indexed_strides[j] % esz != 0) return decline(R, OP, "indexed_stride");
+        d.isize[j]   = indexed_sizes[j];
+        d.istride[j] = indexed_strides[j] / esz;
+        if (d.isize[j] <= 0) return decline(R, OP, "empty_indexed_dim");
+        if (d.istride[j] < 0) return decline(R, OP, "negative_indexed_stride");
+        p_idx[j] = iter.data_ptr(2 + j);
+        idx_span[j] = index_span_elems(d.shape, d.idx_es + j * HAGANE_INDEX_MAX_DIMS,
+                                       ndim) * ib.element_size();
+    }
+
+    // `base` is WRITTEN at the largest coordinate AND the largest wrapped index
+    // on every indexed dim, so both terms are in the span — the same quantity
+    // the gather computes for its read, because it is the same address set.
+    int64_t base_span = index_span_elems(d.shape, d.base_es, ndim);
+    for (int j = 0; j < n_idx; ++j) base_span += (d.isize[j] - 1) * d.istride[j];
+    const int64_t value_span = index_span_elems(d.shape, d.out_es, ndim);
+
+    void* p_base  = iter.data_ptr(0);
+    void* p_value = iter.data_ptr(1);
+    flush_or_commit_metallib_input(p_value, value_span * esz);
+    for (int j = 0; j < n_idx; ++j)
+        flush_or_commit_metallib_input(p_idx[j], idx_span[j]);
+    // MATERIALISE, never drop — see the header comment. Partial by
+    // construction, so unlike the gather there is no full-overwrite branch.
+    haganeOpsFlushRegion(p_base, base_span * esz);
+
+    std::string kname = "hagane_index_put" + std::to_string(n_idx) + "_" + bsfx;
+    int64_t c_ndim = ndim, c_total = total;
+    void*  args[8];
+    int    at_[8];
+    size_t as_[8];
+    int n = 0;
+    args[n] = p_base; at_[n] = 0; as_[n] = 0; ++n;
+    for (int j = 0; j < n_idx; ++j) { args[n] = p_idx[j]; at_[n] = 0; as_[n] = 0; ++n; }
+    args[n] = p_value; at_[n] = 0; as_[n] = 0; ++n;
+    args[n] = &d;       at_[n] = 1; as_[n] = sizeof(d); ++n;
+    args[n] = &c_ndim;  at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
+    args[n] = &c_total; at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
+
+    int64_t nb = (total + 255) / 256;
+    if (nb < 1) nb = 1;
+    if (nb > 65535) nb = 65535;
+    dim3 block(256, 1, 1), grid(static_cast<unsigned>(nb), 1, 1);
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, at_, as_, n) != hipSuccess)
+        return decline(R, OP, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(p_base, static_cast<size_t>(base_span * esz));
     return true;
 }
 
