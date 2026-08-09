@@ -1095,20 +1095,48 @@ C10_EXPORT Tensor& nonzero_out_cuda(const Tensor& self, Tensor& out) {
   int64_t num_nonzero = 0;
   auto in_d = make_tensor_desc(self);
 
-  // First pass: get count
-  if (haganeOpsNonzero(&in_d, nullptr, &num_nonzero) != HAGANE_OPS_SUCCESS) {
-    auto cpu_result = self.cpu().nonzero();
+  // S2-4: TWO passes, because nonzero's output size is data-dependent and torch
+  // must resize_ to it before the indices can be written. That is CUDA's shape
+  // too. Each pass is now device work plus one 8-byte D2H, where it used to be
+  // a blocking mx::eval plus two O(numel) host scans.
+  auto host_fallback = [&]() -> Tensor& {
+    // .contiguous() IS LOAD-BEARING, and its absence was a silent-wrong that
+    // sat here undetected because this branch was unreachable: haganeOpsNonzero
+    // could not fail before S2-4 gave it honest declines.
+    //
+    // torch's own CPU nonzero builds its result as (ndim, count) and returns a
+    // TRANSPOSED VIEW of it — shape (count, ndim), strides (1, count), NOT
+    // contiguous. So a raw memcpy of const_data_ptr() copies the (ndim, count)
+    // buffer into a (count, ndim) output and every coordinate pair is shuffled.
+    // Measured on a 4x3 input: [[0,1],[2,2],[3,3],[1,0],[1,2],[0,2]] against the
+    // correct [[0,1],[1,0],[2,1],[2,2],[3,0],[3,2]] — a permutation with an
+    // out-of-range index in it, and the count is right, so nothing about the
+    // shape gives it away.
+    //
+    // Exactly 1.6's range_cuda_out lesson repeating: making an entry able to
+    // decline is what makes its fallback reachable, so the fallback has to be
+    // checked in the same edit.
+    auto cpu_result = self.cpu().nonzero().contiguous();
     out.resize_({cpu_result.size(0), cpu_result.size(1)});
     HAGANE_HOST_FALLBACK("raw_read");
     HAGANE_BEFORE_RAW_READ();
     std::memcpy(out.data_ptr(), cpu_result.const_data_ptr(),
                 out.numel() * out.itemsize());
     return out;
-  }
+  };
+
+  // First pass: the count.
+  if (haganeOpsNonzero(&in_d, nullptr, &num_nonzero) != HAGANE_OPS_SUCCESS)
+    return host_fallback();
 
   out.resize_({num_nonzero, self.dim()});
   if (num_nonzero > 0) {
-    haganeOpsNonzero(&in_d, out.data_ptr(), &num_nonzero);
+    // THE SECOND RETURN IS CHECKED. It was ignored, which was harmless only
+    // while the entry could not fail — exactly the assumption 1.6 had to
+    // retract in range_cuda_out once arange gained an honest decline. A decline
+    // here would otherwise leave `out` holding whatever resize_ handed back.
+    if (haganeOpsNonzero(&in_d, out.data_ptr(), &num_nonzero) != HAGANE_OPS_SUCCESS)
+      return host_fallback();
   }
   return out;
 }
