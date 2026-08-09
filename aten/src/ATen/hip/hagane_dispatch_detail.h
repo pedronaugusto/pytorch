@@ -141,9 +141,25 @@ inline haganeOpsTensor_t make_ops_tensor_or_scalar_local(
     return make_ops_tensor_local(iter, arg);
 }
 
+// Where Hagane's own metallibs live. THE RUNTIME ANSWERS THIS NOW; torch used
+// to hold its own copy, and the copy was:
+//
+//     return "/Users/gusto/work/izumo/hagane-sdk/share/metallibs";
+//
+// Seven registrations go through here (norm, gelu, reduce, softmax, index,
+// random, and the per-op elementwise arms), so on any machine but the one that
+// string names, all seven fail and every owned route silently falls back to
+// MLX — the whole owned-kernel surface gone, with no wrong answer to notice.
+// A3 swept sixteen hardcoded paths and missed this one because it grepped for
+// the LIBRARY path while this names share/metallibs.
+//
+// haganeOwnedMetallibDir() asks the loader where the runtime actually is
+// (kernel_registry.cpp), which is also what lets a runtime-side owned kernel
+// find its metallib without torch — the case a torch-only test cannot see.
+// It honours HAGANE_METALLIB_DIR, so anything that set it is unchanged.
 inline std::string metallib_dir() {
-    if (const char* env = std::getenv("HAGANE_METALLIB_DIR")) return env;
-    return "/Users/gusto/work/izumo/hagane-sdk/share/metallibs";
+    const char* dir = haganeOwnedMetallibDir();
+    return (dir && *dir) ? std::string(dir) : std::string();
 }
 
 // ---- Per-op fp64 trampolines ----------------------------------------------
