@@ -1097,8 +1097,13 @@ C10_EXPORT Tensor& nonzero_out_cuda(const Tensor& self, Tensor& out) {
 
   // S2-4: TWO passes, because nonzero's output size is data-dependent and torch
   // must resize_ to it before the indices can be written. That is CUDA's shape
-  // too. Each pass is now device work plus one 8-byte D2H, where it used to be
-  // a blocking mx::eval plus two O(numel) host scans.
+  // too, and it used to be a blocking mx::eval plus two O(numel) host scans.
+  //
+  // #1098: ONE 8-byte D2H for the pair, not one per pass. `num_nonzero` is
+  // IN/OUT — the sizing call (output_data == nullptr) writes it, the fill call
+  // reads back the same variable and does no host round trip at all. Nothing
+  // between the two calls may disturb it; `out.resize_` below only reads it.
+  // CUDA's phase 2 likewise never re-reads its own count (Nonzero.cu:251+).
   auto host_fallback = [&]() -> Tensor& {
     // .contiguous() IS LOAD-BEARING, and its absence was a silent-wrong that
     // sat here undetected because this branch was unreachable: haganeOpsNonzero
@@ -1125,12 +1130,16 @@ C10_EXPORT Tensor& nonzero_out_cuda(const Tensor& self, Tensor& out) {
     return out;
   };
 
-  // First pass: the count.
+  // First pass: the count. `num_nonzero` is OUT, and this is the op's one and
+  // only host round trip.
   if (haganeOpsNonzero(&in_d, nullptr, &num_nonzero) != HAGANE_OPS_SUCCESS)
     return host_fallback();
 
   out.resize_({num_nonzero, self.dim()});
   if (num_nonzero > 0) {
+    // Second pass: the coordinates. `num_nonzero` is IN — the count from
+    // above, which the entry uses only to bound its write barrier.
+    //
     // THE SECOND RETURN IS CHECKED. It was ignored, which was harmless only
     // while the entry could not fail — exactly the assumption 1.6 had to
     // retract in range_cuda_out once arange gained an honest decline. A decline
@@ -2180,20 +2189,27 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
   const auto& dst_t = iter.tensor(0);
   const auto& src_t = iter.tensor(1);
 
-  // GPU→CPU copies must materialize src's pending stash before reading; the
-  // lazy CopyFull path (Path A) wraps src and re-stashes against the dst
-  // pointer, but when dst is CPU memory the stash never materializes and the
-  // read returns the zero-initialized buffer. Flush only the src — dst's
-  // CPU bytes don't have a stash to invalidate, and pending_overlaps is a
-  // cheap no-op when src has no pending entry (the Llama post-argmax case).
   const bool gpu_to_cpu =
       src_t.device().is_cuda() && !dst_t.device().is_cuda();
-  if (gpu_to_cpu) {
-    int64_t src_nbytes = src_t.numel() * src_t.element_size();
-    if (src_nbytes > 0) {
-      ::haganeOpsFlushRegion(const_cast<void*>(src_t.data_ptr()), src_nbytes);
-    }
-  }
+
+  // #1130 — ONE HOST READ, ONE BARRIER.
+  //
+  // A `haganeOpsFlushRegion(src)` used to stand here, immediately above the
+  // `haganeOpsCopyFull` below. Both open with an unconditional
+  // `drain_hagane_queue()`, so a single `.cpu()` stopped the GPU TWICE where a
+  // blocking `cudaMemcpy` D2H synchronises the stream once and puts nothing
+  // underneath it. Measured at 2.0 drains/call by
+  // scripts/test_copy_drain_rate.py.
+  //
+  // It was there to protect CopyFull's Path B — a src that is a view into a
+  // stashed base misses Path A's exact-key lookup and would be memcpy'd from
+  // bytes the block merely owes. That is CopyFull's invariant to hold, not its
+  // caller's, and it now holds it itself with the same pending_overlaps guard
+  // Path E has always used. So this is a deletion, not a relocation of the
+  // hazard: the barrier moved INTO the entry that owns the read.
+  //
+  // The declined-copy fallback further down still flushes, because it does its
+  // own host memcpy without going through CopyFull at all.
 
   // #1010 — MLX's copy kernel, dispatched by us, writing the caller's block.
   // A device→device copy is the biggest remaining MLX-owned block in a real
