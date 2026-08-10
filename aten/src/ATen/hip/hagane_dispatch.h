@@ -939,11 +939,22 @@ inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
     return true;
 }
 
+// The decline-trace helpers are defined further down (with the vendor routes)
+// but the owned routes above them need to report too. Declared here rather than
+// moved, so the definitions stay next to the family that documents them.
+inline bool decline(const char* route, const char* op, const char* why);
+inline bool decline_layout(const char* route, const char* why,
+                           const at::Tensor& t);
+inline bool decline_dtypes(const char* route, const char* op, const char* why,
+                           c10::ScalarType from, c10::ScalarType to);
+
 // ---- A9 (Phase 2): native reduction route (sum / mean, full contiguous) ------
 // PyTorch's real reduce_kernel can't be transpiled (its ReduceOp carries an
 // un-nameable GPU_LAMBDA ops type — see hagane/kernels/reduce.hip), so we own a
-// generic Tier-a block reducer instead. reduce.metallib bundles 3 concrete
-// kernels: f32→f32, bf16→f32 (pass 1), f32→bf16 (pass 2). Route-off
+// generic Tier-a block reducer instead. reduce.metallib bundles 7 concrete
+// kernels: the float ladder f32→f32, {bf16,f16}→f32 (pass 1), f32→{bf16,f16}
+// (pass 2), and the two integer reducers i64→i64 / i32→i32 (#1124), which are
+// their own pass 1 AND pass 2 because TIN == TOUT == TACC. Route-off
 // (HAGANE_USE_METALLIB_ROUTE=0) skips registration → MLX (the bit-identical spine).
 inline bool reduction_metallib_available() {
     static const bool available = [] {
@@ -957,21 +968,32 @@ inline bool reduction_metallib_available() {
             return false;
         }
         std::fprintf(stderr,
-            "[hagane-path-alpha] reduce metallib registered (sum/mean Tier-a, f32+bf16)\n");
+            "[hagane-path-alpha] reduce metallib registered "
+            "(Tier-a: sum/mean f32+bf16+f16, integer sum i32+i64)\n");
         return true;
     }();
     return available;
 }
 
-// Per-thread persistent float partials buffer for the reduction 2-pass — reused
+// Per-thread persistent partials buffer for the reduction 2-pass — reused
 // across calls (mirrors rms_moments_scratch: never freed mid-flight, grows
 // monotonically, safe on the in-order queue since pass 2 consumes pass 1's
 // partials before the next call overwrites them).
-inline void* reduce_partials_scratch(const at::TensorOptions& opts, int64_t nblocks) {
+//
+// acc_ty IS LOAD-BEARING, not a tidy-up. This buffer used to be hardcoded
+// at::kFloat while the reuse predicate compared only numel and device. Once
+// #1124 added an int64 arm, a buffer first created by a float reduction (4
+// bytes/elt) and then handed to an int64 pass 1 (8 bytes/elt) would have been
+// overrun by exactly 2x — a heap corruption, not a wrong number, and one that
+// would have reproduced only when the two dtypes met on one thread in that
+// order. The dtype is part of the reuse identity.
+inline void* reduce_partials_scratch(const at::TensorOptions& opts,
+                                     int64_t nblocks, at::ScalarType acc_ty) {
     static thread_local at::Tensor* t = nullptr;
     if (t == nullptr) t = new at::Tensor();
-    if (!t->defined() || t->numel() < nblocks || t->device() != opts.device())
-        *t = at::empty({nblocks}, opts.dtype(at::kFloat));
+    if (!t->defined() || t->numel() < nblocks || t->device() != opts.device()
+        || t->scalar_type() != acc_ty)
+        *t = at::empty({nblocks}, opts.dtype(acc_ty));
     return t->data_ptr();
 }
 
@@ -982,31 +1004,72 @@ inline void* reduce_partials_scratch(const at::TensorOptions& opts, int64_t nblo
 // route-off, tape recording, non-contiguous, unsupported dtype, partial-dim
 // reduction (out.numel()!=1, deferred to a Tier-b follow-on), or launch failure.
 inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
-    if (haganeOpsTapeRecording()) return false;
-    if (!reduction_metallib_available()) return false;
+    const char* op = is_mean ? "mean" : "sum";
+    if (haganeOpsTapeRecording())
+        return decline("reduce_owned", op, "tape_recording");
+    if (!reduction_metallib_available())
+        return decline("reduce_owned", op, "metallib_unavailable");
     const at::Tensor& in_t  = iter.tensor(1);
     const at::Tensor& out_t = iter.tensor(0);
-    if (out_t.numel() != 1) return false;          // full reduction only (v1)
-    if (!in_t.is_contiguous()) return false;
+    // Full reduction only. NOTE this is dtype-independent: a sum(dim=) whose
+    // output has >1 element stays on MLX for float32 too. #1124 widened the
+    // dtype gate below, NOT this one — the partial-dim case is the row/col
+    // reduce family (1.9b) and is a separate piece of work.
+    if (out_t.numel() != 1)
+        return decline("reduce_owned", op, "partial_dim_out_numel_gt_1");
+    if (!in_t.is_contiguous())
+        return decline_layout("reduce_owned", "input_not_contiguous", in_t);
     const int64_t N = in_t.numel();
-    if (N <= 0) return false;
+    if (N <= 0) return decline("reduce_owned", op, "empty_input");
 
+    // in→out dtype pairs this route owns. acc_ty is the PARTIALS dtype (what
+    // pass 1 writes and pass 2 reads); `scaled` says whether the kernel takes
+    // the trailing float `scale` argument at all.
+    //
+    // Integers accumulate in their own width, never float: a float32
+    // accumulator is exact only to 2^24. They also carry no scale — mean is
+    // unreachable for them (TORCH_META_FUNC2(mean,dim) rejects an integral
+    // inferred dtype, and mean(int, dtype=float) casts first and lands on the
+    // f32 arm), so one kernel serves both passes.
+    //
+    // The narrow integer types (bool/uint8/int8/int16) never appear here:
+    // ReduceOpsUtils.h's make_reduction does self.to(in_dtype) with
+    // in_dtype == out_dtype, so torch has already widened them to int64 before
+    // the stub is reached. That is why there is no i8/i16 arm and why adding
+    // one would be dead code.
     const char *k1, *k2;
+    at::ScalarType acc_ty = at::kFloat;
+    bool scaled = true;
     const auto inty = in_t.scalar_type(), outty = out_t.scalar_type();
     if (inty == at::kFloat && outty == at::kFloat) {
-        k1 = "hagane_reduce_f32_f32"; k2 = "hagane_reduce_f32_f32";
+        k1 = "hagane_reduce_f32_f32";  k2 = "hagane_reduce_f32_f32";
     } else if (inty == at::kBFloat16 && outty == at::kBFloat16) {
         k1 = "hagane_reduce_bf16_f32"; k2 = "hagane_reduce_f32_bf16";
+    } else if (inty == at::kBFloat16 && outty == at::kFloat) {
+        k1 = "hagane_reduce_bf16_f32"; k2 = "hagane_reduce_f32_f32";
+    } else if (inty == at::kHalf && outty == at::kHalf) {
+        k1 = "hagane_reduce_f16_f32";  k2 = "hagane_reduce_f32_f16";
+    } else if (inty == at::kHalf && outty == at::kFloat) {
+        k1 = "hagane_reduce_f16_f32";  k2 = "hagane_reduce_f32_f32";
+    } else if (inty == at::kLong && outty == at::kLong) {
+        k1 = k2 = "hagane_reduce_i64_i64"; acc_ty = at::kLong; scaled = false;
+    } else if (inty == at::kInt && outty == at::kInt) {
+        k1 = k2 = "hagane_reduce_i32_i32"; acc_ty = at::kInt;  scaled = false;
     } else {
-        return false;  // half / mixed-acc dtypes stay on MLX
+        return decline_dtypes("reduce_owned", op, "dtype_pair_unowned",
+                              inty, outty);
     }
+    // Belt and braces on the paragraph above: if an integral mean ever does
+    // reach here, decline rather than silently drop the 1/N.
+    if (is_mean && !scaled)
+        return decline("reduce_owned", "mean", "integral_mean_has_no_scale");
 
     const int block = 256;
     int64_t nbtmp = (N + block - 1) / block;     // ~one block per 256 elements,
     if (nbtmp < 1) nbtmp = 1;                     // clamped to [1, 256] so pass 2's
     if (nbtmp > 256) nbtmp = 256;                 // single block reduces the partials
     const int nblocks = static_cast<int>(nbtmp);
-    void* dpart = reduce_partials_scratch(in_t.options(), nblocks);
+    void* dpart = reduce_partials_scratch(in_t.options(), nblocks, acc_ty);
     void* dX    = in_t.data_ptr();
     void* dout  = out_t.data_ptr();
     flush_or_commit_metallib_input(dX, N * in_t.element_size());
@@ -1015,14 +1078,15 @@ inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
     float s1 = 1.0f, s2 = is_mean ? static_cast<float>(1.0 / static_cast<double>(N)) : 1.0f;
     const int    at_[] = {1, 0, 0, 1};
     const size_t as_[] = {sizeof(int64_t), 0, 0, sizeof(float)};
+    const int nargs = scaled ? 4 : 3;   // the integer arms take no `scale`
     dim3 b(block, 1, 1), g1(static_cast<unsigned>(nblocks), 1, 1), g2(1, 1, 1);
 
     void* a1[] = {&c_N, dX, dpart, &s1};   // pass 1: X(N) → partials(nblocks), scale 1
-    if (hagane_launch_kernel_mixed_tracked(k1, g1, b, 0, nullptr, a1, at_, as_, 4) != hipSuccess)
-        return false;
+    if (hagane_launch_kernel_mixed_tracked(k1, g1, b, 0, nullptr, a1, at_, as_, nargs) != hipSuccess)
+        return decline("reduce_owned", op, "pass1_launch_failed");
     void* a2[] = {&c_NB, dpart, dout, &s2}; // pass 2: partials(nblocks) → out(1), scale
-    if (hagane_launch_kernel_mixed_tracked(k2, g2, b, 0, nullptr, a2, at_, as_, 4) != hipSuccess)
-        return false;
+    if (hagane_launch_kernel_mixed_tracked(k2, g2, b, 0, nullptr, a2, at_, as_, nargs) != hipSuccess)
+        return decline("reduce_owned", op, "pass2_launch_failed");
 
     note_native_launch(k1);
     note_native_launch(k2);
