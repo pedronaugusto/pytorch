@@ -6469,22 +6469,27 @@ static std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t, int64_t, Tensor, Tens
 _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
     std::optional<double> scale) {
-  // ViT-style attention arrives as `qkv.view(B, T, H, D).transpose(1, 2)` —
-  // non-contiguous along the head-dim stride. The per-op aten matmul/softmax
-  // chain below behaves correctly on the standalone shape but mis-produces
-  // NaN inside the full ViT-B/16 pipeline (tracked separately — interaction
-  // between non-contig stash wrap + softmax dtype promotion). Forcing q/k/v
-  // contiguous here is the per-op aten safety path.
-  auto q = query.is_contiguous() ? query : query.contiguous();
-  auto k = key.is_contiguous() ? key : key.contiguous();
-  auto v = value.is_contiguous() ? value : value.contiguous();
-  // Handle GQA: expand K/V heads to match Q heads
-  if (q.size(-3) != k.size(-3)) {
-    int64_t num_groups = q.size(-3) / k.size(-3);
-    k = k.repeat_interleave(num_groups, -3);
-    v = v.repeat_interleave(num_groups, -3);
-  }
-  double s = scale.value_or(1.0 / std::sqrt((double)q.size(-1)));
+  // #1129 — q, k and v ARRIVE AS THEY ARE. CUDA copies nothing here: the
+  // cutlass memory-efficient kernel takes them by stride and only requires
+  // stride(-1) == 1, which `check_last_dim_stride_equals_1_dense`
+  // (cuda/sdp_utils.cpp:784) tests as a BACKEND-ELIGIBILITY predicate — a
+  // tensor that fails it makes the backend ineligible and never triggers a
+  // repack. GQA likewise: the kernel handles the head ratio internally and
+  // allocates nothing.
+  //
+  // Three `.contiguous()` calls and two `repeat_interleave`s used to stand
+  // here, above everything, so the standard `qkv.view(B,T,H,D).transpose(1,2)`
+  // layout paid three whole tensor copies per attention call before any math
+  // ran, and every grouped-query model materialised its K and V heads on top.
+  // They have moved DOWN into the aten fallback, which is the only thing that
+  // ever needed them — its own comment scoped the ViT NaN workaround to "the
+  // per-op aten matmul/softmax chain below", and the chain is below.
+  //
+  // So the workaround is not weakened and the NaN it guards against does not
+  // have to be re-derived to make this change: the fallback still receives
+  // contiguous, head-expanded tensors. What changes is that reaching the
+  // routed/fused path no longer costs five copies to get there.
+  double s = scale.value_or(1.0 / std::sqrt((double)query.size(-1)));
 
   // Sprint F — fused-SDPA parity (ADR-027 Invariant A). Try the fused
   // single-kernel path (haganeOpsSdpa → mx::fast::scaled_dot_product_
@@ -6511,30 +6516,41 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
   // decomposed graph and MLX's fused kernel by shape.
   const bool have_mask = attn_mask.has_value() && attn_mask->defined();
   if (dropout_p == 0.0 &&
-      q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
-      q.scalar_type() == k.scalar_type() &&
-      q.scalar_type() == v.scalar_type() &&
-      (q.scalar_type() == at::kFloat ||
-       q.scalar_type() == at::kHalf ||
-       q.scalar_type() == at::kBFloat16)) {
-    int64_t D = q.size(3);
+      query.dim() == 4 && key.dim() == 4 && value.dim() == 4 &&
+      query.scalar_type() == key.scalar_type() &&
+      query.scalar_type() == value.scalar_type() &&
+      (query.scalar_type() == at::kFloat ||
+       query.scalar_type() == at::kHalf ||
+       query.scalar_type() == at::kBFloat16)) {
+    int64_t D = query.size(3);
     if ((D == 64 || D == 80 || D == 96 || D == 128 || D == 256) &&
-        k.size(3) == D && v.size(3) == D &&
-        q.size(0) == k.size(0) && q.size(0) == v.size(0) &&
-        k.size(1) == v.size(1) && k.size(2) == v.size(2) &&
-        k.size(1) > 0 && q.size(1) % k.size(1) == 0) {
-      auto qd = make_tensor_desc(q);
-      auto kd = make_tensor_desc(k);
-      auto vd = make_tensor_desc(v);
-      Tensor mask_c;
+        key.size(3) == D && value.size(3) == D &&
+        query.size(0) == key.size(0) && query.size(0) == value.size(0) &&
+        key.size(1) == value.size(1) && key.size(2) == value.size(2) &&
+        key.size(1) > 0 && query.size(1) % key.size(1) == 0) {
+      auto qd = make_tensor_desc(query);
+      auto kd = make_tensor_desc(key);
+      auto vd = make_tensor_desc(value);
+      // #1129 — THE MASK ARRIVES AS IT IS TOO. torch's standard additive mask
+      // is [B,1,1,Sk] expanded to [B,H,Sq,Sk] — strides (Sk, 0, 0, 1) — so
+      // `.contiguous()` here wrote a B*H*Sq*Sk buffer holding Sk distinct
+      // values repeated. cutlass reads it through bias_strideB/H/M and never
+      // densifies. The runtime now takes the mask's own strides, so the only
+      // mask copy left in the op is torch's `preprocess_mask` 8-element
+      // alignment pad (attention.cpp:595) — which lives in the
+      // BACKEND-AGNOSTIC composite, so a CUDA build pays it identically.
       haganeOpsTensor_t md;
       const haganeOpsTensor_t* mdp = nullptr;
       if (have_mask) {
-        mask_c = attn_mask->is_contiguous() ? *attn_mask : attn_mask->contiguous();
-        md = make_tensor_desc(mask_c);
+        md = make_tensor_desc(*attn_mask);
         mdp = &md;
       }
-      auto output = at::empty_like(q);
+      // Contiguous by construction, not by luck: steel advances the GEMM
+      // output by ONE uniform batch stride, so an output carrying query's own
+      // transposed strides could not be written. This is also byte-for-byte
+      // the layout `at::empty_like(q)` produced when q was forced contiguous
+      // above, so nothing downstream sees a different tensor.
+      auto output = at::empty(query.sizes(), query.options());
       auto od = make_tensor_desc(output);
       if (haganeOpsSdpa(&qd, &kd, &vd, mdp, &od,
                         static_cast<float>(s), is_causal ? 1 : 0) == HAGANE_OPS_SUCCESS) {
@@ -6552,6 +6568,26 @@ _hagane_sdpa_forward(const Tensor& query, const Tensor& key, const Tensor& value
   // Fallback: manual at::matmul + at::softmax + at::matmul chain. Used
   // for shapes/dtypes the fused kernel can't handle, causal masking, or
   // arbitrary attn_mask cases.
+  //
+  // THE MATERIALISATION LIVES HERE, and only here (#1129). ViT-style attention
+  // arrives as `qkv.view(B,T,H,D).transpose(1,2)` — non-contiguous along the
+  // head-dim stride. This chain behaves correctly on the standalone shape but
+  // mis-produces NaN inside the full ViT-B/16 pipeline (tracked separately:
+  // non-contig stash wrap interacting with softmax dtype promotion), so
+  // forcing q/k/v contiguous is the per-op aten safety path. It is unchanged;
+  // it simply no longer taxes the calls that never reach this chain.
+  //
+  // The GQA expansion is here for a different reason: at::matmul has no head
+  // ratio, so the chain genuinely needs K and V expanded. The routed path does
+  // it as a stride.
+  auto q = query.is_contiguous() ? query : query.contiguous();
+  auto k = key.is_contiguous() ? key : key.contiguous();
+  auto v = value.is_contiguous() ? value : value.contiguous();
+  if (q.size(-3) != k.size(-3)) {
+    int64_t num_groups = q.size(-3) / k.size(-3);
+    k = k.repeat_interleave(num_groups, -3);
+    v = v.repeat_interleave(num_groups, -3);
+  }
   auto attn_weight = at::mul(at::matmul(q, k.transpose(-2, -1)), s);
   if (is_causal) {
     int64_t L = q.size(-2), S = k.size(-2);
