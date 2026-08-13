@@ -310,21 +310,30 @@ struct UnaryIterOpConfig {
 
 // A9: kSumCfg/kMeanCfg carry a non-null metallib_kernel sentinel ("reduce") so
 // the bridge attempts try_launch_reduction_metallib (the owned Tier-a host
-// 2-pass) before the MLX c_abi_fn. The sentinel only gates the attempt; the
-// actual kernel names are picked by dtype inside the helper. All other reduce
-// configs keep nullptr → MLX (unchanged).
+// 2-pass) before the MLX c_abi_fn. The sentinel only gates the ATTEMPT; the
+// actual kernel names are picked by op and dtype inside the helper.
+//
+// #1135 extended the sentinel to prod / max_values / min_values / and / or, so
+// their PARTIAL (dim=) reductions reach the owned outer/red/inner kernel. The
+// helpers take the op NAME and decline by name anything they have no arm for
+// (`op_unowned`, `dtype_pair_unowned`), which is what makes the sentinel a
+// request to try rather than a claim to own: try_launch_reduction_metallib is
+// still sum/mean-only, and now says so instead of assuming it.
+//
+// argmax/argmin keep nullptr: they reduce to an INDEX, not to a value, and
+// share none of these kernels.
 inline constexpr UnaryIterOpConfig kSumCfg       = {"sum",        "reduce", &haganeOpsSum,       &cpu_dispatch_sum,        nullptr, nullptr};
 inline constexpr UnaryIterOpConfig kMeanCfg      = {"mean",       "reduce", &haganeOpsMean,      &cpu_dispatch_mean,       nullptr, nullptr};
-inline constexpr UnaryIterOpConfig kProdCfg      = {"prod",       nullptr, &haganeOpsProd,      &cpu_dispatch_prod,       nullptr, nullptr};
+inline constexpr UnaryIterOpConfig kProdCfg      = {"prod",       "reduce", &haganeOpsProd,      &cpu_dispatch_prod,       nullptr, nullptr};
 inline constexpr UnaryIterOpConfig kArgmaxCfg    = {"argmax",     nullptr, &haganeOpsArgmax,    &cpu_dispatch_argmax,     nullptr, nullptr};
 inline constexpr UnaryIterOpConfig kArgminCfg    = {"argmin",     nullptr, &haganeOpsArgmin,    &cpu_dispatch_argmin,     nullptr, nullptr};
-inline constexpr UnaryIterOpConfig kMaxValuesCfg = {"max_values", nullptr, &haganeOpsMaxValues, &cpu_dispatch_max_values, nullptr, "max"};
-inline constexpr UnaryIterOpConfig kMinValuesCfg = {"min_values", nullptr, &haganeOpsMinValues, &cpu_dispatch_min_values, nullptr, "min"};
+inline constexpr UnaryIterOpConfig kMaxValuesCfg = {"max_values", "reduce", &haganeOpsMaxValues, &cpu_dispatch_max_values, nullptr, "max"};
+inline constexpr UnaryIterOpConfig kMinValuesCfg = {"min_values", "reduce", &haganeOpsMinValues, &cpu_dispatch_min_values, nullptr, "min"};
 // and_stub is the reduction kernel behind `torch.all` (logical AND across
 // elements), or_stub backs `torch.any` (logical OR). The C-ABI names match
 // the semantic, not the stub name.
-inline constexpr UnaryIterOpConfig kAndCfg       = {"and",        nullptr, &haganeOpsAll,       &cpu_dispatch_and,        nullptr, "and"};
-inline constexpr UnaryIterOpConfig kOrCfg        = {"or",         nullptr, &haganeOpsAny,       &cpu_dispatch_or,         nullptr, "or"};
+inline constexpr UnaryIterOpConfig kAndCfg       = {"and",        "reduce", &haganeOpsAll,       &cpu_dispatch_and,        nullptr, "and"};
+inline constexpr UnaryIterOpConfig kOrCfg        = {"or",         "reduce", &haganeOpsAny,       &cpu_dispatch_or,         nullptr, "or"};
 inline constexpr UnaryIterOpConfig kHardswishCfg = {"hardswish",  nullptr, &haganeOpsHardswish, &cpu_dispatch_hardswish,  nullptr, nullptr};
 
 // ---- Reduce-with-flag op configuration (X+23) -----------------------------
@@ -1003,8 +1012,17 @@ inline void* reduce_partials_scratch(const at::TensorOptions& opts,
 // mean) is applied once at the pass-2 store. Returns false → MLX fallback:
 // route-off, tape recording, non-contiguous, unsupported dtype, partial-dim
 // reduction (out.numel()!=1, deferred to a Tier-b follow-on), or launch failure.
-inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
-    const char* op = is_mean ? "mean" : "sum";
+//
+// #1135 step 1 — this takes the OP NAME, not a `bool is_mean`. The bool was
+// sound only while sum and mean were the only two configs carrying a
+// `metallib_kernel`: a third op reaching here with `false` would have been
+// computed as a SUM and returned as itself. Declining by name is what makes
+// giving `prod`/`max`/`min`/`all`/`any` that sentinel a routing change rather
+// than a silent-wrong.
+inline bool try_launch_reduction_metallib(TensorIterator& iter, const char* op) {
+    const bool is_mean = std::strcmp(op, "mean") == 0;
+    if (!is_mean && std::strcmp(op, "sum") != 0)
+        return decline("reduce_owned", op, "op_unowned");
     if (haganeOpsTapeRecording())
         return decline("reduce_owned", op, "tape_recording");
     if (!reduction_metallib_available())
@@ -1094,7 +1112,8 @@ inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
     return true;
 }
 
-// #1135 — the PARTIAL reduction, `sum(dim=)` / `mean(dim=)`, owned.
+// #1135 — the PARTIAL reduction owned: `sum` / `mean` / `prod` / `amax` /
+// `amin` / `all` / `any`, each over a `dim=`.
 //
 // try_launch_reduction_metallib above declines every one of these by name
 // (`partial_dim_out_numel_gt_1`) and has since A9, with a comment calling the
@@ -1115,9 +1134,28 @@ inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
 // reduce and inner > 1 the col reduce, from one kernel. A reduced axis set that
 // is not adjacent (`sum(dim=(0,2))`) is not expressible this way and declines
 // by name rather than being approximated.
-inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, bool is_mean) {
-    const char* op = is_mean ? "mean" : "sum";
+//
+// Takes the OP NAME for the reason spelled out over try_launch_reduction_metallib
+// above: the ops this route owns are named here and nowhere else, so an op that
+// arrives without an arm declines instead of being computed as the arm that
+// happens to be first.
+inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, const char* op) {
     constexpr const char* R = "reduce_dim_owned";
+    // The families this route owns, by name. `mean` shares every one of sum's
+    // arms and differs from it only by `scale`, applied once at the store. An op
+    // not listed declines right here, which is what lets a config carry the
+    // `reduce` sentinel without that being a claim that an arm exists for it.
+    enum Family { kFamSum, kFamProd, kFamMax, kFamMin, kFamAll, kFamAny };
+    Family fam;
+    bool is_mean = false;
+    if      (std::strcmp(op, "sum")        == 0) fam = kFamSum;
+    else if (std::strcmp(op, "mean")       == 0) { fam = kFamSum; is_mean = true; }
+    else if (std::strcmp(op, "prod")       == 0) fam = kFamProd;
+    else if (std::strcmp(op, "max_values") == 0) fam = kFamMax;
+    else if (std::strcmp(op, "min_values") == 0) fam = kFamMin;
+    else if (std::strcmp(op, "and")        == 0) fam = kFamAll;
+    else if (std::strcmp(op, "or")         == 0) fam = kFamAny;
+    else return decline(R, op, "op_unowned");
     if (haganeOpsTapeRecording()) return decline(R, op, "tape_recording");
     if (!reduction_metallib_available()) return decline(R, op, "metallib_unavailable");
     const at::Tensor& in_t  = iter.tensor(1);
@@ -1162,32 +1200,114 @@ inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, bool is_mean
     // not tolerate.
     if (outer * inner > 0x7fffffffLL) return decline(R, op, "grid_too_large");
 
-    // The dtype table is the full reducer's, minus the two arms that exist
-    // there only to serve its SECOND pass (f32->bf16, f32->f16 read a float
-    // partials buffer). This route is single-pass, so its pairs are the ones
-    // torch actually presents: same-dtype, or a float32 accumulate-out.
+    // Every kernel name is a literal here, so `grep hagane_reduce_dim_ ` over
+    // this file and over kernels/reduce.hip must produce the same set. A name
+    // assembled from pieces would break that, and a typo in one would surface as
+    // a launch failure at runtime rather than as a diff.
+    //
+    // `scaled` says whether the kernel takes the trailing float `scale` at all.
+    // sum/mean/prod's float arms do; the integer arms and the whole
+    // max/min/all/any set do not, because a parameter that can only ever be 1 is
+    // a lie in the signature (the same rule kernels/reduce.hip states).
     const char* k = nullptr;
-    bool scaled = true;
+    bool scaled = false;
     const auto inty = in_t.scalar_type(), outty = out_t.scalar_type();
-    // sum and mean share every arm: the only difference is `scale`, applied
-    // once at the store, exactly as the full reducer does it.
-    if (inty == at::kFloat    && outty == at::kFloat)
-        k = "hagane_reduce_dim_sum_f32_f32";
-    else if (inty == at::kBFloat16 && outty == at::kBFloat16)
-        k = "hagane_reduce_dim_sum_bf16_bf16";
-    else if (inty == at::kBFloat16 && outty == at::kFloat)
-        k = "hagane_reduce_dim_sum_bf16_f32";
-    else if (inty == at::kHalf     && outty == at::kHalf)
-        k = "hagane_reduce_dim_sum_f16_f16";
-    else if (inty == at::kHalf     && outty == at::kFloat)
-        k = "hagane_reduce_dim_sum_f16_f32";
-    else if (inty == at::kLong     && outty == at::kLong) {
-        k = "hagane_reduce_dim_sum_i64_i64"; scaled = false;
-    } else if (inty == at::kInt    && outty == at::kInt) {
-        k = "hagane_reduce_dim_sum_i32_i32"; scaled = false;
-    } else {
-        return decline_dtypes(R, op, "dtype_pair_unowned", inty, outty);
+    switch (fam) {
+    case kFamSum:
+        // The full reducer's table minus the two arms that exist there only to
+        // serve its SECOND pass (f32->bf16, f32->f16 read a float partials
+        // buffer). This route is single-pass, so its pairs are the ones torch
+        // actually presents: same-dtype, or a float32 accumulate-out.
+        scaled = true;
+        if      (inty == at::kFloat     && outty == at::kFloat)    k = "hagane_reduce_dim_sum_f32_f32";
+        else if (inty == at::kBFloat16  && outty == at::kBFloat16) k = "hagane_reduce_dim_sum_bf16_bf16";
+        else if (inty == at::kBFloat16  && outty == at::kFloat)    k = "hagane_reduce_dim_sum_bf16_f32";
+        else if (inty == at::kHalf      && outty == at::kHalf)     k = "hagane_reduce_dim_sum_f16_f16";
+        else if (inty == at::kHalf      && outty == at::kFloat)    k = "hagane_reduce_dim_sum_f16_f32";
+        else if (inty == at::kLong      && outty == at::kLong)   { k = "hagane_reduce_dim_sum_i64_i64"; scaled = false; }
+        else if (inty == at::kInt       && outty == at::kInt)    { k = "hagane_reduce_dim_sum_i32_i32"; scaled = false; }
+        break;
+    case kFamProd:
+        // prod has no `mean` partner, so its scale is always 1 — but its float
+        // arms keep sum's 6-argument signature rather than gaining a shorter
+        // one, because two float kernels of different arity is a launch-site
+        // branch that buys nothing.
+        scaled = true;
+        if      (inty == at::kFloat     && outty == at::kFloat)    k = "hagane_reduce_dim_prod_f32_f32";
+        else if (inty == at::kBFloat16  && outty == at::kBFloat16) k = "hagane_reduce_dim_prod_bf16_bf16";
+        else if (inty == at::kHalf      && outty == at::kHalf)     k = "hagane_reduce_dim_prod_f16_f16";
+        else if (inty == at::kLong      && outty == at::kLong)   { k = "hagane_reduce_dim_prod_i64_i64"; scaled = false; }
+        else if (inty == at::kInt       && outty == at::kInt)    { k = "hagane_reduce_dim_prod_i32_i32"; scaled = false; }
+        break;
+    case kFamMax:
+        // amax/amin PRESERVE the dtype (TORCH_META_FUNC(amax) builds its
+        // iterator on self's dtype with no promotion), so a pair that differs is
+        // not this family's and declines. That also means the narrow integers
+        // reach here as themselves, where the sum path never sees them.
+        if (inty != outty) break;
+        if      (inty == at::kFloat)    k = "hagane_reduce_dim_max_f32_f32";
+        else if (inty == at::kBFloat16) k = "hagane_reduce_dim_max_bf16_bf16";
+        else if (inty == at::kHalf)     k = "hagane_reduce_dim_max_f16_f16";
+        else if (inty == at::kLong)     k = "hagane_reduce_dim_max_i64_i64";
+        else if (inty == at::kInt)      k = "hagane_reduce_dim_max_i32_i32";
+        else if (inty == at::kShort)    k = "hagane_reduce_dim_max_i16_i16";
+        else if (inty == at::kChar)     k = "hagane_reduce_dim_max_i8_i8";
+        else if (inty == at::kByte)     k = "hagane_reduce_dim_max_u8_u8";
+        else if (inty == at::kBool)     k = "hagane_reduce_dim_max_bool_bool";
+        break;
+    case kFamMin:
+        if (inty != outty) break;
+        if      (inty == at::kFloat)    k = "hagane_reduce_dim_min_f32_f32";
+        else if (inty == at::kBFloat16) k = "hagane_reduce_dim_min_bf16_bf16";
+        else if (inty == at::kHalf)     k = "hagane_reduce_dim_min_f16_f16";
+        else if (inty == at::kLong)     k = "hagane_reduce_dim_min_i64_i64";
+        else if (inty == at::kInt)      k = "hagane_reduce_dim_min_i32_i32";
+        else if (inty == at::kShort)    k = "hagane_reduce_dim_min_i16_i16";
+        else if (inty == at::kChar)     k = "hagane_reduce_dim_min_i8_i8";
+        else if (inty == at::kByte)     k = "hagane_reduce_dim_min_u8_u8";
+        else if (inty == at::kBool)     k = "hagane_reduce_dim_min_bool_bool";
+        break;
+    case kFamAll:
+        // all/any run with a Bool OUTPUT and the INPUT's own dtype
+        // (get_allany_iter, ReduceOps.cpp), so the in/out pair genuinely differs
+        // and the kernel reduces the predicate `x != 0` rather than the values.
+        // The MLX route declines exactly this pair by name
+        // (try_vendor_reduce_dim, `in_out_dtype_differ`), so a non-bool input is
+        // not a route MOVE here — it is a case that had no owned path at all.
+        //
+        // uint8 is the ONE dtype torch does not convert: uint8 in, uint8 out,
+        // valued 0/1. #1136 — that arm is a wrong-VALUE fix, not a route move.
+        if (inty == at::kByte && outty == at::kByte) {
+            k = "hagane_reduce_dim_all_u8_u8"; break;
+        }
+        if (outty != at::kBool) break;
+        if      (inty == at::kFloat)    k = "hagane_reduce_dim_all_f32";
+        else if (inty == at::kBFloat16) k = "hagane_reduce_dim_all_bf16";
+        else if (inty == at::kHalf)     k = "hagane_reduce_dim_all_f16";
+        else if (inty == at::kLong)     k = "hagane_reduce_dim_all_i64";
+        else if (inty == at::kInt)      k = "hagane_reduce_dim_all_i32";
+        else if (inty == at::kShort)    k = "hagane_reduce_dim_all_i16";
+        else if (inty == at::kChar)     k = "hagane_reduce_dim_all_i8";
+        else if (inty == at::kByte)     k = "hagane_reduce_dim_all_u8";
+        else if (inty == at::kBool)     k = "hagane_reduce_dim_all_bool";
+        break;
+    case kFamAny:
+        if (inty == at::kByte && outty == at::kByte) {
+            k = "hagane_reduce_dim_any_u8_u8"; break;
+        }
+        if (outty != at::kBool) break;
+        if      (inty == at::kFloat)    k = "hagane_reduce_dim_any_f32";
+        else if (inty == at::kBFloat16) k = "hagane_reduce_dim_any_bf16";
+        else if (inty == at::kHalf)     k = "hagane_reduce_dim_any_f16";
+        else if (inty == at::kLong)     k = "hagane_reduce_dim_any_i64";
+        else if (inty == at::kInt)      k = "hagane_reduce_dim_any_i32";
+        else if (inty == at::kShort)    k = "hagane_reduce_dim_any_i16";
+        else if (inty == at::kChar)     k = "hagane_reduce_dim_any_i8";
+        else if (inty == at::kByte)     k = "hagane_reduce_dim_any_u8";
+        else if (inty == at::kBool)     k = "hagane_reduce_dim_any_bool";
+        break;
     }
+    if (k == nullptr) return decline_dtypes(R, op, "dtype_pair_unowned", inty, outty);
     // Belt and braces, exactly as the full reducer carries it: an integral mean
     // is unreachable by construction (TORCH_META_FUNC2(mean,dim) rejects an
     // integral inferred dtype), and if one ever does arrive, decline rather
@@ -3964,15 +4084,19 @@ inline void hagane_unary_iter_bridge(TensorIterator& iter) {
     // (metallib_kernel != nullptr enables it). Any miss (partial-dim, non-
     // contiguous, unsupported dtype, route-off) falls through to the MLX C-ABI —
     // the bit-identical spine.
+    // Both routes take Cfg.op_name and decline by name what they do not own,
+    // so which ops carry a `metallib_kernel` and which ops have an arm are two
+    // independent facts. They used to be one — `op_name == "mean"` — which held
+    // only while sum and mean were the whole sentinel set.
     if (Cfg.metallib_kernel != nullptr &&
-        try_launch_reduction_metallib(iter, std::string(Cfg.op_name) == "mean"))
+        try_launch_reduction_metallib(iter, Cfg.op_name))
         return;
 
     // #1135: the PARTIAL sum/mean, which the line above has declined by name
     // since A9. Ordered after it so the full reduction keeps its 2-pass path
     // and the two routes' counts stay disjoint.
     if (Cfg.metallib_kernel != nullptr &&
-        try_launch_reduction_dim_metallib(iter, std::string(Cfg.op_name) == "mean"))
+        try_launch_reduction_dim_metallib(iter, Cfg.op_name))
         return;
 
     // #1010 1.9: MLX's all_reduce, our output block. A partial reduction
