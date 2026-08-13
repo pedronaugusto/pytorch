@@ -2233,6 +2233,47 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
   dst_d.ndim = static_cast<int32_t>(dst_t.dim());
   dst_d.dtype = to_hagane_dtype(dst_t.scalar_type());
 
+  // #1133 step 1 — the direction split, which only this frame can make.
+  // haganeOpsCopyFull is told `dst_is_host` and nothing else, so it can say
+  // "d2h" or "to_device" and no more; here both devices are in hand.
+  //
+  // It records the device PAIR verbatim rather than a derived label, because a
+  // derived label cannot be cross-examined. The first cut wrote
+  // `gpu_to_cpu ? "d2h" : (src.is_cuda() ? "d2d" : "h2d")`, reported 121 h2d per
+  // ARDY replan, and disagreed with a TorchDispatchMode over the same replan
+  // that saw ONE aten call mixing a CPU and a CUDA tensor. The mode was the one
+  // that was wrong, for a dull reason: `_to_copy(cpu_tensor, device=cuda)` has
+  // only a CPU tensor among its ARGUMENTS — the CUDA output does not exist yet —
+  // so a filter requiring both devices could never match. Recording the pair
+  // rather than a conclusion is what made that resolvable instead of arguable.
+  //
+  // WHAT THE SPLIT SAYS, measured over one replan: 121 calls, all `host2dev`.
+  // Zero d2h and zero d2d. 82 of the 121 block the host, which is 82 of the
+  // replan's 179 waits. A temporary backtrace walk (5..12 at:: frames, recorded
+  // as `copyfull_from/<symbol>/fN`) put every one of them under
+  // `at::_ops::to_device::call` — `Tensor.to("cuda")`, not internal kernel
+  // staging — and the 36 of those that a dispatch mode could see came from
+  // ARDY's own `stats.py` normalize/unnormalize and `diffusion.py`
+  // calc_diffusion_vars, on tensors of 1, 4, 5 and 330 elements.
+  //
+  // That walk is NOT kept. It cost a backtrace and a symbolisation per copy, it
+  // has answered its question, and a permanent instrument earns its place by
+  // what it will be read for next — this one would only be re-read to confirm a
+  // conclusion already written down. The two cheap rows stay.
+  if (haganeOpsDeclineTraceEnabled()) {
+    auto dev_name = [](const at::Tensor& t) -> const char* {
+      if (!t.defined()) return "undef";
+      switch (t.device().type()) {
+        case c10::DeviceType::CUDA: return "dev";
+        case c10::DeviceType::CPU:  return "host";
+        default:                    return "other";
+      }
+    };
+    char pair[24];
+    std::snprintf(pair, sizeof(pair), "%s2%s", dev_name(src_t), dev_name(dst_t));
+    ::haganeOpsDeclineNote("copyfull_dir", pair, "call");
+  }
+
   if (haganeOpsCopyFull(&src_d, &dst_d, gpu_to_cpu ? 1 : 0) == HAGANE_OPS_SUCCESS) {
     g_copy_lazy_count.fetch_add(1, std::memory_order_relaxed);
     return;
