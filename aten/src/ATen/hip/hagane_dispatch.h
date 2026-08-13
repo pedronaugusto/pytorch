@@ -1094,6 +1094,128 @@ inline bool try_launch_reduction_metallib(TensorIterator& iter, bool is_mean) {
     return true;
 }
 
+// #1135 — the PARTIAL reduction, `sum(dim=)` / `mean(dim=)`, owned.
+//
+// try_launch_reduction_metallib above declines every one of these by name
+// (`partial_dim_out_numel_gt_1`) and has since A9, with a comment calling the
+// partial-dim case "a separate piece of work". Measured, that left sum, mean
+// and prod stashing AND blocking the host on every dim and every dtype — 158
+// dirty op x dtype x dim x keepdim combinations. It survived because ARDY never
+// calls a partial sum; a model-free gate (test_workload_stress) found it on the
+// first run it was ever given.
+//
+// `result` carries the INPUT's rank with extent 1 at every reduced axis —
+// review_reduce_result's doing (ReduceOpsUtils.h:170) — which is what lets the
+// reduced axes be identified here without threading a dim list through every
+// stub signature. Same trick try_vendor_reduce_dim uses, and this route is
+// strictly more general than that one: it takes a reduced block ANYWHERE, not
+// only trailing.
+//
+// Geometry is outer/red/inner (see kernels/reduce.hip). inner == 1 is the row
+// reduce and inner > 1 the col reduce, from one kernel. A reduced axis set that
+// is not adjacent (`sum(dim=(0,2))`) is not expressible this way and declines
+// by name rather than being approximated.
+inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, bool is_mean) {
+    const char* op = is_mean ? "mean" : "sum";
+    constexpr const char* R = "reduce_dim_owned";
+    if (haganeOpsTapeRecording()) return decline(R, op, "tape_recording");
+    if (!reduction_metallib_available()) return decline(R, op, "metallib_unavailable");
+    const at::Tensor& in_t  = iter.tensor(1);
+    const at::Tensor& out_t = iter.tensor(0);
+
+    // The full reduction belongs to try_launch_reduction_metallib, which runs
+    // first. Declining here keeps the two routes' counts disjoint.
+    if (out_t.numel() <= 1) return decline(R, op, "full_reduction");
+    if (!in_t.is_contiguous())  return decline_layout(R, "in_not_contiguous", in_t);
+    if (!out_t.is_contiguous()) return decline_layout(R, "out_not_contiguous", out_t);
+    const int64_t nd = in_t.dim();
+    if (nd < 1) return decline(R, op, "rank_0");
+    if (out_t.dim() != nd) return decline(R, op, "rank_differs");
+    if (in_t.numel() <= 0) return decline(R, op, "empty");
+
+    // Find the reduced block. An axis is reduced when the output holds extent 1
+    // where the input does not; an axis of extent 1 in the INPUT reduces to
+    // itself and belongs to whichever side keeps the block contiguous, so it is
+    // treated as neither.
+    int64_t first = -1, last = -1;
+    for (int64_t d = 0; d < nd; ++d) {
+        const bool reduced = out_t.size(d) == 1 && in_t.size(d) != 1;
+        if (!reduced) continue;
+        if (first < 0) first = d;
+        last = d;
+    }
+    if (first < 0) return decline(R, op, "no_reduced_axis");
+    for (int64_t d = first; d <= last; ++d)
+        if (out_t.size(d) != 1 && in_t.size(d) != 1)
+            return decline(R, op, "reduced_axes_not_adjacent");
+
+    int64_t outer = 1, red = 1, inner = 1;
+    for (int64_t d = 0;        d < first; ++d) outer *= in_t.size(d);
+    for (int64_t d = first;    d <= last; ++d) red   *= in_t.size(d);
+    for (int64_t d = last + 1; d < nd;    ++d) inner *= in_t.size(d);
+    if (red <= 1) return decline(R, op, "no_reduced_axis");
+    if (outer * inner != out_t.numel()) return decline(R, op, "shape_mismatch");
+    // One threadgroup per output element, so the grid is the output size. Bound
+    // it rather than letting an unsigned narrowing decide: a truncated grid
+    // writes part of the output and leaves the rest as whatever the block held,
+    // which is finite, plausible and wrong — the failure mode this project does
+    // not tolerate.
+    if (outer * inner > 0x7fffffffLL) return decline(R, op, "grid_too_large");
+
+    // The dtype table is the full reducer's, minus the two arms that exist
+    // there only to serve its SECOND pass (f32->bf16, f32->f16 read a float
+    // partials buffer). This route is single-pass, so its pairs are the ones
+    // torch actually presents: same-dtype, or a float32 accumulate-out.
+    const char* k = nullptr;
+    bool scaled = true;
+    const auto inty = in_t.scalar_type(), outty = out_t.scalar_type();
+    // sum and mean share every arm: the only difference is `scale`, applied
+    // once at the store, exactly as the full reducer does it.
+    if (inty == at::kFloat    && outty == at::kFloat)
+        k = "hagane_reduce_dim_sum_f32_f32";
+    else if (inty == at::kBFloat16 && outty == at::kBFloat16)
+        k = "hagane_reduce_dim_sum_bf16_bf16";
+    else if (inty == at::kBFloat16 && outty == at::kFloat)
+        k = "hagane_reduce_dim_sum_bf16_f32";
+    else if (inty == at::kHalf     && outty == at::kHalf)
+        k = "hagane_reduce_dim_sum_f16_f16";
+    else if (inty == at::kHalf     && outty == at::kFloat)
+        k = "hagane_reduce_dim_sum_f16_f32";
+    else if (inty == at::kLong     && outty == at::kLong) {
+        k = "hagane_reduce_dim_sum_i64_i64"; scaled = false;
+    } else if (inty == at::kInt    && outty == at::kInt) {
+        k = "hagane_reduce_dim_sum_i32_i32"; scaled = false;
+    } else {
+        return decline_dtypes(R, op, "dtype_pair_unowned", inty, outty);
+    }
+    // Belt and braces, exactly as the full reducer carries it: an integral mean
+    // is unreachable by construction (TORCH_META_FUNC2(mean,dim) rejects an
+    // integral inferred dtype), and if one ever does arrive, decline rather
+    // than silently drop the 1/N.
+    if (is_mean && !scaled) return decline(R, "mean", "integral_mean_has_no_scale");
+
+    void* dX   = in_t.data_ptr();
+    void* dout = out_t.data_ptr();
+    flush_or_commit_metallib_input(dX, in_t.numel() * in_t.element_size());
+
+    int64_t c_outer = outer, c_red = red, c_inner = inner;
+    float scale = is_mean ? static_cast<float>(1.0 / static_cast<double>(red)) : 1.0f;
+    const int    at_[] = {1, 1, 1, 0, 0, 1};
+    const size_t as_[] = {sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
+                          0, 0, sizeof(float)};
+    const int nargs = scaled ? 6 : 5;   // the integer arms take no `scale`
+    void* args[] = {&c_outer, &c_red, &c_inner, dX, dout, &scale};
+    dim3 b(256, 1, 1), g(static_cast<unsigned>(outer * inner), 1, 1);
+    if (hagane_launch_kernel_mixed_tracked(k, g, b, 0, nullptr, args, at_, as_,
+                                           nargs) != hipSuccess)
+        return decline(R, op, "launch_failed");
+
+    note_native_launch(k);
+    haganeOpsMarkMetallibWrite(dout, static_cast<size_t>(out_t.numel() *
+                                                         out_t.element_size()));
+    return true;
+}
+
 // A6 softmax: register the warp-per-row softmax metallib (PyTorch's REAL
 // softmax_warp_forward, owned via explicit-instantiation injection — float +
 // bfloat16, log2_elements 0..11, is_log {false,true}). Separate from norm.metallib;
@@ -3844,6 +3966,13 @@ inline void hagane_unary_iter_bridge(TensorIterator& iter) {
     // the bit-identical spine.
     if (Cfg.metallib_kernel != nullptr &&
         try_launch_reduction_metallib(iter, std::string(Cfg.op_name) == "mean"))
+        return;
+
+    // #1135: the PARTIAL sum/mean, which the line above has declined by name
+    // since A9. Ordered after it so the full reduction keeps its 2-pass path
+    // and the two routes' counts stay disjoint.
+    if (Cfg.metallib_kernel != nullptr &&
+        try_launch_reduction_dim_metallib(iter, std::string(Cfg.op_name) == "mean"))
         return;
 
     // #1010 1.9: MLX's all_reduce, our output block. A partial reduction
