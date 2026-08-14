@@ -1164,7 +1164,11 @@ inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, const char* 
     // The full reduction belongs to try_launch_reduction_metallib, which runs
     // first. Declining here keeps the two routes' counts disjoint.
     if (out_t.numel() <= 1) return decline(R, op, "full_reduction");
-    if (!in_t.is_contiguous())  return decline_layout(R, "in_not_contiguous", in_t);
+    // #1138 — the INPUT no longer has to be contiguous; its strides are carried
+    // into the kernel. The OUTPUT still does, and that is not laziness: `row`
+    // indexes the output linearly and is the same index the (outer, inner)
+    // decomposition is derived from, so a strided output would need its own
+    // second decomposition to stay sound.
     if (!out_t.is_contiguous()) return decline_layout(R, "out_not_contiguous", out_t);
     const int64_t nd = in_t.dim();
     if (nd < 1) return decline(R, op, "rank_0");
@@ -1193,6 +1197,64 @@ inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, const char* 
     for (int64_t d = last + 1; d < nd;    ++d) inner *= in_t.size(d);
     if (red <= 1) return decline(R, op, "no_reduced_axis");
     if (outer * inner != out_t.numel()) return decline(R, op, "shape_mismatch");
+
+    // #1138 — collapse each side into at most TWO linear runs. One stride per
+    // side cannot express a transposed group: b.transpose(1,2) leaves the outer
+    // pair at extents (32,128) and strides (8192,1), and the output is
+    // contiguous in (d0,d1) order so no reordering rescues it. Two runs cover
+    // every layout the sweep measured — transpose, stride-2 slice, expand — for
+    // every dim. Three or more declines BY NAME.
+    //
+    // A NEGATIVE stride declines outright rather than being handled: the span
+    // arithmetic below assumes the data_ptr is the lowest address touched, and
+    // ATen does not produce negative strides today (torch.flip copies), so a
+    // path for them would be untested code guarding an unreachable case.
+    for (int64_t d = 0; d < nd; ++d)
+        if (in_t.stride(d) < 0) return decline_layout(R, "negative_stride", in_t);
+
+    struct Run { int64_t ext, str; };
+    // Walk INNERMOST-first and merge while the index stays linear across the
+    // pair; emit outermost-first. An extent-1 dim contributes no index at all,
+    // so it can never break a run — which is why `narrow(dim0)` and the
+    // keepdim=True shapes collapse to one run like the contiguous case.
+    auto collapse2 = [&](int64_t lo, int64_t hi, Run* a, Run* b_) -> bool {
+        Run r[3];
+        int k = 0;
+        for (int64_t d = hi - 1; d >= lo; --d) {
+            const int64_t sz = in_t.size(d);
+            if (sz == 1) continue;
+            const int64_t st = in_t.stride(d);
+            if (k > 0 && st == r[k - 1].str * r[k - 1].ext) {
+                r[k - 1].ext *= sz;               // stays linear: merge
+                continue;
+            }
+            if (k == 3) return false;             // needs > 2 runs
+            r[k].ext = sz; r[k].str = st; ++k;
+        }
+        if (k > 2) return false;
+        // Encode as (outer-run, inner-run). A single run is stored as
+        // (1, ext)/(0, str) so the kernel's `outer0 == 1` test skips a division
+        // and the contiguous path's arithmetic is identical, not just equal.
+        if (k == 0)      { *a = {1, 0}; *b_ = {1, 0}; }
+        else if (k == 1) { *a = {1, 0}; *b_ = r[0]; }
+        else             { *a = r[1];   *b_ = r[0]; }   // r is innermost-first
+        return true;
+    };
+
+    Run o_run[2], i_run[2], red_a, red_b;
+    if (!collapse2(0, first, &o_run[0], &o_run[1]))
+        return decline_layout(R, "outer_group_not_collapsible", in_t);
+    if (!collapse2(last + 1, nd, &i_run[0], &i_run[1]))
+        return decline_layout(R, "inner_group_not_collapsible", in_t);
+    // The reduce loop has ONE stride by construction, so the reduced block must
+    // be a single run. `sum(dim=(0,2))` already declined above as non-adjacent;
+    // this catches an adjacent-but-non-linear block, e.g. a transpose INSIDE
+    // the reduced axes.
+    if (!collapse2(first, last + 1, &red_a, &red_b) || red_a.ext != 1)
+        return decline_layout(R, "reduced_group_not_collapsible", in_t);
+    if (o_run[0].ext * o_run[1].ext != outer ||
+        i_run[0].ext * i_run[1].ext != inner || red_b.ext != red)
+        return decline(R, op, "collapse_extent_mismatch");
     // One threadgroup per output element, so the grid is the output size. Bound
     // it rather than letting an unsigned narrowing decide: a truncated grid
     // writes part of the output and leaves the rest as whatever the block held,
@@ -1316,15 +1378,30 @@ inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, const char* 
 
     void* dX   = in_t.data_ptr();
     void* dout = out_t.data_ptr();
-    flush_or_commit_metallib_input(dX, in_t.numel() * in_t.element_size());
+    // #1138 — the flush range is the SPAN the view actually reads, not
+    // numel*esize. For a strided slice the span is larger (numel understates it
+    // and a pending write past the end would be missed); for an expand it is
+    // smaller (numel overstates it by the broadcast factor). Both were wrong
+    // the moment a non-contiguous input became reachable here.
+    int64_t span = 1;
+    for (int64_t d = 0; d < nd; ++d)
+        span += (in_t.size(d) - 1) * in_t.stride(d);
+    flush_or_commit_metallib_input(dX, span * in_t.element_size());
 
-    int64_t c_outer = outer, c_red = red, c_inner = inner;
+    int64_t c_o0 = o_run[0].ext, c_o1 = o_run[1].ext, c_red = red;
+    int64_t c_i0 = i_run[0].ext, c_i1 = i_run[1].ext;
+    int64_t c_so0 = o_run[0].str, c_so1 = o_run[1].str, c_sr = red_b.str;
+    int64_t c_si0 = i_run[0].str, c_si1 = i_run[1].str;
     float scale = is_mean ? static_cast<float>(1.0 / static_cast<double>(red)) : 1.0f;
-    const int    at_[] = {1, 1, 1, 0, 0, 1};
+    const int    at_[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1};
     const size_t as_[] = {sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
-                          0, 0, sizeof(float)};
-    const int nargs = scaled ? 6 : 5;   // the integer arms take no `scale`
-    void* args[] = {&c_outer, &c_red, &c_inner, dX, dout, &scale};
+                          sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
+                          sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
+                          sizeof(int64_t), 0, 0, sizeof(float)};
+    const int nargs = scaled ? 13 : 12;   // the integer arms take no `scale`
+    void* args[] = {&c_o0, &c_o1, &c_red, &c_i0, &c_i1,
+                    &c_so0, &c_so1, &c_sr, &c_si0, &c_si1,
+                    dX, dout, &scale};
     dim3 b(256, 1, 1), g(static_cast<unsigned>(outer * inner), 1, 1);
     if (hagane_launch_kernel_mixed_tracked(k, g, b, 0, nullptr, args, at_, as_,
                                            nargs) != hipSuccess)
