@@ -1824,7 +1824,9 @@ inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& ite
 // collapse wherever BOTH operands stay linear across them, which keeps the
 // common cases inside the three dimensions the corpus carries.
 //
-// The OUTPUT must be contiguous — the kernel writes it with a linear index.
+// The OUTPUT must be DENSE — the kernel writes it with a linear index — but it
+// does NOT have to be contiguous in torch's dimension order; see the ordering
+// block below.
 inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) {
     constexpr const char* R = "bin_g";
     if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
@@ -1852,7 +1854,6 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     if (dt_out < 0) return decline(R, torch_op, "out_dtype_unspellable");
 
     const at::Tensor& out = iter.tensor(0);
-    if (!out.is_contiguous()) return decline(R, torch_op, "out_not_contiguous");
     const int64_t N = iter.numel();
     if (N <= 0) return true;                      // nothing to compute
     if (N > static_cast<int64_t>(INT32_MAX)) return decline(R, torch_op, "numel_too_big");
@@ -1860,6 +1861,40 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     const auto osz = out.sizes();
     const int64_t n = static_cast<int64_t>(osz.size());
     if (n > 16) return decline(R, torch_op, "rank_gt16");
+
+    // #1138 — the output has to be DENSE, not CONTIGUOUS, and those differ.
+    //
+    // TensorIterator propagates a non-contiguous input's permutation into the
+    // output it allocates: `x.transpose(1,2) + 1` gives sizes (32,128,64) at
+    // strides (8192,1,128). Every element is written exactly once — it is a
+    // contiguous buffer in a permuted ORDER — so a linear-index kernel is
+    // perfectly able to write it, as long as the problem is iterated in that
+    // order. Requiring is_contiguous() declined the whole transposed class for
+    // a property the kernel never needed, and a transposed operand is what
+    // every attention head split produces.
+    //
+    // Recover the order: sort the output's dims by DESCENDING output stride;
+    // the strides must then be the suffix products of the extents. That is the
+    // definition of dense, and it also proves injectivity — two elements cannot
+    // share an address — so no separate overlap test is needed. Everything
+    // else (an `out=` into a strided slice, a stride-0 output) declines by name.
+    //
+    // A contiguous output sorts to the identity and passes the check trivially,
+    // so nothing about the cases that already routed changes.
+    int64_t ord[16];
+    int nord = 0;
+    for (int64_t k = 0; k < n; ++k) {
+        if (osz[k] == 1) continue;               // contributes no index at all
+        if (out.stride(k) < 0) return decline_layout(R, "out_negative_stride", out);
+        ord[nord++] = k;
+    }
+    std::sort(ord, ord + nord,
+              [&](int64_t x, int64_t y) { return out.stride(x) > out.stride(y); });
+    int64_t want = 1;
+    for (int j = nord - 1; j >= 0; --j) {
+        if (out.stride(ord[j]) != want) return decline_layout(R, "out_not_dense", out);
+        want *= osz[ord[j]];
+    }
 
     // Each operand's stride along every OUTPUT dimension, right-aligned.
     int64_t st[2][16];
@@ -1904,11 +1939,14 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     if (is_scalar[0] && is_scalar[1]) return decline(R, torch_op, "both_scalar");
 
     // Collapse: merge an inner dimension into the group outside it only when
-    // EVERY operand's index stays linear across the pair.
+    // EVERY operand's index stays linear across the pair. Walked in the output's
+    // OWN order (`ord`), not the tensor's dim order — that is what makes the
+    // output linear, and it is also why a transposed operand usually collapses
+    // to one group here: reordered by the output's layout, it IS linear.
     int64_t ext[16], sa[16], sb[16];
     int ng = 0;
-    for (int64_t k = 0; k < n; ++k) {
-        if (osz[k] == 1) continue;
+    for (int j = 0; j < nord; ++j) {
+        const int64_t k = ord[j];
         const int64_t e = osz[k], A = st[0][k], B = st[1][k];
         if (ng > 0 && sa[ng - 1] == A * e && sb[ng - 1] == B * e) {
             ext[ng - 1] *= e; sa[ng - 1] = A; sb[ng - 1] = B;
