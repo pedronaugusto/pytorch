@@ -106,7 +106,12 @@ inline constexpr OpConfig kAbsCfg = {
     &fp64_abs,
 };
 
-inline constexpr OpConfig kNegCfg  = {"neg",  nullptr, &haganeOpsNeg,  &cpu_dispatch_neg,  &fp64_neg};
+// #1138 — neg is now owned. It had no metallib at all, so every neg went to
+// MLX's v_Negative; that arm is flat, so a neg over any non-contiguous view
+// stashed and stopped the host with nowhere else to go. PyTorch's own
+// neg_kernel_cuda harvests over EIGHT dtypes, which is wider than the MLX arm it
+// replaces, and the strided sibling comes with it for free.
+inline constexpr OpConfig kNegCfg  = {"neg",  "hagane_neg_kernel_cuda", &haganeOpsNeg,  &cpu_dispatch_neg,  &fp64_neg};
 inline constexpr OpConfig kSignCfg = {"sign", nullptr, &haganeOpsSign, &cpu_dispatch_sign, nullptr };
 inline constexpr OpConfig kSgnCfg  = {"sgn",  nullptr, nullptr,        &cpu_dispatch_sgn,  nullptr };
 
@@ -504,13 +509,18 @@ inline int metallib_work_per_thread(c10::ScalarType st) {
     return (bytes > 0 && bytes <= 8) ? 8 / bytes : 1;
 }
 
+// #1138 — the ARM suffix is a parameter now. The transpiler emits two arms per
+// specialization from one body: `_unrolled_contig` (flat loads) and `_strided`
+// (the same body, loads decomposed through an ext/stride triple). Defaulted so
+// every existing call site names the contiguous arm exactly as before.
 inline std::string metallib_kernel_name(const char* base, c10::ScalarType st,
-                                        const char* shape) {
+                                        const char* shape,
+                                        const char* arm = "unrolled_contig") {
     const char* tag = metallib_dtype_tag(st);
     if (!tag) return {};
     return std::string(base) + "_" + tag + shape
          + "_wpt" + std::to_string(metallib_work_per_thread(st))
-         + "_unrolled_contig";
+         + "_" + arm;
 }
 
 // ---- Lazy metallib registration --------------------------------------------
@@ -952,10 +962,161 @@ inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
 // but the owned routes above them need to report too. Declared here rather than
 // moved, so the definitions stay next to the family that documents them.
 inline bool decline(const char* route, const char* op, const char* why);
+inline void route_enter(const char* route, const char* op);
 inline bool decline_layout(const char* route, const char* why,
                            const at::Tensor& t);
 inline bool decline_dtypes(const char* route, const char* op, const char* why,
                            c10::ScalarType from, c10::ScalarType to);
+
+// ---- #1138: the order in which a tensor is linear -------------------------
+// DENSE is the property a linear-index kernel needs; CONTIGUOUS is a stronger
+// one it does not. TensorIterator propagates a non-contiguous input's
+// permutation into the output it allocates, so `x.transpose(1,2) + 1` is sizes
+// (32,128,64) at strides (8192,1,128): every element written exactly once — a
+// contiguous buffer in a permuted ORDER. Iterating the problem in THAT order
+// makes the output index linear again, so a permuted output costs a
+// permutation, not a materialisation.
+//
+// Recover it by sorting the dims by DESCENDING stride and requiring the strides
+// to be the suffix products of the extents. That is the definition of dense, and
+// it also proves injectivity — two elements cannot share an address — so no
+// separate overlap test is needed. Extent-1 dims carry no index and drop out.
+//
+// A contiguous tensor yields the identity order and passes trivially, so every
+// case that routed before this existed behaves exactly as it did.
+inline bool dense_linear_order(const at::Tensor& t, int64_t* ord, int* nord,
+                               const char** why) {
+    int n = 0;
+    for (int64_t k = 0; k < t.dim(); ++k) {
+        if (t.size(k) == 1) continue;              // contributes no index at all
+        if (t.stride(k) < 0) { *why = "negative_stride"; return false; }
+        ord[n++] = k;
+    }
+    std::sort(ord, ord + n,
+              [&](int64_t x, int64_t y) { return t.stride(x) > t.stride(y); });
+    int64_t want = 1;
+    for (int j = n - 1; j >= 0; --j) {
+        if (t.stride(ord[j]) != want) { *why = "not_dense"; return false; }
+        want *= t.size(ord[j]);
+    }
+    *nord = n;
+    return true;
+}
+
+// #1138 — the same op as try_launch_unary_metallib / try_launch_binary_scalar_
+// metallib when the INPUT is not contiguous. MLX ships no strided form of either
+// shape: every unary in the corpus is v_/v2_/vn_ and every scalar-operand binary
+// is vs_/sv_, all flat. So this is the only 1-dispatch path there is; the
+// alternative is materialise, which is two dispatches and a full extra copy.
+//
+// `scalar_bits`, when present, is the captured operand of an `_a1_sA`/`_a1_sB`
+// arm and rides between the output and N — the emitted kernel's parameter order,
+// which is where the contiguous launcher puts it too. It crosses as RAW BITS in
+// the compute dtype for the reason 1.11-A gives: a float round-trip loses an
+// int64 past 2^24.
+//
+// Geometry is the convention haganeOpsVendorBinaryG and MLX's own g1_/g2_/g3_
+// use: at most three runs, extents OUTERMOST-first, strides in ELEMENTS. The
+// OUTPUT only has to be dense — see dense_linear_order — and the problem is
+// walked in the output's own order, which is also why a transposed input
+// usually collapses to a single run here.
+inline bool try_launch_unary_strided_metallib(const std::string& kname,
+                                              TensorIteratorBase& iter,
+                                              int in_idx = 1,
+                                              const uint64_t* scalar_bits = nullptr) {
+    constexpr const char* R = "unary_strided";
+    route_enter(R, nullptr);
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+
+    const at::Tensor& out = iter.tensor(0);
+    const at::Tensor& in  = iter.tensor(in_idx);
+    const int64_t N64 = iter.numel();
+    if (N64 <= 0) return true;                     // nothing to compute
+    if (N64 > static_cast<int64_t>(INT32_MAX))
+        return decline(R, nullptr, "numel_too_big");
+    const int64_t n = out.dim();
+    if (n > 16) return decline(R, nullptr, "rank_gt16");
+    if (in.dim() > n) return decline(R, nullptr, "in_rank_gt_out");
+
+    int64_t ord[16];
+    int nord = 0;
+    const char* why = nullptr;
+    if (!dense_linear_order(out, ord, &nord, &why))
+        return decline_layout(R, (std::string("out_") + why).c_str(), out);
+
+    // The input's stride along every OUTPUT dimension, right-aligned and 0 where
+    // it broadcasts — the same rule try_vendor_binary_g applies to two operands.
+    const auto osz = out.sizes();
+    const int64_t tn = in.dim();
+    int64_t st[16];
+    for (int64_t k = 0; k < n; ++k) {
+        const int64_t j = k - (n - tn);
+        if (j < 0)                     { st[k] = 0; continue; }
+        if (in.size(j) == osz[k])        st[k] = in.stride(j);
+        else if (in.size(j) == 1)        st[k] = 0;
+        else return decline(R, nullptr, "not_broadcastable");
+        if (st[k] < 0) return decline_layout(R, "in_negative_stride", in);
+    }
+
+    // Collapse in the OUTPUT's order, merging while the input stays linear
+    // across the pair; the output always does, by dense_linear_order.
+    int64_t ext[16], si[16];
+    int ng = 0;
+    for (int j = 0; j < nord; ++j) {
+        const int64_t k = ord[j], e = osz[k], S = st[k];
+        if (ng > 0 && si[ng - 1] == S * e) { ext[ng - 1] *= e; si[ng - 1] = S; }
+        else                               { ext[ng] = e; si[ng] = S; ++ng; }
+    }
+    if (ng == 0) { ext[0] = 1; si[0] = 0; ng = 1; }   // every dim was 1
+    if (ng > 3) return decline_layout(R, "groups_gt3", in);
+
+    // Pad to the kernel's fixed three runs, OUTERMOST-first: a leading extent 1
+    // with stride 0 contributes nothing to either the index or the offset.
+    int32_t e3[3] = {1, 1, 1};
+    int64_t s3[3] = {0, 0, 0};
+    for (int g = 0; g < ng; ++g) {
+        if (ext[g] > INT32_MAX) return decline(R, nullptr, "extent_too_big");
+        e3[3 - ng + g] = static_cast<int32_t>(ext[g]);
+        s3[3 - ng + g] = si[g];
+    }
+
+    // The flush range is the SPAN the view actually reads, never numel*esize: a
+    // strided slice spans MORE than its element count (a pending write past the
+    // end would be missed) and an expand spans less.
+    int64_t span = 1;
+    for (int g = 0; g < ng; ++g) span += (ext[g] - 1) * si[g];
+    void* d_in  = iter.data_ptr(in_idx);
+    void* d_out = iter.data_ptr(0);
+    flush_or_commit_metallib_input(d_in, span * iter.element_size(in_idx));
+
+    int N = static_cast<int>(N64);
+    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int nthreads = (N + wpt - 1) / wpt;
+    dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
+    uint64_t sc = scalar_bits ? *scalar_bits : 0;
+    void*  args[6]      = {d_in, d_out, &N, e3, s3, nullptr};
+    int    arg_types[6] = {0, 0, 1, 1, 1, 0};
+    size_t arg_sizes[6] = {0, 0, sizeof(int), sizeof(e3), sizeof(s3), 0};
+    int nargs = 5;
+    if (scalar_bits) {
+        // The captured scalar sits between the output and N — the emitted
+        // kernel's parameter order, and the same slot the contiguous launcher
+        // uses. Sized at the STORAGE element size because the harvested functor
+        // keeps its argument at scalar_t.
+        args[2] = &sc;      arg_types[2] = 1; arg_sizes[2] = iter.element_size(0);
+        args[3] = &N;       arg_types[3] = 1; arg_sizes[3] = sizeof(int);
+        args[4] = e3;       arg_types[4] = 1; arg_sizes[4] = sizeof(e3);
+        args[5] = s3;       arg_types[5] = 1; arg_sizes[5] = sizeof(s3);
+        nargs = 6;
+    }
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, arg_types, arg_sizes, nargs) != hipSuccess)
+        return decline(R, nullptr, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(d_out,
+                               static_cast<size_t>(N64) * iter.element_size(0));
+    return true;
+}
 
 // ---- A9 (Phase 2): native reduction route (sum / mean, full contiguous) ------
 // PyTorch's real reduce_kernel can't be transpiled (its ReduceOp carries an
@@ -1863,38 +2024,15 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     if (n > 16) return decline(R, torch_op, "rank_gt16");
 
     // #1138 — the output has to be DENSE, not CONTIGUOUS, and those differ.
-    //
-    // TensorIterator propagates a non-contiguous input's permutation into the
-    // output it allocates: `x.transpose(1,2) + 1` gives sizes (32,128,64) at
-    // strides (8192,1,128). Every element is written exactly once — it is a
-    // contiguous buffer in a permuted ORDER — so a linear-index kernel is
-    // perfectly able to write it, as long as the problem is iterated in that
-    // order. Requiring is_contiguous() declined the whole transposed class for
-    // a property the kernel never needed, and a transposed operand is what
-    // every attention head split produces.
-    //
-    // Recover the order: sort the output's dims by DESCENDING output stride;
-    // the strides must then be the suffix products of the extents. That is the
-    // definition of dense, and it also proves injectivity — two elements cannot
-    // share an address — so no separate overlap test is needed. Everything
-    // else (an `out=` into a strided slice, a stride-0 output) declines by name.
-    //
-    // A contiguous output sorts to the identity and passes the check trivially,
-    // so nothing about the cases that already routed changes.
+    // Requiring is_contiguous() declined the whole transposed class for a
+    // property the g*_ kernels never needed: TensorIterator hands back an output
+    // in the INPUT's permutation, and a transposed operand is what every
+    // attention head split produces. See dense_linear_order.
     int64_t ord[16];
     int nord = 0;
-    for (int64_t k = 0; k < n; ++k) {
-        if (osz[k] == 1) continue;               // contributes no index at all
-        if (out.stride(k) < 0) return decline_layout(R, "out_negative_stride", out);
-        ord[nord++] = k;
-    }
-    std::sort(ord, ord + nord,
-              [&](int64_t x, int64_t y) { return out.stride(x) > out.stride(y); });
-    int64_t want = 1;
-    for (int j = nord - 1; j >= 0; --j) {
-        if (out.stride(ord[j]) != want) return decline_layout(R, "out_not_dense", out);
-        want *= osz[ord[j]];
-    }
+    const char* dense_why = nullptr;
+    if (!dense_linear_order(out, ord, &nord, &dense_why))
+        return decline_layout(R, (std::string("out_") + dense_why).c_str(), out);
 
     // Each operand's stride along every OUTPUT dimension, right-aligned.
     int64_t st[2][16];
@@ -4037,11 +4175,24 @@ inline void hagane_kernel_bridge(TensorIteratorBase& iter) {
             //
             // Decline here and let try_vendor_unary below take it, which casts the
             // input with MLX's own v_copy first (#1031).
-            if (MetallibState<Cfg>::available && iter.is_contiguous() &&
-                iter.dtype(1) == iter.dtype(0)) {
-                std::string kname =
-                    metallib_kernel_name(Cfg.metallib_kernel, iter.dtype(), "");
-                if (!kname.empty() && try_launch_unary_metallib(kname, iter)) return;
+            if (MetallibState<Cfg>::available && iter.dtype(1) == iter.dtype(0)) {
+                // #1138 — the same body, two arms. A non-contiguous input used to
+                // fall past here to MLX, which has no strided unary either, so it
+                // ended on the C-ABI path: a stash and a stopped host on every
+                // slice, expand and permuted view. The strided arm declines by
+                // name when the geometry needs more than three runs, so what it
+                // cannot express stays visible instead of being approximated.
+                const bool contig = iter.is_contiguous();
+                std::string kname = metallib_kernel_name(
+                    Cfg.metallib_kernel, iter.dtype(), "",
+                    contig ? "unrolled_contig" : "strided");
+                if (!kname.empty()) {
+                    if (contig) {
+                        if (try_launch_unary_metallib(kname, iter)) return;
+                    } else if (try_launch_unary_strided_metallib(kname, iter)) {
+                        return;
+                    }
+                }
             }
         }
 
@@ -4113,18 +4264,30 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
                 !Cfg.float_cpu_scalar_differs ||
                 c10::isIntegralType(iter.dtype(), /*includeBool=*/true);
             const int tin = s1 ? 2 : 1;
+            // #1138 — the layout guards moved into the STRIDED arm rather than
+            // gating the whole route. MLX's vs_/sv_ kernels are flat too, so a
+            // scalar-operand binary over a slice or an expand had nowhere to go
+            // either; the same `_strided` sibling the unary arm uses covers it,
+            // with the captured scalar riding in the kernel's own parameter slot.
+            const bool contig = iter.tensor(tin).is_contiguous()
+                             && iter.tensor(0).is_contiguous();
             if ((s1 != s2) && arm_faithful
                 && iter.tensor(tin).scalar_type() == iter.dtype()
-                && iter.tensor(tin).is_contiguous()
-                && iter.tensor(0).is_contiguous()
                 && iter.tensor(tin).sizes() == iter.tensor(0).sizes()) {
                 uint64_t bits = 0;
                 if (vendor_scalar_bytes(iter, s1 ? 1 : 2, iter.dtype(), &bits)) {
                     std::string kname = metallib_kernel_name(
-                        Cfg.metallib_kernel, iter.dtype(), s1 ? "_a1_sA" : "_a1_sB");
-                    if (!kname.empty() &&
-                        try_launch_binary_scalar_metallib(kname, iter, tin, bits))
-                        return;
+                        Cfg.metallib_kernel, iter.dtype(), s1 ? "_a1_sA" : "_a1_sB",
+                        contig ? "unrolled_contig" : "strided");
+                    if (!kname.empty()) {
+                        if (contig) {
+                            if (try_launch_binary_scalar_metallib(kname, iter, tin, bits))
+                                return;
+                        } else if (try_launch_unary_strided_metallib(kname, iter, tin,
+                                                                    &bits)) {
+                            return;
+                        }
+                    }
                 }
             }
         }
