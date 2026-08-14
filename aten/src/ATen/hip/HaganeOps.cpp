@@ -2577,6 +2577,15 @@ void hagane_clamp_kernel(TensorIteratorBase& iter) {
 static void hagane_clamp_scalar_common(TensorIteratorBase& iter,
                                        bool has_min, const Scalar& min_val,
                                        bool has_max, const Scalar& max_val) {
+  // #1139 — torch's OWN launch_clamp_scalar, first. It is the same arithmetic
+  // this function's header quotes, compiled from that exact source rather than
+  // reproduced by composing two MLX kernels, and it is the only path that
+  // covers a NON-CONTIGUOUS input or an INTEGER dtype without leaving the GPU.
+  // Declines fall through to the MLX composition below, unchanged.
+  if (hagane_dispatch::detail::try_launch_clamp_scalar_metallib(
+          iter, has_min, min_val, has_max, max_val))
+    return;
+
   if (hagane_dispatch::detail::try_vendor_clamp(iter, has_min, min_val,
                                                 has_max, max_val))
     return;

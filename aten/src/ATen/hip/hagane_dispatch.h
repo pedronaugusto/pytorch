@@ -1003,37 +1003,27 @@ inline bool dense_linear_order(const at::Tensor& t, int64_t* ord, int* nord,
     return true;
 }
 
-// #1138 — the same op as try_launch_unary_metallib / try_launch_binary_scalar_
-// metallib when the INPUT is not contiguous. MLX ships no strided form of either
-// shape: every unary in the corpus is v_/v2_/vn_ and every scalar-operand binary
-// is vs_/sv_, all flat. So this is the only 1-dispatch path there is; the
-// alternative is materialise, which is two dispatches and a full extra copy.
-//
-// `scalar_bits`, when present, is the captured operand of an `_a1_sA`/`_a1_sB`
-// arm and rides between the output and N — the emitted kernel's parameter order,
-// which is where the contiguous launcher puts it too. It crosses as RAW BITS in
-// the compute dtype for the reason 1.11-A gives: a float round-trip loses an
-// int64 past 2^24.
-//
 // Geometry is the convention haganeOpsVendorBinaryG and MLX's own g1_/g2_/g3_
 // use: at most three runs, extents OUTERMOST-first, strides in ELEMENTS. The
 // OUTPUT only has to be dense — see dense_linear_order — and the problem is
 // walked in the output's own order, which is also why a transposed input
 // usually collapses to a single run here.
-inline bool try_launch_unary_strided_metallib(const std::string& kname,
-                                              TensorIteratorBase& iter,
-                                              int in_idx = 1,
-                                              const uint64_t* scalar_bits = nullptr) {
-    constexpr const char* R = "unary_strided";
-    route_enter(R, nullptr);
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
-
+//
+// #1139 — the geometry half of the strided arm, on its own so a second launcher
+// derives it rather than copies it. `try_launch_clamp_scalar_metallib` needs the
+// identical three-run decomposition with a different scalar tail (three captured
+// bounds instead of one operand), and a second copy of the collapse rule is a
+// second place for it to drift.
+//
+// Fills the kernel's fixed three runs (`e3` extents, `s3` input strides in
+// ELEMENTS, OUTERMOST-first) and `span`, the element count the input view
+// actually reaches. Declines under the CALLER's route label, so the decline
+// tally keeps naming the route that gave up rather than this helper.
+inline bool strided_elementwise_geometry(const char* R, TensorIteratorBase& iter,
+                                         int in_idx, int32_t e3[3], int64_t s3[3],
+                                         int64_t* span) {
     const at::Tensor& out = iter.tensor(0);
     const at::Tensor& in  = iter.tensor(in_idx);
-    const int64_t N64 = iter.numel();
-    if (N64 <= 0) return true;                     // nothing to compute
-    if (N64 > static_cast<int64_t>(INT32_MAX))
-        return decline(R, nullptr, "numel_too_big");
     const int64_t n = out.dim();
     if (n > 16) return decline(R, nullptr, "rank_gt16");
     if (in.dim() > n) return decline(R, nullptr, "in_rank_gt_out");
@@ -1072,8 +1062,8 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
 
     // Pad to the kernel's fixed three runs, OUTERMOST-first: a leading extent 1
     // with stride 0 contributes nothing to either the index or the offset.
-    int32_t e3[3] = {1, 1, 1};
-    int64_t s3[3] = {0, 0, 0};
+    e3[0] = e3[1] = e3[2] = 1;
+    s3[0] = s3[1] = s3[2] = 0;
     for (int g = 0; g < ng; ++g) {
         if (ext[g] > INT32_MAX) return decline(R, nullptr, "extent_too_big");
         e3[3 - ng + g] = static_cast<int32_t>(ext[g]);
@@ -1083,8 +1073,39 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
     // The flush range is the SPAN the view actually reads, never numel*esize: a
     // strided slice spans MORE than its element count (a pending write past the
     // end would be missed) and an expand spans less.
-    int64_t span = 1;
-    for (int g = 0; g < ng; ++g) span += (ext[g] - 1) * si[g];
+    *span = 1;
+    for (int g = 0; g < ng; ++g) *span += (ext[g] - 1) * si[g];
+    return true;
+}
+
+// #1138 — the same op as try_launch_unary_metallib / try_launch_binary_scalar_
+// metallib when the INPUT is not contiguous. MLX ships no strided form of either
+// shape: every unary in the corpus is v_/v2_/vn_ and every scalar-operand binary
+// is vs_/sv_, all flat. So this is the only 1-dispatch path there is; the
+// alternative is materialise, which is two dispatches and a full extra copy.
+//
+// `scalar_bits`, when present, is the captured operand of an `_a1_sA`/`_a1_sB`
+// arm and rides between the output and N — the emitted kernel's parameter order,
+// which is where the contiguous launcher puts it too. It crosses as RAW BITS in
+// the compute dtype for the reason 1.11-A gives: a float round-trip loses an
+// int64 past 2^24.
+inline bool try_launch_unary_strided_metallib(const std::string& kname,
+                                              TensorIteratorBase& iter,
+                                              int in_idx = 1,
+                                              const uint64_t* scalar_bits = nullptr) {
+    constexpr const char* R = "unary_strided";
+    route_enter(R, nullptr);
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+
+    const int64_t N64 = iter.numel();
+    if (N64 <= 0) return true;                     // nothing to compute
+    if (N64 > static_cast<int64_t>(INT32_MAX))
+        return decline(R, nullptr, "numel_too_big");
+
+    int32_t e3[3];
+    int64_t s3[3], span = 0;
+    if (!strided_elementwise_geometry(R, iter, in_idx, e3, s3, &span))
+        return false;
     void* d_in  = iter.data_ptr(in_idx);
     void* d_out = iter.data_ptr(0);
     flush_or_commit_metallib_input(d_in, span * iter.element_size(in_idx));
@@ -3029,6 +3050,166 @@ inline bool vendor_bound_bits(c10::ScalarType st, const c10::Scalar& s,
             { bool v = s.to<bool>();       std::memcpy(out, &v, 1); return true; }
         default: return false;      // Double: Metal has no float64
     }
+}
+
+// ---- #1139: clamp on PyTorch's OWN kernel ----------------------------------
+//
+// `launch_clamp_scalar` (aten/src/ATen/native/hip/TensorCompare.hip) is what
+// upstream dispatches for clamp / clamp_min / clamp_max, and therefore for
+// relu. It never reached a metallib because its GPU_LAMBDA is an if/else-if
+// chain of returns and the transpiler's functor path took only
+// `{ locals…; return expr; }` — #1069, now folded through return_seq_to_expr.
+// The file itself always parsed; the 24 recovered `<<<>>>` diagnostics from
+// `_assert_async_cuda_kernel` were never what blocked it, and where/isposinf/
+// isneginf have been harvesting out of it the whole time.
+//
+// 16 arms: {float, half, bfloat16, int8, int16, int32, int64, uint8} x
+// {unrolled_contig, strided}. That is BOTH more than the MLX composition below
+// covered and fewer dispatches — one kernel where vs_Maximum + vs_Minimum was
+// two — and it is the first clamp path that exists at all for a non-contiguous
+// input or an integer one (integers went to torch's CPU kernel, a full host
+// round-trip, on every strided call).
+inline bool clamp_metallib_available() {
+    static const bool available = [] {
+        const char* route = std::getenv("HAGANE_USE_METALLIB_ROUTE");
+        if (route && route[0] == '0') return false;
+        std::string path = metallib_dir() + "/clamp.metallib";
+        if (haganeRegisterMetallibAll(path.c_str()) != hipSuccess) {
+            std::fprintf(stderr,
+                "[hagane-path-alpha] failed to register %s; clamp stays on MLX\n",
+                path.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+            "[hagane-path-alpha] clamp metallib registered "
+            "(launch_clamp_scalar, 8 dtypes x contig/strided)\n");
+        return true;
+    }();
+    return available;
+}
+
+// A clamp BOUND in the kernel's OPMATH type, which is NOT the storage type:
+// `at::opmath_type<scalar_t>` is FLOAT for Half and BFloat16, so the emitted arm
+// declares `constant float& lim0_val` over a `half` buffer. This is an ABI fact
+// before it is a numeric one — handing setBytes two bytes for a four-byte
+// `constant float&` reads two bytes of adjacent garbage as the bound.
+//
+// It is NOT a rounding fix, and vendor_bound_bits below is not wrong to round to
+// storage: min and max are monotone and so is round-to-nearest, so a bound
+// rounded to the tensor's dtype selects the same result as the unrounded one.
+// That equivalence is measured, not assumed — the ulp sweep in
+// scripts/test_scalar_ops.py.
+//
+// `.to<T>()` is c10::checked_convert and RAISES on a bound outside T, which is
+// parity: upstream's `lim.to<opmath_t>()` raises identically. Deliberately not
+// caught.
+inline bool clamp_bound_opmath_bits(c10::ScalarType st, const c10::Scalar& s,
+                                    uint64_t* out, size_t* nbytes) {
+    *out = 0;
+    switch (st) {
+        // opmath_type<{Float,Half,BFloat16}> == float, all three.
+        case c10::ScalarType::Float:
+        case c10::ScalarType::Half:
+        case c10::ScalarType::BFloat16:
+            { float v = s.to<float>();     std::memcpy(out, &v, 4); *nbytes = 4; return true; }
+        case c10::ScalarType::Char:
+            { int8_t v = s.to<int8_t>();   std::memcpy(out, &v, 1); *nbytes = 1; return true; }
+        case c10::ScalarType::Short:
+            { int16_t v = s.to<int16_t>(); std::memcpy(out, &v, 2); *nbytes = 2; return true; }
+        case c10::ScalarType::Int:
+            { int32_t v = s.to<int32_t>(); std::memcpy(out, &v, 4); *nbytes = 4; return true; }
+        case c10::ScalarType::Long:
+            { int64_t v = s.to<int64_t>(); std::memcpy(out, &v, 8); *nbytes = 8; return true; }
+        case c10::ScalarType::Byte:
+            { uint8_t v = s.to<uint8_t>(); std::memcpy(out, &v, 1); *nbytes = 1; return true; }
+        // Bool is NOT in upstream's AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16),
+        // so no bool arm was harvested and none should be invented. Double has no
+        // Metal spelling.
+        default: return false;
+    }
+}
+
+// Dispatch the harvested `launch_clamp_scalar` arm for this iterator.
+//
+// The parameter order is the emitted kernel's, first-capture-first:
+//
+//   (in, out, minmax, lim0_val, lim1_val, N [, ext, strides])
+//
+// `minmax` is `at::native::detail::ClampLimits` — Min=0, Max=1, MinMax=2 — and
+// upstream passes the SAME scalar as both bounds for the one-sided stubs
+// (clamp_min_scalar_kernel_impl calls launch_clamp_scalar(iter, min, min, Min)).
+// Mirrored here rather than left undefined, so the unused bound can never be
+// read as garbage if a future arm reorders its branches.
+//
+// Nothing in this ordering is checkable at compile time — it is a name and a
+// buffer index — so scripts/test_clamp_route.py pins it numerically with a
+// two-sided clamp whose bounds differ; swap them and it fails immediately.
+inline bool try_launch_clamp_scalar_metallib(TensorIteratorBase& iter,
+                                             bool has_min, const c10::Scalar& min_val,
+                                             bool has_max, const c10::Scalar& max_val) {
+    constexpr const char* R = "clamp_metallib";
+    route_enter(R, nullptr);
+    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    if (!clamp_metallib_available()) return decline(R, nullptr, "metallib_unavailable");
+    if (!has_min && !has_max) return decline(R, nullptr, "no_bounds");
+    if (iter.ninputs() != 1) return decline(R, nullptr, "not_unary");
+
+    const c10::ScalarType compute = iter.common_dtype();
+    // The kernel is named by dtype and binds both buffers raw, so a promoted
+    // operand would be reinterpreted — the #1045 silent-wrong, in this family.
+    if (iter.dtype(0) != compute || iter.dtype(1) != compute)
+        return decline_dtypes(R, nullptr, "operand_dtype_differs",
+                              iter.dtype(1), compute);
+
+    const int64_t N64 = iter.numel();
+    if (N64 <= 0) return true;                      // nothing to write
+    if (N64 > static_cast<int64_t>(INT32_MAX))
+        return decline(R, nullptr, "numel_too_big");
+
+    // Deliberately before the dispatch and deliberately able to throw — see
+    // clamp_bound_opmath_bits.
+    uint64_t lo = 0, hi = 0;
+    size_t lo_sz = 0, hi_sz = 0;
+    const c10::Scalar& present = has_min ? min_val : max_val;
+    if (!clamp_bound_opmath_bits(compute, present, &lo, &lo_sz))
+        return decline(R, nullptr, "bound_dtype");
+    hi = lo; hi_sz = lo_sz;
+    if (has_min && has_max &&
+        !clamp_bound_opmath_bits(compute, max_val, &hi, &hi_sz))
+        return decline(R, nullptr, "bound_dtype");
+    const int32_t minmax = (has_min && has_max) ? 2 : (has_min ? 0 : 1);
+
+    const bool contig = iter.is_contiguous();
+    const std::string kname = metallib_kernel_name(
+        "hagane_launch_clamp_scalar", compute, "_a1_s3",
+        contig ? "unrolled_contig" : "strided");
+    if (kname.empty()) return decline(R, nullptr, "dtype");
+
+    void* d_in  = iter.data_ptr(1);
+    void* d_out = iter.data_ptr(0);
+    int32_t e3[3] = {1, 1, 1};
+    int64_t s3[3] = {0, 0, 0}, span = N64;
+    if (!contig) {
+        if (!strided_elementwise_geometry(R, iter, 1, e3, s3, &span)) return false;
+    }
+    flush_or_commit_metallib_input(d_in, span * iter.element_size(1));
+
+    int N = static_cast<int>(N64);
+    const int wpt = metallib_work_per_thread(compute);
+    const int nthreads = (N + wpt - 1) / wpt;
+    dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
+    void*  args[8]      = {d_in, d_out, (void*)&minmax, &lo, &hi, &N, e3, s3};
+    int    arg_types[8] = {0, 0, 1, 1, 1, 1, 1, 1};
+    size_t arg_sizes[8] = {0, 0, sizeof(int32_t), lo_sz, hi_sz, sizeof(int),
+                           sizeof(e3), sizeof(s3)};
+    const int nargs = contig ? 6 : 8;
+    if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
+                                           args, arg_types, arg_sizes, nargs) != hipSuccess)
+        return decline(R, nullptr, "kernel_dispatch");
+    note_native_launch(kname);
+    haganeOpsMarkMetallibWrite(d_out,
+                               static_cast<size_t>(N64) * iter.element_size(0));
+    return true;
 }
 
 // clamp with scalar bounds — MLX's vs_Maximum then vs_Minimum, which IS
