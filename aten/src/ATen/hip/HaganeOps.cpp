@@ -2577,6 +2577,25 @@ void hagane_clamp_kernel(TensorIteratorBase& iter) {
 static void hagane_clamp_scalar_common(TensorIteratorBase& iter,
                                        bool has_min, const Scalar& min_val,
                                        bool has_max, const Scalar& max_val) {
+  // #1145 — REFUSE BOOL, because upstream does.
+  //
+  // `launch_clamp_scalar` wraps its kernel in
+  // `AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, ...)`, which has no Bool arm,
+  // so clamp on a bool tensor RAISES on CUDA — and CPU raises the identical
+  // `_cpu` twin, measured. Hagane ANSWERED: `try_vendor_clamp` accepts Bool
+  // through `hagane_vendor_dtype` and returned `[True, False, True]`.
+  //
+  // That is not the MLX path covering a gap in the owned route below; it is the
+  // MLX path inventing behaviour CUDA does not have. The message is spelled to
+  // match what AT_DISPATCH would have thrown, name included, so a caller cannot
+  // tell the difference between this refusal and upstream's — all three scalar
+  // stubs funnel through `launch_clamp_scalar`, so `clamp_scalar_cuda` is the
+  // name for clamp_min and clamp_max too.
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      iter.common_dtype() != c10::ScalarType::Bool,
+      "\"clamp_scalar_cuda\" not implemented for '",
+      toString(iter.common_dtype()), "'");
+
   // #1139 — torch's OWN launch_clamp_scalar, first. It is the same arithmetic
   // this function's header quotes, compiled from that exact source rather than
   // reproduced by composing two MLX kernels, and it is the only path that
