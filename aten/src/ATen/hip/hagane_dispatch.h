@@ -603,7 +603,11 @@ inline void flush_or_commit_metallib_input(void* d_in, int64_t nbytes) {
 
 inline bool try_launch_unary_metallib(const std::string& kname,
                                       TensorIteratorBase& iter) {
-    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
+    // #1146 — no `tape_recording` decline here any more. This route DECLARES
+    // the direction and extent of every argument below, which is exactly what
+    // makes the dispatch recordable as a command node, so a capture now records
+    // the kernel Hagane actually ran instead of declining to the MLX C-ABI to
+    // produce something a VALUE tape could replay.
     void* d_out = iter.data_ptr(0);
     void* d_in  = iter.data_ptr(1);
     int N = static_cast<int>(iter.numel());
@@ -613,15 +617,20 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     // lazy chain). Only the input bytes must be materialized; mirrors
     // hagane_copy_kernel's haganeOpsFlushRegion(src, nbytes) (HaganeOps.cpp).
     // X+77: under the unified queue this event-orders the input GPU-side instead.
-    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(N) * iter.element_size(1));
+    const size_t in_bytes  = static_cast<size_t>(N) * iter.element_size(1);
+    const size_t out_bytes = static_cast<size_t>(N) * iter.element_size(0);
+    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
     // A8: each thread handles wpt elements (matches the kernel's _wptN); the
     // grid covers ceil(N/wpt) threads.
     const int wpt = metallib_work_per_thread(iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
+    // #1146 — the same two numbers this function already computes for its own
+    // settle and mark, declared to the launcher so a capture can record them.
     void*  args[]      = {d_in, d_out, &N};
-    int    arg_types[] = {0, 0, 1};
-    size_t arg_sizes[] = {0, 0, sizeof(int)};
+    int    arg_types[] = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                          HAGANE_ARG_SCALAR};
+    size_t arg_sizes[] = {in_bytes, out_bytes, sizeof(int)};
     if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                    args, arg_types, arg_sizes, 3) != hipSuccess)
         return false;
@@ -634,7 +643,7 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     // host-readback / FREE boundaries still drain precisely (correctness). All of
     // that queue policy lives in the runtime now, so this path is op-agnostic and
     // flag-off stays bit-identical to X+75.
-    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
+    haganeOpsMarkMetallibWrite(d_out, out_bytes);
     return true;
 }
 
@@ -3149,7 +3158,10 @@ inline bool try_launch_clamp_scalar_metallib(TensorIteratorBase& iter,
                                              bool has_max, const c10::Scalar& max_val) {
     constexpr const char* R = "clamp_metallib";
     route_enter(R, nullptr);
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1146 — recordable as a command node; see try_launch_unary_metallib. This
+    // arm carries the widest by-value payload in the tree (minmax + two bounds +
+    // N + extents + strides, 60 bytes), so it is the one that proves the blob is
+    // genuinely self-describing rather than sized for a two-scalar special case.
     if (!clamp_metallib_available()) return decline(R, nullptr, "metallib_unavailable");
     if (!has_min && !has_max) return decline(R, nullptr, "no_bounds");
     if (iter.ninputs() != 1) return decline(R, nullptr, "not_unary");
@@ -3192,16 +3204,24 @@ inline bool try_launch_clamp_scalar_metallib(TensorIteratorBase& iter,
     if (!contig) {
         if (!strided_elementwise_geometry(R, iter, 1, e3, s3, &span)) return false;
     }
-    flush_or_commit_metallib_input(d_in, span * iter.element_size(1));
+    const size_t in_bytes  = static_cast<size_t>(span) * iter.element_size(1);
+    const size_t out_bytes = static_cast<size_t>(N64) * iter.element_size(0);
+    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
 
     int N = static_cast<int>(N64);
     const int wpt = metallib_work_per_thread(compute);
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
+    // #1146 — the input's extent is its byte SPAN, not its element count: the
+    // strided arm reads across a region wider than numel, and that span is what
+    // the settle above already uses. The output is contiguous N elements.
     void*  args[8]      = {d_in, d_out, (void*)&minmax, &lo, &hi, &N, e3, s3};
-    int    arg_types[8] = {0, 0, 1, 1, 1, 1, 1, 1};
-    size_t arg_sizes[8] = {0, 0, sizeof(int32_t), lo_sz, hi_sz, sizeof(int),
-                           sizeof(e3), sizeof(s3)};
+    int    arg_types[8] = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                           HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                           HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                           HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t arg_sizes[8] = {in_bytes, out_bytes, sizeof(int32_t), lo_sz, hi_sz,
+                           sizeof(int), sizeof(e3), sizeof(s3)};
     const int nargs = contig ? 6 : 8;
     if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                            args, arg_types, arg_sizes, nargs) != hipSuccess)
