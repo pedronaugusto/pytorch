@@ -2482,7 +2482,9 @@ inline bool try_vendor_masked_fill(at::Tensor& self, const at::Tensor& mask,
     constexpr const char* R = "masked_fill";
     route_enter(R, nullptr);
     if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, nullptr, "corpus_unavailable");
 
@@ -2564,7 +2566,9 @@ inline bool try_vendor_where(TensorIteratorBase& iter) {
     constexpr const char* OP = "where";
     route_enter(R, OP);
     if (!vendor_elementwise_route_enabled()) return decline(R, OP, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, OP, "corpus_unavailable");
     if (iter.ninputs() != 3) return decline(R, OP, "ninputs");
@@ -2914,7 +2918,9 @@ inline bool try_vendor_fill(TensorIteratorBase& iter, const c10::Scalar& value) 
     constexpr const char* R = "fill";
     route_enter(R, nullptr);
     if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, nullptr, "corpus_unavailable");
     if (iter.noutputs() != 1) return decline(R, nullptr, "noutputs");
@@ -2969,7 +2975,9 @@ inline bool try_vendor_arange(at::Tensor& result, const c10::Scalar& start,
     constexpr const char* R = "arange";
     route_enter(R, nullptr);
     if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, nullptr, "corpus_unavailable");
 
@@ -3254,7 +3262,9 @@ inline bool try_vendor_clamp(at::TensorIteratorBase& iter,
     constexpr const char* R = "clamp";
     route_enter(R, nullptr);
     if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, nullptr, "corpus_unavailable");
     // No bound left after normalisation is a copy, not a clamp; the caller
