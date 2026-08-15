@@ -1934,7 +1934,8 @@ inline bool try_vendor_binary_flat(const char* torch_op, TensorIteratorBase& ite
     if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
     const char* mlx_op = mlx_binary_op_name(torch_op);
     if (!mlx_op) return decline(R, torch_op, "no_mlx_name");
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of each buffer, so it records as a command node.
     if (iter.ninputs() != 2) return decline(R, torch_op, "ninputs");
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, torch_op, "corpus_unavailable");
@@ -2023,7 +2024,8 @@ inline bool try_vendor_binary_g(const char* torch_op, TensorIteratorBase& iter) 
     if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
     const char* mlx_op = mlx_binary_op_name(torch_op);
     if (!mlx_op) return decline(R, torch_op, "no_mlx_name");
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of each buffer, so it records as a command node.
     if (iter.ninputs() != 2) return decline(R, torch_op, "ninputs");
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, torch_op, "corpus_unavailable");
@@ -2369,7 +2371,7 @@ inline bool try_vendor_unary(const char* torch_op, TensorIteratorBase& iter) {
     // way the unary ones are, and walk the same single operand.
     const UnaryAsScalarBinary* sb = mlx_op ? nullptr : unary_as_scalar_binary(torch_op);
     if (!mlx_op && !sb) return decline(R, torch_op, "no_mlx_name");
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1146 — vendor_unary DECLARES its argument directions; no decline.
     if (iter.ninputs() != 1) return decline(R, torch_op, "ninputs");
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, torch_op, "corpus_unavailable");
@@ -2821,7 +2823,7 @@ inline bool try_vendor_cat(const TensorList& tensors,
     constexpr const char* R = "cat";
     route_enter(R, nullptr);
     if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1146 — the copy_gg nest DECLARES its argument directions; no decline.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, nullptr, "corpus_unavailable");
     if (!result.is_contiguous()) return decline(R, nullptr, "out_not_contiguous");
@@ -3341,7 +3343,7 @@ inline bool try_vendor_copy(const at::Tensor& dst, const at::Tensor& src) {
     constexpr const char* R = "copy";
     route_enter(R, nullptr);
     if (!vendor_elementwise_route_enabled()) return decline(R, nullptr, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1146 — vendor_copy DECLARES its argument directions; no decline.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, nullptr, "corpus_unavailable");
 
