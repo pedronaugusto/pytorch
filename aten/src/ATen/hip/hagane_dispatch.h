@@ -2659,7 +2659,9 @@ inline bool try_vendor_reduce_all(const char* torch_op, const char* mlx_op,
     route_enter(R, torch_op);
     if (!mlx_op) return decline(R, torch_op, "no_mlx_reduce_op");
     if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, torch_op, "corpus_unavailable");
 
@@ -2708,7 +2710,9 @@ inline bool try_vendor_reduce_dim(const char* torch_op, const char* mlx_op,
     route_enter(R, torch_op);
     if (!mlx_op) return decline(R, torch_op, "no_mlx_reduce_op");
     if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, torch_op, "corpus_unavailable");
 
@@ -2779,7 +2783,9 @@ inline bool try_vendor_scan(const char* torch_op, const char* mlx_op,
     route_enter(R, torch_op);
     if (!mlx_op) return decline(R, torch_op, "no_mlx_scan_op");
     if (!vendor_elementwise_route_enabled()) return decline(R, torch_op, "route_off");
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1146 — no `tape_recording` decline. The vendor route DECLARES the
+    // direction and byte extent of every buffer argument, so the dispatch
+    // records as a command node and replays as itself.
     if (!haganeOpsVendorElementwiseAvailable())
         return decline(R, torch_op, "corpus_unavailable");
 
