@@ -1170,7 +1170,8 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
                                               const uint64_t* scalar_bits = nullptr) {
     constexpr const char* R = "unary_strided";
     route_enter(R, nullptr);
-    if (haganeOpsTapeRecording()) return decline(R, nullptr, "tape_recording");
+    // #1156 — no `tape_recording` decline; the dispatch below declares both
+    // buffers, so it records as a command node instead of falling to mx::.
 
     const int64_t N64 = iter.numel();
     if (N64 <= 0) return true;                     // nothing to compute
@@ -1183,7 +1184,12 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
         return false;
     void* d_in  = iter.data_ptr(in_idx);
     void* d_out = iter.data_ptr(0);
-    flush_or_commit_metallib_input(d_in, span * iter.element_size(in_idx));
+    // The input's extent is the SPAN the view reaches, never numel*esize — the
+    // same rule the geometry helper computes it under, and the reason `span`
+    // exists at all. The output is dense by dense_linear_order, so it is numel.
+    const size_t in_bytes  = static_cast<size_t>(span) * iter.element_size(in_idx);
+    const size_t out_bytes = static_cast<size_t>(N64) * iter.element_size(0);
+    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
 
     int N = static_cast<int>(N64);
     const int wpt = metallib_work_per_thread(iter.dtype());
@@ -1191,8 +1197,11 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     uint64_t sc = scalar_bits ? *scalar_bits : 0;
     void*  args[6]      = {d_in, d_out, &N, e3, s3, nullptr};
-    int    arg_types[6] = {0, 0, 1, 1, 1, 0};
-    size_t arg_sizes[6] = {0, 0, sizeof(int), sizeof(e3), sizeof(s3), 0};
+    int    arg_types[6] = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                           HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                           HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t arg_sizes[6] = {in_bytes, out_bytes, sizeof(int), sizeof(e3),
+                           sizeof(s3), 0};
     int nargs = 5;
     if (scalar_bits) {
         // The captured scalar sits between the output and N — the emitted
@@ -1209,8 +1218,7 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
                                            args, arg_types, arg_sizes, nargs) != hipSuccess)
         return decline(R, nullptr, "kernel_dispatch");
     note_native_launch(kname);
-    haganeOpsMarkMetallibWrite(d_out,
-                               static_cast<size_t>(N64) * iter.element_size(0));
+    haganeOpsMarkMetallibWrite(d_out, out_bytes);
     return true;
 }
 
@@ -1280,8 +1288,7 @@ inline bool try_launch_reduction_metallib(TensorIterator& iter, const char* op) 
     const bool is_mean = std::strcmp(op, "mean") == 0;
     if (!is_mean && std::strcmp(op, "sum") != 0)
         return decline("reduce_owned", op, "op_unowned");
-    if (haganeOpsTapeRecording())
-        return decline("reduce_owned", op, "tape_recording");
+    // #1156 — no `tape_recording` decline; both passes declare every buffer.
     if (!reduction_metallib_available())
         return decline("reduce_owned", op, "metallib_unavailable");
     const at::Tensor& in_t  = iter.tensor(1);
@@ -1347,25 +1354,39 @@ inline bool try_launch_reduction_metallib(TensorIterator& iter, const char* op) 
     void* dpart = reduce_partials_scratch(in_t.options(), nblocks, acc_ty);
     void* dX    = in_t.data_ptr();
     void* dout  = out_t.data_ptr();
-    flush_or_commit_metallib_input(dX, N * in_t.element_size());
+    // #1156 — three buffers, three extents. The partials are at ACC_TY, not the
+    // input dtype: reduce_partials_scratch keeps acc_ty in its reuse identity
+    // because a float buffer handed to an int64 pass is overrun 2x, and
+    // declaring the input's element size here would put that same overrun on the
+    // tape — where it would reproduce on every replay instead of once.
+    const size_t x_bytes    = static_cast<size_t>(N) * in_t.element_size();
+    const size_t part_bytes =
+        static_cast<size_t>(nblocks) * c10::elementSize(acc_ty);
+    const size_t out_bytes  = static_cast<size_t>(out_t.element_size());
+    flush_or_commit_metallib_input(dX, static_cast<int64_t>(x_bytes));
 
     int64_t c_N = N, c_NB = nblocks;
     float s1 = 1.0f, s2 = is_mean ? static_cast<float>(1.0 / static_cast<double>(N)) : 1.0f;
-    const int    at_[] = {1, 0, 0, 1};
-    const size_t as_[] = {sizeof(int64_t), 0, 0, sizeof(float)};
+    // Both passes bind {count, in, out, scale}, so the DIRECTIONS coincide and
+    // one at_[] serves both. The extents do not coincide — pass 1 is X→partials,
+    // pass 2 is partials→out — so those get one array each.
+    const int    at_[]  = {HAGANE_ARG_SCALAR, HAGANE_ARG_BUFFER_IN,
+                           HAGANE_ARG_BUFFER_OUT, HAGANE_ARG_SCALAR};
+    const size_t as1_[] = {sizeof(int64_t), x_bytes,    part_bytes, sizeof(float)};
+    const size_t as2_[] = {sizeof(int64_t), part_bytes, out_bytes,  sizeof(float)};
     const int nargs = scaled ? 4 : 3;   // the integer arms take no `scale`
     dim3 b(block, 1, 1), g1(static_cast<unsigned>(nblocks), 1, 1), g2(1, 1, 1);
 
     void* a1[] = {&c_N, dX, dpart, &s1};   // pass 1: X(N) → partials(nblocks), scale 1
-    if (hagane_launch_kernel_mixed_tracked(k1, g1, b, 0, nullptr, a1, at_, as_, nargs) != hipSuccess)
+    if (hagane_launch_kernel_mixed_tracked(k1, g1, b, 0, nullptr, a1, at_, as1_, nargs) != hipSuccess)
         return decline("reduce_owned", op, "pass1_launch_failed");
     void* a2[] = {&c_NB, dpart, dout, &s2}; // pass 2: partials(nblocks) → out(1), scale
-    if (hagane_launch_kernel_mixed_tracked(k2, g2, b, 0, nullptr, a2, at_, as_, nargs) != hipSuccess)
+    if (hagane_launch_kernel_mixed_tracked(k2, g2, b, 0, nullptr, a2, at_, as2_, nargs) != hipSuccess)
         return decline("reduce_owned", op, "pass2_launch_failed");
 
     note_native_launch(k1);
     note_native_launch(k2);
-    haganeOpsMarkMetallibWrite(dout, static_cast<size_t>(out_t.element_size()));
+    haganeOpsMarkMetallibWrite(dout, out_bytes);
     return true;
 }
 
@@ -1413,7 +1434,7 @@ inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, const char* 
     else if (std::strcmp(op, "and")        == 0) fam = kFamAll;
     else if (std::strcmp(op, "or")         == 0) fam = kFamAny;
     else return decline(R, op, "op_unowned");
-    if (haganeOpsTapeRecording()) return decline(R, op, "tape_recording");
+    // #1156 — no `tape_recording` decline; both buffers are declared below.
     if (!reduction_metallib_available()) return decline(R, op, "metallib_unavailable");
     const at::Tensor& in_t  = iter.tensor(1);
     const at::Tensor& out_t = iter.tensor(0);
@@ -1643,18 +1664,28 @@ inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, const char* 
     int64_t span = 1;
     for (int64_t d = 0; d < nd; ++d)
         span += (in_t.size(d) - 1) * in_t.stride(d);
-    flush_or_commit_metallib_input(dX, span * in_t.element_size());
+    // #1156 — the declared input extent is that same span, for the same reason:
+    // it is what the view reaches, and the tape is owed the real range.
+    const size_t x_bytes   = static_cast<size_t>(span) * in_t.element_size();
+    const size_t out_bytes =
+        static_cast<size_t>(out_t.numel()) * out_t.element_size();
+    flush_or_commit_metallib_input(dX, static_cast<int64_t>(x_bytes));
 
     int64_t c_o0 = o_run[0].ext, c_o1 = o_run[1].ext, c_red = red;
     int64_t c_i0 = i_run[0].ext, c_i1 = i_run[1].ext;
     int64_t c_so0 = o_run[0].str, c_so1 = o_run[1].str, c_sr = red_b.str;
     int64_t c_si0 = i_run[0].str, c_si1 = i_run[1].str;
     float scale = is_mean ? static_cast<float>(1.0 / static_cast<double>(red)) : 1.0f;
-    const int    at_[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1};
+    // Ten geometry scalars, then dX (in) and dout (out), then the scale.
+    const int    at_[] = {HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                          HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                          HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                          HAGANE_ARG_SCALAR, HAGANE_ARG_BUFFER_IN,
+                          HAGANE_ARG_BUFFER_OUT, HAGANE_ARG_SCALAR};
     const size_t as_[] = {sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
                           sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
                           sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
-                          sizeof(int64_t), 0, 0, sizeof(float)};
+                          sizeof(int64_t), x_bytes, out_bytes, sizeof(float)};
     const int nargs = scaled ? 13 : 12;   // the integer arms take no `scale`
     void* args[] = {&c_o0, &c_o1, &c_red, &c_i0, &c_i1,
                     &c_so0, &c_so1, &c_sr, &c_si0, &c_si1,
@@ -1665,8 +1696,7 @@ inline bool try_launch_reduction_dim_metallib(TensorIterator& iter, const char* 
         return decline(R, op, "launch_failed");
 
     note_native_launch(k);
-    haganeOpsMarkMetallibWrite(dout, static_cast<size_t>(out_t.numel() *
-                                                         out_t.element_size()));
+    haganeOpsMarkMetallibWrite(dout, out_bytes);
     return true;
 }
 
@@ -1786,23 +1816,29 @@ inline bool try_launch_softmax_metallib(const at::Tensor& input_c,
 
 inline bool try_launch_binary_metallib(const std::string& kname,
                                        TensorIteratorBase& iter) {
-    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
+    // #1156 — no `tape_recording` decline; all three buffers are declared below.
     void* d_out = iter.data_ptr(0);
     void* d_a   = iter.data_ptr(1);
     void* d_b   = iter.data_ptr(2);
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
+    // The two operands can differ in element size from each other and from the
+    // output (a comparison writes bool), so each extent is taken per operand.
+    const size_t a_bytes   = static_cast<size_t>(N) * iter.element_size(1);
+    const size_t b_bytes   = static_cast<size_t>(N) * iter.element_size(2);
+    const size_t out_bytes = static_cast<size_t>(N) * iter.element_size(0);
     // X+75: minimal per-input region flush for both operands (see unary above).
     // X+77: event-order both inputs GPU-side under the unified queue.
-    flush_or_commit_metallib_input(d_a, static_cast<int64_t>(N) * iter.element_size(1));
-    flush_or_commit_metallib_input(d_b, static_cast<int64_t>(N) * iter.element_size(2));
+    flush_or_commit_metallib_input(d_a, static_cast<int64_t>(a_bytes));
+    flush_or_commit_metallib_input(d_b, static_cast<int64_t>(b_bytes));
     // A8: wpt elements per thread (matches the kernel's _wptN).
     const int wpt = metallib_work_per_thread(iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_a, d_b, d_out, &N};
-    int    arg_types[] = {0, 0, 0, 1};
-    size_t arg_sizes[] = {0, 0, 0, sizeof(int)};
+    int    arg_types[] = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_IN,
+                          HAGANE_ARG_BUFFER_OUT, HAGANE_ARG_SCALAR};
+    size_t arg_sizes[] = {a_bytes, b_bytes, out_bytes, sizeof(int)};
     if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                    args, arg_types, arg_sizes, 4) != hipSuccess)
         return false;
@@ -1810,7 +1846,7 @@ inline bool try_launch_binary_metallib(const std::string& kname,
     // M3c: mark the output dirty-on-Hagane-queue instead of draining now; the
     // drain fires lazily at the MLX/host read boundary, so native chains don't
     // pay the per-op sync (the X+71 async win is preserved for routed ops).
-    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
+    haganeOpsMarkMetallibWrite(d_out, out_bytes);
     return true;
 }
 
@@ -4315,22 +4351,25 @@ inline bool try_index_put_advanced(TensorIterator& iter,
 
 inline bool try_launch_unary_scalar_metallib(const std::string& kname,
                                              TensorIteratorBase& iter, float scalar) {
-    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
+    // #1156 — no `tape_recording` decline; both buffers are declared below.
     void* d_out = iter.data_ptr(0);
     void* d_in  = iter.data_ptr(1);
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
+    const size_t in_bytes  = static_cast<size_t>(N) * iter.element_size(1);
+    const size_t out_bytes = static_cast<size_t>(N) * iter.element_size(0);
     // X+75: minimal per-input region flush (see unary above).
     // X+77: event-order the input GPU-side under the unified queue.
-    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(N) * iter.element_size(1));
+    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
     float sc = scalar;
     // A8: wpt elements per thread (matches the kernel's _wptN).
     const int wpt = metallib_work_per_thread(iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &sc, &N};
-    int    arg_types[] = {0, 0, 1, 1};
-    size_t arg_sizes[] = {0, 0, sizeof(float), sizeof(int)};
+    int    arg_types[] = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                          HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t arg_sizes[] = {in_bytes, out_bytes, sizeof(float), sizeof(int)};
     if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                    args, arg_types, arg_sizes, 4) != hipSuccess)
         return false;
@@ -4338,7 +4377,7 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     // M3c: mark the output dirty-on-Hagane-queue instead of draining now; the
     // drain fires lazily at the MLX/host read boundary, so native chains don't
     // pay the per-op sync (the X+71 async win is preserved for routed ops).
-    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
+    haganeOpsMarkMetallibWrite(d_out, out_bytes);
     return true;
 }
 
@@ -4359,13 +4398,14 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
 inline bool try_launch_binary_scalar_metallib(const std::string& kname,
                                               TensorIteratorBase& iter,
                                               int in_idx, uint64_t scalar_bits) {
-    if (haganeOpsTapeRecording()) return false;  // record via MLX so replay is correct
+    // #1156 — no `tape_recording` decline; both buffers are declared below.
     void* d_out = iter.data_ptr(0);
     void* d_in  = iter.data_ptr(in_idx);
     int N = static_cast<int>(iter.numel());
     if (N <= 0) return true;
-    flush_or_commit_metallib_input(
-        d_in, static_cast<int64_t>(N) * iter.element_size(in_idx));
+    const size_t in_bytes  = static_cast<size_t>(N) * iter.element_size(in_idx);
+    const size_t out_bytes = static_cast<size_t>(N) * iter.element_size(0);
+    flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
     // The scalar param is declared at the STORAGE dtype in the harvested
     // kernel (gpu_kernel_with_scalars keeps the functor's arg at scalar_t), so
     // setBytes gets exactly element_size bytes — the low bytes of `sc` on this
@@ -4376,13 +4416,14 @@ inline bool try_launch_binary_scalar_metallib(const std::string& kname,
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &sc, &N};
-    int    arg_types[] = {0, 0, 1, 1};
-    size_t arg_sizes[] = {0, 0, esz, sizeof(int)};
+    int    arg_types[] = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                          HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t arg_sizes[] = {in_bytes, out_bytes, esz, sizeof(int)};
     if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                            args, arg_types, arg_sizes, 4) != hipSuccess)
         return false;
     note_native_launch(kname);
-    haganeOpsMarkMetallibWrite(d_out, static_cast<size_t>(N) * iter.element_size(0));
+    haganeOpsMarkMetallibWrite(d_out, out_bytes);
     return true;
 }
 
