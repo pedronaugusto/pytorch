@@ -2323,6 +2323,31 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
     return;
   }
   g_copy_fallback_count.fetch_add(1, std::memory_order_relaxed);
+  // #1157 — A DECLINED COPY RUNS ON THE HOST, AND THE TAPE HAS TO KNOW.
+  //
+  // Both arms below touch device memory from the host: the first memcpys it
+  // directly, the second hands the whole thing to the CPU copy_stub. Neither
+  // announced itself. That is the same unrecordable-work class
+  // haganeOpsSettleForCpuKernel already refuses — it taints the active tape,
+  // which is why the cpu_delegated conformance case gets an honest
+  // hipErrorNotSupported — and this path simply was not going through the
+  // door, so it was invisible to the capture AND to the host-fallback counter.
+  //
+  // MEASURED: `a.sum().double()` inside a capture replayed the CAPTURE-TIME
+  // value forever — corr=0.00e+00 but resp=6.65e+01 against a new input. The
+  // ticket had recorded that expression as "replays correctly", because
+  // correctness had only ever been checked against the inputs the capture ran
+  // on, and a frozen result is indistinguishable from a right one there.
+  //
+  // The declared reason names the dtype pair, so the trace says which cast
+  // delegated rather than just that one did.
+  {
+    char why[48];
+    std::snprintf(why, sizeof(why), "cpu_copy %s->%s",
+                  c10::toString(iter.dtype(1)), c10::toString(iter.dtype(0)));
+    HAGANE_HOST_FALLBACK(why);
+    HAGANE_BEFORE_RAW_READ();
+  }
   // Dep-targeted flush: the MLX graph walk at stash time (collect_leaf_
   // buffers) populates a reverse index from leaf Buffer → stash keys, so
   // we materialize only the entries the upcoming copy would corrupt —
