@@ -3637,7 +3637,7 @@ inline bool try_index_gather_axis(const char* torch_op, const at::Tensor& in,
     const char* R = "index_axis";
     if (!index_metallib_available()) return false;
     route_enter(R, torch_op);
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1156 — no `tape_recording` decline; all three buffers are declared below.
     if (!in.defined() || !index.defined() || !out.defined())
         return decline(R, torch_op, "undefined_operand");
     if (!in.is_cuda() || !index.is_cuda() || !out.is_cuda())
@@ -3721,9 +3721,16 @@ inline bool try_index_gather_axis(const char* torch_op, const at::Tensor& in,
 
     std::string kname = std::string("hagane_gather_axis_") + bsfx + "_" + isfx;
     int64_t c_ndim = ndim, c_total = total, c_dim = dim, c_dimsz = dim_size;
+    // #1156 — the three spans computed above ARE the declared extents; `in` is
+    // read over its own extent along dim because any index may select any row.
     void*  args[]  = {p_in, p_idx, p_out, &d, &c_ndim, &c_total, &c_dim, &c_dimsz};
-    int    at_[]   = {0, 0, 0, 1, 1, 1, 1, 1};
-    size_t as_[]   = {0, 0, 0, sizeof(d), sizeof(int64_t), sizeof(int64_t),
+    int    at_[]   = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_IN,
+                      HAGANE_ARG_BUFFER_OUT, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                      HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t as_[]   = {static_cast<size_t>(in_span * esz),
+                      static_cast<size_t>(idx_span * index.element_size()),
+                      static_cast<size_t>(out_span * esz),
+                      sizeof(d), sizeof(int64_t), sizeof(int64_t),
                       sizeof(int64_t), sizeof(int64_t)};
     int64_t nb = (total + 255) / 256;
     if (nb < 1) nb = 1;
@@ -3758,7 +3765,7 @@ inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
     const char* OP = "scatter";
     if (!index_metallib_available()) return false;
     route_enter(R, OP);
-    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+    // #1156 — no `tape_recording` decline; self is declared INOUT below.
     if (!self.defined() || !index.defined() || !src.defined())
         return decline(R, OP, "undefined_operand");
     if (!self.is_cuda() || !index.is_cuda() || !src.is_cuda())
@@ -3814,9 +3821,20 @@ inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
 
     std::string kname = std::string("hagane_scatter_axis_") + bsfx;
     int64_t c_ndim = ndim, c_total = total, c_dim = dim, c_dimsz = dim_size;
+    // #1156 — `self` is INOUT, not OUT. The write is PARTIAL by construction
+    // (that is what scatter IS, and it is why the settle above materialises
+    // rather than supersedes), so declaring it OUT would claim this dispatch
+    // produces the whole buffer when it produces only the scattered positions.
+    // INOUT also arms the -607 guard, which refuses honestly if the buffer still
+    // holds a value node's result instead of reading capture-time bytes.
     void*  args[] = {p_self, p_idx, p_src, &d, &c_ndim, &c_total, &c_dim, &c_dimsz};
-    int    at_[]  = {0, 0, 0, 1, 1, 1, 1, 1};
-    size_t as_[]  = {0, 0, 0, sizeof(d), sizeof(int64_t), sizeof(int64_t),
+    int    at_[]  = {HAGANE_ARG_BUFFER_INOUT, HAGANE_ARG_BUFFER_IN,
+                     HAGANE_ARG_BUFFER_IN, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                     HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t as_[]  = {static_cast<size_t>(self_span * esz),
+                     static_cast<size_t>(idx_span * index.element_size()),
+                     static_cast<size_t>(src_span * esz),
+                     sizeof(d), sizeof(int64_t), sizeof(int64_t),
                      sizeof(int64_t), sizeof(int64_t)};
     int64_t nb = (total + 255) / 256;
     if (nb < 1) nb = 1;
@@ -3854,7 +3872,7 @@ inline bool try_triangle(const char* torch_op, bool upper,
     const char* R = "triangle";
     if (!index_metallib_available()) return false;
     route_enter(R, torch_op);
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1156 — no `tape_recording` decline; declared by aliasing below.
     if (!in.defined() || !out.defined())
         return decline(R, torch_op, "undefined_operand");
     if (!in.is_cuda() || !out.is_cuda()) return decline(R, torch_op, "not_device");
@@ -3888,10 +3906,21 @@ inline bool try_triangle(const char* torch_op, bool upper,
 
     std::string kname = std::string(upper ? "hagane_triu_" : "hagane_tril_") + bsfx;
     int64_t c_total = total, c_H = H, c_W = W, c_diag = diagonal;
+    // #1156 — declare by ALIASING, not by position. `in` and `out` are two
+    // separate arguments that are the SAME address for triu_/tril_. Declared
+    // IN/OUT they would resolve independently, and the -607 guard is keyed on
+    // types[i]==INOUT so it would NOT fire on a divergence — the kernel would
+    // read one place and write another, silently. Declaring the aliased pair
+    // INOUT is what arms that guard, turning the one shape of #1148 no pointer
+    // can reconcile into an honest refusal. Distinct addresses stay IN/OUT.
+    const bool self_write = (p_in == p_out);
+    const int in_kind  = self_write ? HAGANE_ARG_BUFFER_INOUT : HAGANE_ARG_BUFFER_IN;
+    const int out_kind = self_write ? HAGANE_ARG_BUFFER_INOUT : HAGANE_ARG_BUFFER_OUT;
     void*  args[]  = {p_in, p_out, &c_total, &c_H, &c_W, &c_diag};
-    int    at_[]   = {0, 0, 1, 1, 1, 1};
-    size_t as_[]   = {0, 0, sizeof(int64_t), sizeof(int64_t), sizeof(int64_t),
-                      sizeof(int64_t)};
+    int    at_[]   = {in_kind, out_kind, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                      HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t as_[]   = {bytes, bytes, sizeof(int64_t), sizeof(int64_t),
+                      sizeof(int64_t), sizeof(int64_t)};
     int64_t nb = (total + 255) / 256;
     if (nb < 1) nb = 1;
     if (nb > 65535) nb = 65535;          // the grid-stride loop covers the rest
@@ -4075,7 +4104,7 @@ inline bool try_index_gather_advanced(TensorIteratorBase& iter,
     const char* OP = "index";
     if (!index_metallib_available()) return false;
     route_enter(R, OP);
-    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+    // #1156 — no `tape_recording` decline; every buffer is declared below.
 
     const int n_idx = static_cast<int>(iter.ntensors()) - 2;
     if (n_idx <= 0 || n_idx > HAGANE_INDEX_MAX_IDX)
@@ -4167,9 +4196,18 @@ inline bool try_index_gather_advanced(TensorIteratorBase& iter,
     int    at_[8];
     size_t as_[8];
     int n = 0;
-    args[n] = p_base; at_[n] = 0; as_[n] = 0; ++n;
-    for (int j = 0; j < n_idx; ++j) { args[n] = p_idx[j]; at_[n] = 0; as_[n] = 0; ++n; }
-    args[n] = p_out;  at_[n] = 0; as_[n] = 0; ++n;
+    // #1156 — base is read at the largest coordinate AND the largest wrapped
+    // index on every indexed dim, which is exactly what base_span already
+    // carries. idx_span[j] is in BYTES already (it multiplies by element_size
+    // where it is computed); the other two are element counts.
+    args[n] = p_base; at_[n] = HAGANE_ARG_BUFFER_IN;
+    as_[n] = static_cast<size_t>(base_span * esz); ++n;
+    for (int j = 0; j < n_idx; ++j) {
+        args[n] = p_idx[j]; at_[n] = HAGANE_ARG_BUFFER_IN;
+        as_[n] = static_cast<size_t>(idx_span[j]); ++n;
+    }
+    args[n] = p_out;  at_[n] = HAGANE_ARG_BUFFER_OUT;
+    as_[n] = static_cast<size_t>(out_span * esz); ++n;
     args[n] = &d;      at_[n] = 1; as_[n] = sizeof(d); ++n;
     args[n] = &c_ndim; at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
     args[n] = &c_total; at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
@@ -4235,7 +4273,7 @@ inline bool try_index_put_advanced(TensorIterator& iter,
     const char* OP = "index_put";
     if (!index_metallib_available()) return false;
     route_enter(R, OP);
-    if (haganeOpsTapeRecording()) return decline(R, OP, "tape_recording");
+    // #1156 — no `tape_recording` decline; base is declared INOUT below.
     // accumulate=true is a different op: it needs atomics and torch routes it
     // to index_put_with_sort_stub long before here. Guarded anyway, because
     // quietly overwriting instead of adding is the worst failure available.
@@ -4330,9 +4368,17 @@ inline bool try_index_put_advanced(TensorIterator& iter,
     int    at_[8];
     size_t as_[8];
     int n = 0;
-    args[n] = p_base; at_[n] = 0; as_[n] = 0; ++n;
-    for (int j = 0; j < n_idx; ++j) { args[n] = p_idx[j]; at_[n] = 0; as_[n] = 0; ++n; }
-    args[n] = p_value; at_[n] = 0; as_[n] = 0; ++n;
+    // #1156 — base is INOUT for the same reason scatter_axis's self is: the
+    // write is partial by construction, which is why the settle above
+    // materialises rather than supersedes.
+    args[n] = p_base; at_[n] = HAGANE_ARG_BUFFER_INOUT;
+    as_[n] = static_cast<size_t>(base_span * esz); ++n;
+    for (int j = 0; j < n_idx; ++j) {
+        args[n] = p_idx[j]; at_[n] = HAGANE_ARG_BUFFER_IN;
+        as_[n] = static_cast<size_t>(idx_span[j]); ++n;
+    }
+    args[n] = p_value; at_[n] = HAGANE_ARG_BUFFER_IN;
+    as_[n] = static_cast<size_t>(value_span * esz); ++n;
     args[n] = &d;       at_[n] = 1; as_[n] = sizeof(d); ++n;
     args[n] = &c_ndim;  at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
     args[n] = &c_total; at_[n] = 1; as_[n] = sizeof(int64_t); ++n;
