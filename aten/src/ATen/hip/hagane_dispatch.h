@@ -463,12 +463,23 @@ inline constexpr UnaryScalarOpConfig kLogitCfg      = {"logit",      nullptr, &h
 // — so this is no longer called per metallib launch; kept for the contract.)
 extern "C" hipError_t hipDeviceSynchronize();
 
-// X+74 — a raw metallib launch (hagane_launch_kernel_mixed) has no capture
-// hook, so it is invisible to the hagane tape and would be dropped on replay.
-// While a tape is recording (haganeOpsTapeRecording), the launch helpers fall
-// back to the MLX c_abi path, which IS recorded (HAGANE_CAPTURE_OP) and replays
-// correctly. Distinct from haganeOpsCaptureActive() (hipStreamBeginCapture).
-// Declared here (hagane_capture.h is not included by this header).
+// X+74 — a raw metallib launch had no capture hook, so it was invisible to the
+// hagane tape and would be dropped on replay. Every route below therefore
+// declined while a tape was recording and let the MLX c_abi path be recorded
+// instead.
+//
+// #1146/#1156 — that is no longer the mechanism. hagane_launch_kernel_mixed_
+// tracked forwards each argument's DECLARED direction and byte extent to the
+// recorder, which records the dispatch as a command node that replays as
+// itself; an undeclared buffer taints the capture rather than vanishing from it
+// (#1149). A route that declares its arguments therefore has no decline, and
+// the two go together — a decline left behind on a declaring route only forces
+// the op back onto mx::, where its value intermediates alias the command nodes
+// around it. Every remaining `tape_recording` return below is a route that has
+// NOT been converted yet.
+//
+// Distinct from haganeOpsCaptureActive() (hipStreamBeginCapture). Declared here
+// (hagane_capture.h is not included by this header).
 extern "C" int haganeOpsTapeRecording(void);
 
 
@@ -750,9 +761,24 @@ inline bool fused_norm_eligible(const char* tag, int64_t N,
     return a16(dX) && a16(dgamma) && a16(dY) && (dbeta == nullptr || a16(dbeta));
 }
 
+// #1156 — the byte extent of each buffer the norm kernels touch. Both norm
+// routes compute these already, for their own settle and mark; this carries
+// them into the shared launcher so a capture can record the dispatch instead of
+// declining to MLX.
+//
+// `moments` is the trap. rms_moments_scratch and the fresh mean/rstd tensors are
+// ALWAYS at::kFloat whatever the input dtype (T_ACC = float for every arm), so
+// the extent is M * sizeof(float) and NOT M * elt — deriving it from the input
+// element size understates it by half for bfloat16 and half, which is exactly
+// the class of extent bug #1152 was.
+struct norm_arg_bytes {
+    size_t x, gamma, beta, moments, y;
+};
+
 inline bool launch_fused_norm(const char* tag, bool rms, void* dX, void* dgamma,
                               void* dbeta, void* dmean, void* drstd, void* dY,
-                              int64_t M, int64_t N, double eps) {
+                              int64_t M, int64_t N, double eps,
+                              const norm_arg_bytes& nb) {
     const std::string k = std::string("hagane_vectorized_layer_norm_kernel_") +
                           tag + (rms ? "_rms" : "_ln");
     const int warp_size = 32, num_threads = 256;
@@ -762,9 +788,16 @@ inline bool launch_fused_norm(const char* tag, bool rms, void* dX, void* dgamma,
     dim3 grid(static_cast<unsigned>(M), 1, 1), block(warp_size, threads_y, 1);
     int   c_N   = static_cast<int>(N);
     float c_eps = static_cast<float>(eps);
+    // Single pass: the kernel reads X/gamma/beta and WRITES mean, rstd and Y.
+    // The rms arm binds gamma twice (beta is a bound param it never
+    // dereferences), which is two reads of one buffer and resolves alike.
     void*  args[] = {&c_N, &c_eps, dX, dgamma, dbeta, dmean, drstd, dY};
-    int    at[]   = {1, 1, 0, 0, 0, 0, 0, 0};
-    size_t as[]   = {sizeof(int), sizeof(float), 0, 0, 0, 0, 0, 0};
+    int    at[]   = {HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                     HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_IN,
+                     HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                     HAGANE_ARG_BUFFER_OUT, HAGANE_ARG_BUFFER_OUT};
+    size_t as[]   = {sizeof(int), sizeof(float), nb.x, nb.gamma, nb.beta,
+                     nb.moments, nb.moments, nb.y};
     if (hagane_launch_kernel_mixed_tracked(k.c_str(), grid, block, shared, nullptr,
                                    args, at, as, 8) != hipSuccess)
         return false;
@@ -778,14 +811,17 @@ inline bool launch_fused_norm(const char* tag, bool rms, void* dX, void* dgamma,
 // (consistent with the exact forward normalization); that fresh tensor is held
 // by autograd, so it isn't freed during the forward either. Returns false →
 // caller falls back to the MLX path: route-off, an unsupported/non-float dtype,
-// tape recording (so torch.compile capture/replay stays on MLX), or any launch
-// failure.
+// or any launch failure. NOT tape recording — see #1156 above.
 inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
                                          const std::optional<at::Tensor>& weight,
                                          at::Tensor& output,
                                          int64_t M, int64_t N, double eps,
                                          bool need_rstd, at::Tensor& rstd_out) {
-    if (haganeOpsTapeRecording()) return false;
+    // #1156 — no `tape_recording` decline. Both dispatches below DECLARE the
+    // direction and byte extent of every buffer argument, so each records as a
+    // command node and replays as itself. Declining here is what made a captured
+    // layer_norm/rms_norm fall to the mx:: composition, allocating the value
+    // intermediate a later command node then aliased into (the -1002 refusal).
     if (M <= 0 || N <= 0) return false;
     if (!norm_metallib_available()) return false;
     const char* tag = nullptr;
@@ -824,15 +860,21 @@ inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
     void* dY     = output.data_ptr();
     const int64_t elt = input_c.element_size();
 
-    flush_or_commit_metallib_input(dX, M * N * elt);
-    flush_or_commit_metallib_input(dgamma, N * gamma.element_size());
+    const size_t x_bytes       = static_cast<size_t>(M) * N * elt;
+    const size_t gamma_bytes   = static_cast<size_t>(N) * gamma.element_size();
+    const size_t moments_bytes = static_cast<size_t>(M) * sizeof(float);
+
+    flush_or_commit_metallib_input(dX, static_cast<int64_t>(x_bytes));
+    flush_or_commit_metallib_input(dgamma, static_cast<int64_t>(gamma_bytes));
 
     // A10: the fused vec4 kernel (one pass) when aligned + N%4==0. beta is a bound
     // param the rms arm never dereferences (if constexpr DCE), so the gamma dummy
     // is safe — identical to the scalar path's beta=gamma.
+    const norm_arg_bytes nb{x_bytes, gamma_bytes, gamma_bytes, moments_bytes,
+                            x_bytes};
     if (fused_norm_eligible(tag, N, dX, dgamma, dgamma, dY) &&
         launch_fused_norm(tag, /*rms=*/true, dX, dgamma, dgamma, dmean, drstd, dY,
-                          M, N, eps)) {
+                          M, N, eps, nb)) {
         haganeOpsMarkMetallibWrite(dY, static_cast<size_t>(M) * N * elt);
         if (need_rstd) rstd_out = rstd_fresh;
         return true;
@@ -845,9 +887,15 @@ inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
     int64_t c_N = N;
     float c_eps = static_cast<float>(eps);
 
+    // Pass 1 READS X and WRITES both moments; pass 2 READS them back. Declaring
+    // both sides is what lets the tape carry that dependency instead of
+    // inferring it from addresses.
     void*  margs[] = {&c_N, &c_eps, dX, dmean, drstd};
-    int    mat[]   = {1, 1, 0, 0, 0};
-    size_t mas[]   = {sizeof(int64_t), sizeof(float), 0, 0, 0};
+    int    mat[]   = {HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                      HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                      HAGANE_ARG_BUFFER_OUT};
+    size_t mas[]   = {sizeof(int64_t), sizeof(float), x_bytes, moments_bytes,
+                      moments_bytes};
     if (hagane_launch_kernel_mixed_tracked(moments.c_str(), grid, block, 0, nullptr,
                                    margs, mat, mas, 5) != hipSuccess)
         return false;
@@ -855,8 +903,12 @@ inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
     // gamma at [4], beta=gamma (dummy) at [5]; the two kernels run in submission
     // order on the in-order Hagane queue, so apply reads the rstd moments wrote.
     void*  aargs[] = {&c_N, dX, dmean, drstd, dgamma, dgamma, dY};
-    int    aat[]   = {1, 0, 0, 0, 0, 0, 0};
-    size_t aas[]   = {sizeof(int64_t), 0, 0, 0, 0, 0, 0};
+    int    aat[]   = {HAGANE_ARG_SCALAR, HAGANE_ARG_BUFFER_IN,
+                      HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_IN,
+                      HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_IN,
+                      HAGANE_ARG_BUFFER_OUT};
+    size_t aas[]   = {sizeof(int64_t), x_bytes, moments_bytes, moments_bytes,
+                      gamma_bytes, gamma_bytes, x_bytes};
     if (hagane_launch_kernel_mixed_tracked(apply.c_str(), grid, block, 0, nullptr,
                                    aargs, aat, aas, 7) != hipSuccess)
         return false;
@@ -876,8 +928,8 @@ inline bool try_launch_rms_norm_metallib(const at::Tensor& input_c,
 // recompute; otherwise both are reusable per-thread scratch. The mixed launcher
 // rejects null buffers, so no-weight binds a ones-vector gamma and no-bias binds
 // a zeros-vector beta (reproducing the kernel's nullptr-guard identities).
-// Returns false → MLX fallback: route-off, unsupported/non-float dtype, tape
-// recording, or any launch failure.
+// Returns false → MLX fallback: route-off, unsupported/non-float dtype, or any
+// launch failure. NOT tape recording — see #1156 above.
 inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
                                            const std::optional<at::Tensor>& weight,
                                            const std::optional<at::Tensor>& bias,
@@ -885,7 +937,7 @@ inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
                                            int64_t M, int64_t N, double eps,
                                            bool need_stats,
                                            at::Tensor& mean_out, at::Tensor& rstd_out) {
-    if (haganeOpsTapeRecording()) return false;
+    // #1156 — no `tape_recording` decline; see try_launch_rms_norm_metallib.
     if (M <= 0 || N <= 0) return false;
     if (!norm_metallib_available()) return false;
     const char* tag = nullptr;
@@ -926,14 +978,21 @@ inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
     void* dY     = output.data_ptr();
     const int64_t elt = input_c.element_size();
 
-    flush_or_commit_metallib_input(dX, M * N * elt);
-    flush_or_commit_metallib_input(dgamma, N * gamma.element_size());
-    flush_or_commit_metallib_input(dbeta, N * beta.element_size());
+    const size_t x_bytes       = static_cast<size_t>(M) * N * elt;
+    const size_t gamma_bytes   = static_cast<size_t>(N) * gamma.element_size();
+    const size_t beta_bytes    = static_cast<size_t>(N) * beta.element_size();
+    const size_t moments_bytes = static_cast<size_t>(M) * sizeof(float);
+
+    flush_or_commit_metallib_input(dX, static_cast<int64_t>(x_bytes));
+    flush_or_commit_metallib_input(dgamma, static_cast<int64_t>(gamma_bytes));
+    flush_or_commit_metallib_input(dbeta, static_cast<int64_t>(beta_bytes));
 
     // A10: the fused vec4 kernel (one pass) when aligned + N%4==0.
+    const norm_arg_bytes nb{x_bytes, gamma_bytes, beta_bytes, moments_bytes,
+                            x_bytes};
     if (fused_norm_eligible(tag, N, dX, dgamma, dbeta, dY) &&
         launch_fused_norm(tag, /*rms=*/false, dX, dgamma, dbeta, dmean, drstd, dY,
-                          M, N, eps)) {
+                          M, N, eps, nb)) {
         haganeOpsMarkMetallibWrite(dY, static_cast<size_t>(M) * N * elt);
         if (need_stats) { mean_out = mean_fresh; rstd_out = rstd_fresh; }
         return true;
@@ -947,15 +1006,22 @@ inline bool try_launch_layer_norm_metallib(const at::Tensor& input_c,
     float c_eps = static_cast<float>(eps);
 
     void*  margs[] = {&c_N, &c_eps, dX, dmean, drstd};
-    int    mat[]   = {1, 1, 0, 0, 0};
-    size_t mas[]   = {sizeof(int64_t), sizeof(float), 0, 0, 0};
+    int    mat[]   = {HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                      HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
+                      HAGANE_ARG_BUFFER_OUT};
+    size_t mas[]   = {sizeof(int64_t), sizeof(float), x_bytes, moments_bytes,
+                      moments_bytes};
     if (hagane_launch_kernel_mixed_tracked(moments.c_str(), grid, block, 0, nullptr,
                                    margs, mat, mas, 5) != hipSuccess)
         return false;
 
     void*  aargs[] = {&c_N, dX, dmean, drstd, dgamma, dbeta, dY};
-    int    aat[]   = {1, 0, 0, 0, 0, 0, 0};
-    size_t aas[]   = {sizeof(int64_t), 0, 0, 0, 0, 0, 0};
+    int    aat[]   = {HAGANE_ARG_SCALAR, HAGANE_ARG_BUFFER_IN,
+                      HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_IN,
+                      HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_IN,
+                      HAGANE_ARG_BUFFER_OUT};
+    size_t aas[]   = {sizeof(int64_t), x_bytes, moments_bytes, moments_bytes,
+                      gamma_bytes, beta_bytes, x_bytes};
     if (hagane_launch_kernel_mixed_tracked(apply.c_str(), grid, block, 0, nullptr,
                                    aargs, aat, aas, 7) != hipSuccess)
         return false;
@@ -1650,7 +1716,8 @@ inline void* softmax_mask_scratch(const at::TensorOptions& opts, int64_t bytes) 
 inline bool try_launch_softmax_metallib(const at::Tensor& input_c,
                                         const at::Tensor& output,
                                         int64_t dim, bool is_log) {
-    if (haganeOpsTapeRecording()) return false;
+    // #1156 — no `tape_recording` decline; the dispatch below declares the
+    // direction and byte extent of all three buffers.
     if (!softmax_metallib_available()) return false;
     const int64_t ndim = input_c.dim();
     if (ndim == 0) return false;
@@ -1686,18 +1753,28 @@ inline bool try_launch_softmax_metallib(const at::Tensor& input_c,
     void* dst = output.data_ptr();
     void* src = input_c.data_ptr();
     const int64_t elt = input_c.element_size();
-    void* dmask = softmax_mask_scratch(input_c.options(), M * N);
+    const size_t io_bytes   = static_cast<size_t>(M) * N * elt;
+    // The mask scratch is at::kBool sized in ELEMENTS == BYTES (see
+    // softmax_mask_scratch), so its extent is M*N and NOT M*N*elt — declaring
+    // the latter would claim four times the buffer for float.
+    const size_t mask_bytes = static_cast<size_t>(M) * N;
+    void* dmask = softmax_mask_scratch(input_c.options(),
+                                       static_cast<int64_t>(mask_bytes));
 
-    flush_or_commit_metallib_input(src, M * N * elt);
+    flush_or_commit_metallib_input(src, static_cast<int64_t>(io_bytes));
 
     int batch_size = static_cast<int>(M), stride = static_cast<int>(N),
         element_count = static_cast<int>(N), head_chunk = -1;
     bool is_tmask = false;
+    // is_masked=false, so the kernel never dereferences the mask, but it is a
+    // bound buffer and the recorder is answerable for every binding.
     void*  args[] = {dst, src, &batch_size, &stride, &element_count,
                      dmask, &head_chunk, &is_tmask};
-    int    at_[]  = {0, 0, 1, 1, 1, 0, 1, 1};
-    size_t as_[]  = {0, 0, sizeof(int), sizeof(int), sizeof(int),
-                     0, sizeof(int), sizeof(bool)};
+    int    at_[]  = {HAGANE_ARG_BUFFER_OUT, HAGANE_ARG_BUFFER_IN,
+                     HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                     HAGANE_ARG_BUFFER_IN, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t as_[]  = {io_bytes, io_bytes, sizeof(int), sizeof(int), sizeof(int),
+                     mask_bytes, sizeof(int), sizeof(bool)};
     dim3 grid(blocks, 1, 1), block(warp_size, warps_per_block, 1);
     if (hagane_launch_kernel_mixed_tracked(kernel.c_str(), grid, block, 0, nullptr,
                                    args, at_, as_, 8) != hipSuccess)
