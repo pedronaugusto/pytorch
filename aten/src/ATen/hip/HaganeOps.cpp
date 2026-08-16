@@ -551,16 +551,28 @@ C10_EXPORT void sortKeyValueInplace(
 C10_EXPORT void launch_stable_sort_kernel(
     const TensorBase& self, int64_t dim, bool descending,
     const TensorBase& values, const TensorBase& indices) {
-  // Copy input to values
-  HAGANE_HOST_FALLBACK("raw_read");
-  HAGANE_BEFORE_RAW_READ();
-  std::memcpy(const_cast<void*>(values.const_data_ptr()),
-              self.const_data_ptr(), self.numel() * self.itemsize());
-  // Initialize indices to iota [0,1,2,...] — haganeOpsSort permutes in-place
+  // #1158 — THE PAYLOAD IS ROW-LOCAL, AND THE FLAT IOTA WAS NOT.
+  //
+  // This is the arm torch takes when size(dim) > 4096 (should_use_small_sort,
+  // native/hip/Sort.h). It seeded indices with a flat iota over numel and then
+  // let haganeOpsSort permute it ALONG dim via take_along_axis, so every slice
+  // past the first came back carrying its neighbours' global positions:
+  // measured max 39999 on a [8, 5000] sort, where the largest legal index is
+  // 4999. torch returns per-slice indices, so the seed has to be per-slice too.
+  //
+  // Seeded the same way torch's own small-sort arm does it (fillSliceWithIndex
+  // in native/hip/Sort.cpp): an arange along `dim` broadcast across the rest.
+  // That is one aten call instead of a host loop writing device memory, so the
+  // HAGANE_HOST_FALLBACK("raw_read") this function used to take for both the
+  // seed and the values copy is gone rather than relocated — the whole thing
+  // now runs on the GPU, which is also what makes it correct under capture.
+  Tensor(values).copy_(Tensor(self));
   {
-    int64_t n = indices.numel();
-    int64_t* idx_ptr = static_cast<int64_t*>(const_cast<void*>(indices.const_data_ptr()));
-    for (int64_t i = 0; i < n; i++) idx_ptr[i] = i;
+    std::vector<int64_t> seed_shape(indices.dim(), 1);
+    seed_shape[dim] = indices.sizes()[dim];
+    auto range = at::arange(indices.sizes()[dim],
+                            Tensor(indices).options());
+    Tensor(indices).copy_(range.view(seed_shape));
   }
   auto val_d = make_tensor_desc(values);
   auto idx_d = make_tensor_desc(indices);
@@ -2187,7 +2199,39 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
   // For cross-dtype copies, TensorIterator may use internal temporary buffers,
   // so iter.data_ptr(arg) won't match the pending stash key from upstream ops.
   const auto& dst_t = iter.tensor(0);
-  const auto& src_t = iter.tensor(1);
+  const auto& src_raw = iter.tensor(1);
+
+  // #1158 — THE BROADCAST MUST SURVIVE THE HANDOFF.
+  //
+  // iter.tensor(1) is the operand as the CALLER passed it, not the operand the
+  // TensorIterator broadcast to the output's shape. torch's own
+  // fillSliceWithIndex (native/hip/Sort.cpp) does
+  //     t.copy_(at::arange(N).view(1, N))
+  // into an [R, N] destination, so src arrived here shaped [1, N] and every
+  // consumer below was handed a descriptor claiming N elements for an R*N
+  // element copy. try_vendor_copy declined it by name (shape_mismatch) and
+  // haganeOpsCopyFull's Path B then took it: `is_contiguous(src) &&
+  // is_contiguous(dst)` both hold — [1, N] with strides [N, 1] IS contiguous —
+  // and it memcpy'd numel(SRC) elements. ONE ROW written; the rest of the
+  // destination kept whatever it was allocated with, which is uninitialised
+  // heap and only looks like zeros on a fresh block.
+  //
+  // torch.sort was the visible victim (correct values, indices right for row 0
+  // and garbage after, and garbage large enough to make a downstream gather
+  // read out of bounds), but sort was never the defect. The surface is
+  // `dst.copy_(broadcastable_src)`, which is everywhere.
+  //
+  // Expanding here is what CUDA does: TensorIterator broadcasts by giving the
+  // operand stride 0 on the expanded axes, and every path below already speaks
+  // strides. With dst's shape and a 0 stride, try_vendor_copy takes it as an
+  // ordinary strided g_copy — so this is a correctness fix that also keeps the
+  // op on the GPU rather than pushing it to the CPU tail.
+  at::Tensor src_expanded;
+  if (src_raw.sizes() != dst_t.sizes() &&
+      at::is_expandable_to(src_raw.sizes(), dst_t.sizes())) {
+    src_expanded = src_raw.expand(dst_t.sizes());
+  }
+  const at::Tensor& src_t = src_expanded.defined() ? src_expanded : src_raw;
 
   const bool gpu_to_cpu =
       src_t.device().is_cuda() && !dst_t.device().is_cuda();
@@ -2293,9 +2337,12 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
       std::memcpy(dst, src, nbytes);
     }
   } else {
-    int64_t src_nbytes = src_t.numel() * src_t.element_size();
+    // src_raw, not src_t: an expanded view's numel is the DESTINATION's, while
+    // its storage is still the original's, and a flush range must describe
+    // bytes that exist or it reaches into whatever block sits after it.
+    int64_t src_nbytes = src_raw.numel() * src_raw.element_size();
     int64_t dst_nbytes = dst_t.numel() * dst_t.element_size();
-    ::haganeOpsFlushRegion(const_cast<void*>(src_t.data_ptr()), src_nbytes);
+    ::haganeOpsFlushRegion(const_cast<void*>(src_raw.data_ptr()), src_nbytes);
     ::haganeOpsFlushForWrite(const_cast<void*>(dst_t.data_ptr()), dst_nbytes);
     copy_stub(c10::DeviceType::CPU, iter, non_blocking);
   }
