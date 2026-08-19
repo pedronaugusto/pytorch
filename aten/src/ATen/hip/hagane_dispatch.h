@@ -197,6 +197,30 @@ struct BinaryOpConfig {
     // gpu_kernel_with_scalars presents ONE functor for every operand shape, so
     // the harvested arms are exactly what torch dispatches.
     bool float_cpu_scalar_differs = false;
+
+    // #1172 — does UPSTREAM route this op through
+    // opmath_SYMMETRIC_gpu_kernel_with_scalars?
+    //
+    // The symmetric variant exists because the op COMMUTES: CUDA emits ONE
+    // scalar arm and swaps the operands for the other side. So the harvest
+    // carries `_a1_sA` and no `_a1_sB`, and a route that names sB for a
+    // scalar-in-operand-2 call names a kernel that was never built. mul.metallib
+    // ships sA=18, sB=0 where every non-symmetric sibling ships both
+    // (div_floor 16/16, div_trunc 16/16, fmod 16/16, div_true 6/6).
+    //
+    // #1171's census caught it: hagane_MulFunctor_float_a1_sB_wpt2_unrolled_contig
+    // resolved 228 times over 3 ARDY replans and exists in no metallib. It is a
+    // COVERAGE hole rather than a silent-wrong — the fall-through reaches MLX
+    // and the numbers are right, which is exactly why every numeric gate stayed
+    // green over it for the life of the route.
+    //
+    // THIS IS A MIRROR OF UPSTREAM'S CLASSIFICATION AND NOTHING ELSE. Set it
+    // only for an op whose .hip source calls the symmetric entry point, and
+    // NEVER infer it from a lookup miss: a route that fell back sA<->sB when a
+    // name failed to resolve would compute `a - b` as `b - a` the first time a
+    // non-commutative op took that path — correct-looking, and wrong. The swap
+    // is licensed by the op's algebra, not by the corpus's contents.
+    bool scalar_arm_symmetric = false;
 };
 
 inline constexpr BinaryOpConfig kEqCfg  = {"eq",  nullptr, &haganeOpsEq,  &cpu_dispatch_eq,  &fp64_eq };
@@ -205,7 +229,12 @@ inline constexpr BinaryOpConfig kLtCfg  = {"lt",  nullptr, &haganeOpsLt,  &cpu_d
 inline constexpr BinaryOpConfig kGtCfg  = {"gt",  nullptr, &haganeOpsGt,  &cpu_dispatch_gt,  &fp64_gt };
 inline constexpr BinaryOpConfig kLeCfg  = {"le",  nullptr, &haganeOpsLe,  &cpu_dispatch_le,  &fp64_le };
 inline constexpr BinaryOpConfig kGeCfg  = {"ge",  nullptr, &haganeOpsGe,  &cpu_dispatch_ge,  &fp64_ge };
-inline constexpr BinaryOpConfig kMulCfg = {"mul", "hagane_MulFunctor", &haganeOpsMul, &cpu_dispatch_mul, &fp64_mul};
+// #1172 — mul is the SYMMETRIC one. BinaryMulKernel.hip:34 calls
+// opmath_symmetric_gpu_kernel_with_scalars, so only the `_a1_sA` arm is
+// harvested and both operand orders must name it.
+inline constexpr BinaryOpConfig kMulCfg = {"mul", "hagane_MulFunctor", &haganeOpsMul, &cpu_dispatch_mul, &fp64_mul,
+                                           /*float_cpu_scalar_differs=*/false,
+                                           /*scalar_arm_symmetric=*/true};
 
 inline constexpr BinaryOpConfig kPowTtCfg     = {"pow_tt",    nullptr, &haganeOpsPow,       &cpu_dispatch_pow_tt,    nullptr  };
 inline constexpr BinaryOpConfig kAtan2Cfg     = {"atan2",     nullptr, &haganeOpsAtan2,     &cpu_dispatch_atan2,     nullptr  };
@@ -4654,13 +4683,57 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
             // with the captured scalar riding in the kernel's own parameter slot.
             const bool contig = iter.tensor(tin).is_contiguous()
                              && iter.tensor(0).is_contiguous();
-            if ((s1 != s2) && arm_faithful
+            // #1174 — HALF AND BFLOAT16 DECLINE, and this is a LIVE
+            // SILENT-WRONG being closed rather than a capability being held
+            // back. MEASURED: `half_tensor * 2.5` returned ALL ZEROS through
+            // this arm while HAGANE_USE_METALLIB_ROUTE=0 returned the right
+            // answer, on the DEFAULT path, before today.
+            //
+            // THE MECHANISM. The harvested kernel's scalar parameter is
+            // declared at the FUNCTOR's type, not the tensor's, and this
+            // function sends exactly element_size(0) bytes. `xcrun`-emitted MSL,
+            // read rather than assumed:
+            //
+            //   hagane_MulFunctor_half_a1_sA_...   constant float& a   4 bytes
+            //   hagane_DivFunctor_half_a1_sA_...   constant half&  a   2 bytes
+            //
+            // So the host writes 2 bytes of an fp16 bit pattern into a 4-byte
+            // float slot; the kernel reads ~2.3e-41, which flushes to zero, and
+            // every product is zero. The comment above this function claiming
+            // "the scalar param is declared at the STORAGE dtype" is true for
+            // gpu_kernel_with_scalars and FALSE for the opmath variants, whose
+            // functor is templated on at::opmath_type<scalar_t> = float for
+            // Half and BFloat16.
+            //
+            // AND IT IS NOT PREDICTABLE FROM THE SOURCE, which is why this is a
+            // dtype guard and not a per-op flag. BinaryDivTrueKernel.hip has
+            // BOTH an opmath branch (:32) and a scalar_t branch (:57) that
+            // mangle to the SAME kernel name, so which width the metallib
+            // carries is an accident of harvest order. A rule derived from the
+            // entry point would be a guess, and guessing is what produced the
+            // zeros.
+            //
+            // THE REAL FIX is for the launcher to ask the KERNEL how wide its
+            // scalar slot is (Metal exposes it through pipeline reflection) —
+            // #1174. Until that lands, these two dtypes take the MLX route,
+            // which the same A/B measured correct. float32 and the integer
+            // dtypes are unaffected: their storage width IS their opmath width,
+            // so no mismatch is possible.
+            const bool scalar_width_known =
+                iter.dtype() != at::kHalf && iter.dtype() != at::kBFloat16;
+            if ((s1 != s2) && arm_faithful && scalar_width_known
                 && iter.tensor(tin).scalar_type() == iter.dtype()
                 && iter.tensor(tin).sizes() == iter.tensor(0).sizes()) {
                 uint64_t bits = 0;
                 if (vendor_scalar_bytes(iter, s1 ? 1 : 2, iter.dtype(), &bits)) {
+                    // #1172 — a SYMMETRIC op has only the sA arm, because
+                    // upstream swaps the operands rather than emitting a second
+                    // kernel. `tin` already points at the tensor operand, so
+                    // binding is unchanged; only the NAME differs.
+                    const char* arm = (Cfg.scalar_arm_symmetric || s1)
+                                    ? "_a1_sA" : "_a1_sB";
                     std::string kname = metallib_kernel_name(
-                        Cfg.metallib_kernel, iter.dtype(), s1 ? "_a1_sA" : "_a1_sB",
+                        Cfg.metallib_kernel, iter.dtype(), arm,
                         contig ? "unrolled_contig" : "strided");
                     if (!kname.empty()) {
                         if (contig) {
