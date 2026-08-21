@@ -1182,6 +1182,105 @@ inline bool strided_elementwise_geometry(const char* R, TensorIteratorBase& iter
     return true;
 }
 
+// #1174 — RE-ENCODE A CAPTURED SCALAR AT THE WIDTH THE KERNEL DECLARES.
+//
+// The bug this replaces: every launcher below sized its by-value scalar from
+// something other than the kernel — the tensor's element width, sizeof(float) —
+// and `half_tensor * 2.5` returned ALL ZEROS on the default path because the
+// harvested functor keeps its argument at at::opmath_type<scalar_t>, which is
+// float for Half and BFloat16. Two bytes into a four-byte slot reads ~2.3e-41
+// and flushes to zero.
+//
+// It is not answerable from the source — mul's half arm declares float/4 and
+// div_true's declares half/2, because an opmath branch and a scalar_t branch
+// mangle to the same kernel name — so the runtime asks the compiled kernel
+// through pipeline reflection (haganeOpsKernelArgLayout) and this re-encodes
+// to the answer.
+//
+// EXACTNESS IS MEASURED, NOT ASSUMED. The value is decoded, re-encoded at the
+// declared type, and DECODED BACK; anything that does not round-trip bit-exact
+// declines. That is what keeps this from becoming a quieter version of the bug:
+// an int64 divisor squeezed into a declared int32 would look like a fix and
+// lose everything past 2^31, which is 1.11-A's defect with a new coat.
+//
+// `bits` is the scalar's raw bit pattern in `from` (vendor_scalar_bytes wrote
+// it), little-endian, and is rewritten in place. Returns false to DECLINE, and
+// a decline lands on the MLX route, which is correct — never an approximation.
+inline bool rebind_scalar_to_declared(uint64_t* bits, c10::ScalarType from,
+                                      int decl_type, unsigned decl_size) {
+    auto load_f = [&](double* out) -> bool {
+        switch (from) {
+            case c10::ScalarType::Float: {
+                float v; std::memcpy(&v, bits, 4); *out = (double)v; return true;
+            }
+            case c10::ScalarType::Half: {
+                c10::Half v; std::memcpy(&v, bits, 2); *out = (double)(float)v;
+                return true;
+            }
+            case c10::ScalarType::BFloat16: {
+                c10::BFloat16 v; std::memcpy(&v, bits, 2);
+                *out = (double)(float)v; return true;
+            }
+            default: return false;
+        }
+    };
+
+    // FLOAT-FAMILY -> the declared float family. Round-tripped through the
+    // declared type and compared against the source value.
+    double v = 0.0;
+    if (load_f(&v)) {
+        uint64_t out = 0;
+        double back = 0.0;
+        if (decl_type == HAGANE_ARG_TYPE_FLOAT && decl_size == 4) {
+            float f = (float)v; std::memcpy(&out, &f, 4); back = (double)f;
+        } else if (decl_type == HAGANE_ARG_TYPE_HALF && decl_size == 2) {
+            c10::Half h = (float)v; std::memcpy(&out, &h, 2);
+            back = (double)(float)h;
+        } else if (decl_type == HAGANE_ARG_TYPE_BFLOAT && decl_size == 2) {
+            c10::BFloat16 b = (float)v; std::memcpy(&out, &b, 2);
+            back = (double)(float)b;
+        } else {
+            return false;                      // not a float slot — decline
+        }
+        // NaN never compares equal to itself, so it is admitted by payload
+        // rather than by value; every other bit pattern must round-trip.
+        const bool nan_ok = (v != v) && (back != back);
+        if (!nan_ok && back != v) return false;
+        *bits = out;
+        return true;
+    }
+
+    // INTEGER-FAMILY. Only the identity width is accepted: the whole reason
+    // 1.11-A exists is that narrowing an integer scalar silently loses the top
+    // bits, and a widening one has no caller in the corpus to justify it.
+    if (c10::isIntegralType(from, /*includeBool=*/true)) {
+        return decl_size == (unsigned)c10::elementSize(from);
+    }
+    return false;
+}
+
+// The declared width of a launcher's by-value scalar, and whether the bits
+// needed re-encoding to match it. `arg_index` is the scalar's slot in the
+// kernel's own parameter order.
+//
+// A kernel with no reflection answers "unknown", and unknown keeps the caller's
+// original size — absence of information is not evidence of a mismatch, and
+// refusing what cannot be seen would take out every runtime-JIT kernel.
+inline bool resolve_scalar_width(const std::string& kname, unsigned arg_index,
+                                 c10::ScalarType from, uint64_t* bits,
+                                 size_t* size_inout) {
+    unsigned decl_size = 0;
+    int decl_type = HAGANE_ARG_TYPE_OTHER;
+    if (!::haganeOpsKernelArgLayout(kname.c_str(), arg_index, &decl_size,
+                                    &decl_type))
+        return true;                            // unknown: leave it alone
+    if (decl_size == *size_inout) return true;  // already agreed
+    if (!rebind_scalar_to_declared(bits, from, decl_type, decl_size))
+        return false;
+    *size_inout = decl_size;
+    return true;
+}
+
 // #1138 — the same op as try_launch_unary_metallib / try_launch_binary_scalar_
 // metallib when the INPUT is not contiguous. MLX ships no strided form of either
 // shape: every unary in the corpus is v_/v2_/vn_ and every scalar-operand binary
@@ -1235,9 +1334,17 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
     if (scalar_bits) {
         // The captured scalar sits between the output and N — the emitted
         // kernel's parameter order, and the same slot the contiguous launcher
-        // uses. Sized at the STORAGE element size because the harvested functor
-        // keeps its argument at scalar_t.
-        args[2] = &sc;      arg_types[2] = 1; arg_sizes[2] = iter.element_size(0);
+        // uses.
+        //
+        // #1174 — this comment used to end "Sized at the STORAGE element size
+        // because the harvested functor keeps its argument at scalar_t", the
+        // exact sentence that was wrong for the contiguous arm and returned
+        // zeros. The width is asked of the kernel here too; it is the same
+        // premise, so it was the same bug waiting for a strided fp16 multiply.
+        size_t sc_bytes = static_cast<size_t>(iter.element_size(0));
+        if (!resolve_scalar_width(kname, 2, iter.dtype(), &sc, &sc_bytes))
+            return decline(R, nullptr, "scalar_width");
+        args[2] = &sc;      arg_types[2] = 1; arg_sizes[2] = sc_bytes;
         args[3] = &N;       arg_types[3] = 1; arg_sizes[3] = sizeof(int);
         args[4] = e3;       arg_types[4] = 1; arg_sizes[4] = sizeof(e3);
         args[5] = s3;       arg_types[5] = 1; arg_sizes[5] = sizeof(s3);
@@ -4441,10 +4548,24 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     const int wpt = metallib_work_per_thread(iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
+    // #1174 — this sent sizeof(float) on the stated belief that the `_a1_s1`
+    // arm's scalar "is always float". A corpus-wide reflection census says it
+    // IS, for all 24 such kernels shipped today — so the guess was right, and
+    // that is exactly the problem: it was right by luck, out of the same family
+    // of assumptions that returned zeros for the binary arm. Ask instead.
+    size_t sc_bytes = sizeof(float);
+    {
+        uint64_t sc_bits = 0;
+        std::memcpy(&sc_bits, &sc, sizeof(float));
+        if (!resolve_scalar_width(kname, 2, c10::ScalarType::Float,
+                                  &sc_bits, &sc_bytes))
+            return false;
+        std::memcpy(&sc, &sc_bits, sizeof(float));
+    }
     void*  args[]      = {d_in, d_out, &sc, &N};
     int    arg_types[] = {HAGANE_ARG_BUFFER_IN, HAGANE_ARG_BUFFER_OUT,
                           HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
-    size_t arg_sizes[] = {in_bytes, out_bytes, sizeof(float), sizeof(int)};
+    size_t arg_sizes[] = {in_bytes, out_bytes, sc_bytes, sizeof(int)};
     if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
                                    args, arg_types, arg_sizes, 4) != hipSuccess)
         return false;
@@ -4481,12 +4602,17 @@ inline bool try_launch_binary_scalar_metallib(const std::string& kname,
     const size_t in_bytes  = static_cast<size_t>(N) * iter.element_size(in_idx);
     const size_t out_bytes = static_cast<size_t>(N) * iter.element_size(0);
     flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
-    // The scalar param is declared at the STORAGE dtype in the harvested
-    // kernel (gpu_kernel_with_scalars keeps the functor's arg at scalar_t), so
-    // setBytes gets exactly element_size bytes — the low bytes of `sc` on this
-    // little-endian target, which is where vendor_scalar_bytes wrote them.
+    // #1174 — THE WIDTH COMES FROM THE KERNEL, not from the tensor.
+    //
+    // This used to read "the scalar param is declared at the STORAGE dtype in
+    // the harvested kernel", which is true for gpu_kernel_with_scalars and
+    // FALSE for every opmath variant — and that sentence is what returned zeros
+    // for `half_tensor * 2.5` on the default path. The scalar is now re-encoded
+    // to whatever the compiled kernel declares, or the route declines.
     uint64_t sc = scalar_bits;
-    const size_t esz = static_cast<size_t>(iter.element_size(0));
+    size_t esz = static_cast<size_t>(iter.element_size(0));
+    if (!resolve_scalar_width(kname, 2, iter.dtype(), &sc, &esz))
+        return false;
     const int wpt = metallib_work_per_thread(iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
@@ -4683,45 +4809,35 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
             // with the captured scalar riding in the kernel's own parameter slot.
             const bool contig = iter.tensor(tin).is_contiguous()
                              && iter.tensor(0).is_contiguous();
-            // #1174 — HALF AND BFLOAT16 DECLINE, and this is a LIVE
-            // SILENT-WRONG being closed rather than a capability being held
-            // back. MEASURED: `half_tensor * 2.5` returned ALL ZEROS through
-            // this arm while HAGANE_USE_METALLIB_ROUTE=0 returned the right
-            // answer, on the DEFAULT path, before today.
+            // #1174 — THE DTYPE GUARD IS GONE, and half/bfloat16 are back on
+            // this arm, because the launcher no longer has to guess.
             //
-            // THE MECHANISM. The harvested kernel's scalar parameter is
-            // declared at the FUNCTOR's type, not the tensor's, and this
-            // function sends exactly element_size(0) bytes. `xcrun`-emitted MSL,
-            // read rather than assumed:
+            // WHAT IT WAS. `half_tensor * 2.5` returned ALL ZEROS through this
+            // arm on the DEFAULT path: the harvested kernel declares its scalar
+            // at the FUNCTOR's type — at::opmath_type<scalar_t>, so float for
+            // Half and BFloat16 — while this route sent element_size(0) bytes.
+            // Two bytes of an fp16 pattern in a four-byte float slot read
+            // ~2.3e-41, which flushes to zero. `xcrun`-emitted MSL, read rather
+            // than assumed, and the pair that makes it unanswerable from source:
             //
             //   hagane_MulFunctor_half_a1_sA_...   constant float& a   4 bytes
             //   hagane_DivFunctor_half_a1_sA_...   constant half&  a   2 bytes
             //
-            // So the host writes 2 bytes of an fp16 bit pattern into a 4-byte
-            // float slot; the kernel reads ~2.3e-41, which flushes to zero, and
-            // every product is zero. The comment above this function claiming
-            // "the scalar param is declared at the STORAGE dtype" is true for
-            // gpu_kernel_with_scalars and FALSE for the opmath variants, whose
-            // functor is templated on at::opmath_type<scalar_t> = float for
-            // Half and BFloat16.
+            // Same family, same dtype, same arm, different widths — because
+            // BinaryDivTrueKernel.hip has both an opmath branch (:32) and a
+            // scalar_t branch (:57) that mangle to the SAME name, so which one
+            // the metallib carries is an accident of harvest order. Any rule
+            // derived from the entry point is a guess, and the guess is what
+            // produced the zeros.
             //
-            // AND IT IS NOT PREDICTABLE FROM THE SOURCE, which is why this is a
-            // dtype guard and not a per-op flag. BinaryDivTrueKernel.hip has
-            // BOTH an opmath branch (:32) and a scalar_t branch (:57) that
-            // mangle to the SAME kernel name, so which width the metallib
-            // carries is an accident of harvest order. A rule derived from the
-            // entry point would be a guess, and guessing is what produced the
-            // zeros.
-            //
-            // THE REAL FIX is for the launcher to ask the KERNEL how wide its
-            // scalar slot is (Metal exposes it through pipeline reflection) —
-            // #1174. Until that lands, these two dtypes take the MLX route,
-            // which the same A/B measured correct. float32 and the integer
-            // dtypes are unaffected: their storage width IS their opmath width,
-            // so no mismatch is possible.
-            const bool scalar_width_known =
-                iter.dtype() != at::kHalf && iter.dtype() != at::kBFloat16;
-            if ((s1 != s2) && arm_faithful && scalar_width_known
+            // WHAT REPLACED IT. try_launch_binary_scalar_metallib now asks the
+            // COMPILED KERNEL through pipeline reflection and re-encodes the
+            // scalar to the declared type, round-trip-verified; if it cannot do
+            // that exactly it declines and MLX answers, which the original A/B
+            // measured correct. So the dtype no longer decides anything here —
+            // the kernel does, per kernel, which is the only place the answer
+            // has ever actually lived.
+            if ((s1 != s2) && arm_faithful
                 && iter.tensor(tin).scalar_type() == iter.dtype()
                 && iter.tensor(tin).sizes() == iter.tensor(0).sizes()) {
                 uint64_t bits = 0;
