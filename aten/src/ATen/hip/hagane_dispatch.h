@@ -452,6 +452,25 @@ struct BinaryAlphaOpConfig {
                     const haganeOpsTensor_t*, float alpha);
     void (*cpu_fallback)(TensorIteratorBase&, const Scalar& alpha);
     Tensor (*at_fp64_fn)(const Tensor&, const Tensor&, const Scalar& alpha);
+    // #1190 — WHAT THE SCALAR IS. Two different meanings share this config, and
+    // #1026's exactness guard is correct for exactly one of them.
+    //
+    //   ADDEND (add/sub): the op computes `a + alpha*b`. Rounding alpha to
+    //     float32 changes the ANSWER for the integer dtypes, so the guard is
+    //     load-bearing there — measured, torch.add(int64, 3, alpha=2**24+1)
+    //     came back 4 off.
+    //
+    //   PARAMETER (leaky_relu_backward's negative_slope, logit_backward's eps):
+    //     the scalar is not an addend at all, it configures the kernel. CUDA's
+    //     own kernels take it as `float` (Activation.cu's opmath_t for these is
+    //     float), so float32 IS the reference contract and there is nothing to
+    //     be exact about.
+    //
+    // Applying the ADDEND guard to a PARAMETER declines every value a human
+    // types — 0.07, 0.1, 0.2, 0.3 are none of them exact in float32 — and sends
+    // the op to the CPU fallback. Measured 8/8: exact slopes (0.5, 0.25, 1/64,
+    // 1.0) routed with 0 host fallbacks; inexact ones took 1 each.
+    bool alpha_is_addend = true;
 };
 
 inline constexpr BinaryAlphaOpConfig kAddCfg = {"add", nullptr, &haganeOpsAdd, &cpu_fallback_add, &fp64_add_alpha};
@@ -461,14 +480,14 @@ inline constexpr BinaryAlphaOpConfig kSubCfg = {"sub", nullptr, &haganeOpsSub, &
 // TORCH_META_FUNC builds the iter with pos 1 = self_or_result, pos 2 = grad_out
 // (Activation.cpp:190) — leaky_relu_backward_wrap inverts to match C-ABI's
 // (grad_out, input, grad_in, negval) signature.
-inline constexpr BinaryAlphaOpConfig kLeakyReluBackwardCfg = {"leaky_relu_backward", nullptr, &leaky_relu_backward_wrap, &cpu_dispatch_leaky_relu_backward, nullptr};
+inline constexpr BinaryAlphaOpConfig kLeakyReluBackwardCfg = {"leaky_relu_backward", nullptr, &leaky_relu_backward_wrap, &cpu_dispatch_leaky_relu_backward, nullptr, /*alpha_is_addend=*/false};
 
 // X+28 Lane A — logit_backward via BinaryAlphaOpConfig (binary_fn_alpha =
 // void(*)(TensorIteratorBase&, const Scalar&)). TORCH_META_FUNC at
 // BinaryOps.cpp:306 builds iter as (out, grad_output, input); eps threaded
 // through alpha. C-ABI signature is (grad_out, input, grad_in, eps) — direct
 // match, no swap shim.
-inline constexpr BinaryAlphaOpConfig kLogitBackwardCfg = {"logit_backward", nullptr, &haganeOpsLogitBackward, &cpu_dispatch_logit_backward, nullptr};
+inline constexpr BinaryAlphaOpConfig kLogitBackwardCfg = {"logit_backward", nullptr, &haganeOpsLogitBackward, &cpu_dispatch_logit_backward, nullptr, /*alpha_is_addend=*/false};
 
 
 // ---- Unary-scalar-op configuration ----------------------------------------
@@ -4165,7 +4184,26 @@ inline bool try_normal_metallib(const char* torch_op, const at::TensorBase& out,
     const char* R = "normal";
     if (!random_metallib_available()) return false;
     route_enter(R, torch_op);
-    if (haganeOpsTapeRecording()) return decline(R, torch_op, "tape_recording");
+    // #1156 — no `tape_recording` decline; the output buffer is declared below.
+    //
+    // MEASURED 2026-08-22 before this line was removed: the decline protected
+    // NOTHING. `hagane_normal_kernel` draws (seed, offset) from
+    // CUDAGeneratorImpl::philox_engine_inputs, which opens with
+    // at::cuda::assertNotCapturing, and Hagane's hipStreamIsCapturing is a real
+    // implementation reading g_capture_map (hip_stubs.cpp:817). So randn /
+    // normal_ / rand / dropout all RAISE during a capture, before this route or
+    // the MLX fallback is reached — verified for all four, with relu as the
+    // control that captures.
+    //
+    // That is an honest refusal, not a wrong answer, and it is also a real gap
+    // against CUDA, where normal_ takes a PhiloxCudaState and a captured graph's
+    // RNG advances per replay. Closing it is #1189, and the note there is the
+    // one that matters here: a captured sampler must read its Philox state from
+    // DEVICE MEMORY. Baking (seed, offset) into the tape as by-value scalars —
+    // which is what this route's declaration below does, and equally what
+    // haganeOpsNormal's value node would do — makes every replay reproduce the
+    // same samples. Neither path is capture-correct today; the generator's
+    // assert is what makes that unobservable rather than silent.
     if (!out.defined()) return decline(R, torch_op, "undefined_operand");
     if (!out.is_cuda()) return decline(R, torch_op, "not_device");
     const char* dsfx = nullptr;
@@ -4196,8 +4234,11 @@ inline bool try_normal_metallib(const char* torch_op, const at::TensorBase& out,
     uint64_t c_seed = seed, c_off = offset;
     float    c_mean = static_cast<float>(mean), c_std = static_cast<float>(std);
     void*  args[]  = {p_out, &c_numel, &c_seed, &c_off, &c_mean, &c_std};
-    int    at_[]   = {0, 1, 1, 1, 1, 1};
-    size_t as_[]   = {0, sizeof(int64_t), sizeof(uint64_t), sizeof(uint64_t),
+    // #1156 — a sample covers every byte of the contiguous output and reads
+    // nothing, so the extent is the whole block and the direction is OUT.
+    int    at_[]   = {HAGANE_ARG_BUFFER_OUT, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                      HAGANE_ARG_SCALAR,     HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
+    size_t as_[]   = {bytes, sizeof(int64_t), sizeof(uint64_t), sizeof(uint64_t),
                       sizeof(float), sizeof(float)};
     dim3 block(policy.block_size, 1, 1), grid(policy.grid_x, 1, 1);
     if (hagane_launch_kernel_mixed_tracked(kname.c_str(), grid, block, 0, nullptr,
@@ -5056,7 +5097,12 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
     // This is a decline, not a route: the route is `tmp = alpha*b; out = a+tmp`
     // as two owned dispatches, which is 1.7b's shape and a follow-on. Keeping a
     // silent-wrong until then is not an option the project has.
-    if (!alpha_expressible_in_float(iter.common_dtype(), alpha)) {
+    // #1190 — the guard belongs to `a + alpha*b`, not to a kernel parameter.
+    // See BinaryAlphaOpConfig::alpha_is_addend for why, and for the 8/8
+    // measurement that named this as the reason leaky_relu_backward and
+    // logit_backward left the GPU on every call.
+    if (Cfg.alpha_is_addend &&
+        !alpha_expressible_in_float(iter.common_dtype(), alpha)) {
         (void)decline("bin_alpha", Cfg.op_name, "alpha_not_float_exact");
         ::haganeOpsFlush();
         ::haganeOpsHostFallbackNote(Cfg.op_name, "route_declined");
