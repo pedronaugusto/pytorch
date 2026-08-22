@@ -162,6 +162,57 @@ inline std::string metallib_dir() {
     return (dir && *dir) ? std::string(dir) : std::string();
 }
 
+// ---- The CPU-delegation boundary ------------------------------------------
+//
+// #1192 — ONE boundary, for both families that have it.
+//
+// Hagane hands work to a host kernel from two places, and until this helper
+// they did not do the same thing:
+//
+//   HaganeOps.cpp   HAGANE_BEFORE_RAW_READ() -> haganeOpsSettleForCpuKernel()
+//   these bridges   ::haganeOpsFlush()                          <- 31 sites
+//
+// haganeOpsFlush() lands the lazy stash and, only when output pinning is on
+// (it is off), commits MLX's encoder. It does not drain Hagane's own queue and
+// it does not touch the capture. So a bridge decline was missing three things
+// the other family has had since tracker 1.53:
+//
+//   1. no read barrier  — the CPU loop can read bytes a queued kernel has not
+//      written yet;
+//   2. no write barrier — its host stores are not queue-ordered, so an
+//      outstanding kernel owning that block lands ON TOP of them. That is
+//      #1190's mechanism exactly: leaky_relu_backward returned the discarded
+//      temporary bit-for-bit, and HAGANE_HOST_WRITE_BARRIER_ALWAYS=1 changed
+//      nothing because this path never reached a barrier at all;
+//   3. no capture taint — MEASURED, not inferred. `torch.add(int64, 3,
+//      alpha=2**24+1)` declines here; captured in a hipGraph it recorded
+//      NOTHING, the capture succeeded, the replay succeeded, and the answer
+//      was the capture-time constant — off by 1000 against a changed input,
+//      with an intermittent hard crash (2 runs in 3) on the first D2H after
+//      the replay. #1149's hazard, with the guard that exists to refuse it
+//      never firing.
+//
+// haganeOpsSettleForCpuKernel() does all three, and its own doc comment in
+// hagane_ops.h already named these callers — "PyTorch's CPU kernels reached
+// via index_stub(DeviceType::CPU, ...) AND FRIENDS". These are the friends.
+//
+// It is not a cheaper barrier on purpose. The ranged host_write_barrier would
+// let #1144's disjoint-skip apply, but a CPU kernel reads its inputs as well
+// as writing its output, and a decline is already a full host round-trip that
+// costs far more than a drain. Measured before choosing: an ARDY replan and
+// the standing built-in workload both take ZERO host fallbacks, so this
+// boundary costs both of them nothing.
+//
+// Call it INSTEAD of the flush+note pair, never beside it — the note is folded
+// in so the counter and the barrier cannot drift apart the way the barrier and
+// the taint just did. scripts/test_architecture_conformance.py holds the
+// invariant that no bridge reaches a CPU kernel any other way.
+inline void hagane_cpu_fallback_boundary(const char* op_name,
+                                         const char* reason) {
+    ::haganeOpsHostFallbackNote(op_name, reason);
+    ::haganeOpsSettleForCpuKernel();
+}
+
 // ---- Per-op fp64 trampolines ----------------------------------------------
 // Pin a uniform function-pointer signature for the OpConfig tables and
 // sidestep `at::*` overload-resolution ambiguity.

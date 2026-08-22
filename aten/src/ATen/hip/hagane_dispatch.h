@@ -4695,9 +4695,18 @@ inline bool try_launch_binary_scalar_metallib(const std::string& kname,
 //
 // Everything else — no cpu scalar in play — runs the stub directly on the
 // caller's iterator, unchanged, which keeps gcd/lcm byte-identical.
-inline void run_binary_cpu_fallback(TensorIteratorBase& iter,
+inline void run_binary_cpu_fallback(const char* op_name,
+                                    TensorIteratorBase& iter,
                                     void (*stub)(TensorIteratorBase&)) {
-    if (iter.ninputs() != 2) { ::haganeOpsFlush(); stub(iter); return; }
+    // #1192 — the CPU-delegation boundary is taken HERE, not at the call site,
+    // so this helper cannot be reached without it. Both arms below hand work to
+    // a host kernel and both need it: the `ninputs() != 2` arm punts the
+    // caller's DEVICE iterator straight at a CPU loop, and the arm below —
+    // which does copy through the host properly — still needs the capture
+    // TAINT, because a graph that records neither arm replays whatever the
+    // capture happened to compute.
+    hagane_cpu_fallback_boundary(op_name, "no_device_route");
+    if (iter.ninputs() != 2) { stub(iter); return; }
 
     // Every operand is brought over with torch's own `.to(CPU)`, which is a
     // real D2H copy and therefore respects the deferred-write barrier. Handing
@@ -4708,7 +4717,9 @@ inline void run_binary_cpu_fallback(TensorIteratorBase& iter,
     // broadcast `floor_divide` raised "ZeroDivisionError" because the divisor
     // buffer still read as zeros, and haganeOpsFlush() alone did not settle it.
     // #1025's rule again — enumerate the readers of a deferred write by the
-    // QUEUE they run on, not by function name.
+    // QUEUE they run on, not by function name. That observation was about ONE
+    // arm of ONE helper; #1192 found it held for all 31 bridge fallbacks, which
+    // is why the boundary above is now the same one HaganeOps.cpp takes.
     at::Tensor in[2];
     for (int i = 1; i <= 2; ++i)
         in[i - 1] = iter.tensor(i).to(c10::DeviceType::CPU);
@@ -4782,8 +4793,7 @@ inline void hagane_kernel_bridge(TensorIteratorBase& iter) {
         auto out = make_ops_tensor_local(iter, 0);
         auto in  = make_ops_tensor_local(iter, 1);
         if (Cfg.c_abi_fn(&in, &out) != HAGANE_OPS_SUCCESS) {
-            ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
-            ::haganeOpsFlush();
+            hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
             Cfg.cpu_fallback(iter);
         }
     }
@@ -4917,16 +4927,14 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
         // fallthrough (route-off/unsupported). run_binary_cpu_fallback is the
         // plain stub call unless the iterator carries an unpromoted cpu scalar,
         // which the CPU loops abort on — see its comment.
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "no_device_route");
-        run_binary_cpu_fallback(iter, Cfg.cpu_fallback);
+        run_binary_cpu_fallback(Cfg.op_name, iter, Cfg.cpu_fallback);
     } else {
         auto out = make_ops_tensor_local(iter, 0);
         at::Tensor sa, sb;
         auto a = make_ops_tensor_or_scalar_local(iter, 1, sa);
         auto b = make_ops_tensor_or_scalar_local(iter, 2, sb);
         if (Cfg.c_abi_fn(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-            ::haganeOpsFlush();
-            ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+            hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
             Cfg.cpu_fallback(iter);
         }
     }
@@ -4952,8 +4960,7 @@ inline void hagane_binary_iter_bridge(TensorIterator& iter) {
     auto a = make_ops_tensor_or_scalar_local(iter, 1, sa);
     auto b = make_ops_tensor_or_scalar_local(iter, 2, sb);
     if (Cfg.c_abi_fn(&a, &b, &out) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter);
     }
 }
@@ -5007,8 +5014,7 @@ inline void hagane_unary_iter_bridge(TensorIterator& iter) {
     auto out = make_ops_tensor_local(iter, 0);
     auto in  = make_ops_tensor_local(iter, 1);
     if (Cfg.c_abi_fn(&in, &out) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter);
     }
 }
@@ -5057,8 +5063,7 @@ inline void hagane_unary_iter_flag_bridge(TensorIterator& iter, const Scalar& p)
     if (dim < 0) dim = static_cast<int32_t>(in_t.dim() - 1);
 
     if (Cfg.c_abi_fn(&in, &out, p.toDouble(), dim) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter, p);
     }
 }
@@ -5104,8 +5109,7 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
     if (Cfg.alpha_is_addend &&
         !alpha_expressible_in_float(iter.common_dtype(), alpha)) {
         (void)decline("bin_alpha", Cfg.op_name, "alpha_not_float_exact");
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "route_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "route_declined");
         Cfg.cpu_fallback(iter, alpha);
         return;
     }
@@ -5117,8 +5121,7 @@ inline void hagane_binary_alpha_bridge(TensorIteratorBase& iter, const Scalar& a
     auto a = make_ops_tensor_or_scalar_local(iter, 1, sa);
     auto b = make_ops_tensor_or_scalar_local(iter, 2, sb);
     if (Cfg.c_abi_fn(&a, &b, &out, alpha.toFloat()) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter, alpha);
     }
 }
@@ -5152,8 +5155,7 @@ inline void hagane_unary_scalar_bridge(TensorIteratorBase& iter, const Scalar& s
     auto out = make_ops_tensor_local(iter, 0);
     auto in  = make_ops_tensor_local(iter, 1);
     if (Cfg.c_abi_fn(&in, &out, scalar.toFloat()) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter, scalar);
     }
 }
@@ -5180,7 +5182,7 @@ inline void hagane_cum_bridge_structured(const Tensor& self, const Tensor& resul
     haganeOpsTensor_t in  = make_ops_tensor_from_tensor(self);
     haganeOpsTensor_t out = make_ops_tensor_from_tensor(result);
     if (Cfg.c_abi_fn(&in, &out, dim32) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_structured_fn(self, result, dim);
     }
 }
@@ -5191,7 +5193,7 @@ inline void hagane_cum_bridge_mutable(Tensor& result, const Tensor& self, int64_
     haganeOpsTensor_t out = make_ops_tensor_from_tensor(result);
     int32_t dim32 = static_cast<int32_t>(dim < 0 ? dim + self.dim() : dim);
     if (Cfg.c_abi_fn(&in, &out, dim32) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_mutable_fn(result, self, dim);
     }
 }
@@ -5209,16 +5211,14 @@ inline void hagane_unary_iter_stdvar_bridge(TensorIterator& iter,
     auto var_out = make_ops_tensor_local(iter, 0);
     auto in      = make_ops_tensor_local(iter, nout);
     if (Cfg.c_abi_fn(&in, &var_out, correction, take_sqrt) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter, correction, take_sqrt);
         return;
     }
     if (nout == 2) {
         auto mean_out = make_ops_tensor_local(iter, 1);
         if (haganeOpsMean(&in, &mean_out) != HAGANE_OPS_SUCCESS) {
-            ::haganeOpsFlush();
-            ::haganeOpsHostFallbackNote(Cfg.op_name, "route_declined");
+            hagane_cpu_fallback_boundary(Cfg.op_name, "route_declined");
             Cfg.cpu_fallback(iter, correction, take_sqrt);
         }
     }
@@ -5252,8 +5252,7 @@ inline void hagane_unary_optional_triple_bridge(TensorIteratorBase& iter,
     double p = pos_inf_val.value_or(std::numeric_limits<double>::max());
     double m = neg_inf_val.value_or(std::numeric_limits<double>::lowest());
     if (Cfg.c_abi_fn(&in, &out, n, p, m) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter, nan_val, pos_inf_val, neg_inf_val);
     }
 }
@@ -5290,8 +5289,7 @@ inline void hagane_elu_backward_bridge(TensorIteratorBase& iter,
     if (Cfg.c_abi_fn(&a, &b, &out,
                      alpha.toFloat(), scale.toFloat(), input_scale.toFloat(),
                      is_result) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter, alpha, scale, input_scale, is_result);
     }
 }
@@ -5319,8 +5317,7 @@ inline void hagane_binary_double_scalar_bridge(TensorIteratorBase& iter,
     auto a = make_ops_tensor_or_scalar_local(iter, 1, sa);
     auto b = make_ops_tensor_or_scalar_local(iter, 2, sb);
     if (Cfg.c_abi_fn(&a, &b, &out, s1.toFloat(), s2.toFloat()) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback_base(iter, s1, s2);
     }
 }
@@ -5333,8 +5330,7 @@ inline void hagane_binary_double_scalar_iter_bridge(TensorIterator& iter,
     auto a = make_ops_tensor_or_scalar_local(iter, 1, sa);
     auto b = make_ops_tensor_or_scalar_local(iter, 2, sb);
     if (Cfg.c_abi_fn(&a, &b, &out, s1.toFloat(), s2.toFloat()) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback_iter(iter, s1, s2);
     }
 }
@@ -5400,8 +5396,7 @@ inline void hagane_upsample_scale1d_bridge(
     auto grad_in_d  = make_ops_tensor_local_t(grad_input);
     auto grad_out_d = make_ops_tensor_local_t(grad_output);
     if (Cfg.c_abi_fn(&grad_out_d, &grad_in_d, Cfg.exact ? 1 : 0) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(grad_input, grad_output, scales_w);
     }
 }
@@ -5412,8 +5407,7 @@ inline void hagane_upsample_scale2d_bridge(
     auto grad_in_d  = make_ops_tensor_local_t(grad_input);
     auto grad_out_d = make_ops_tensor_local_t(grad_output);
     if (Cfg.c_abi_fn(&grad_out_d, &grad_in_d, Cfg.exact ? 1 : 0) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(grad_input, grad_output, scales_h, scales_w);
     }
 }
@@ -5425,8 +5419,7 @@ inline void hagane_upsample_scale3d_bridge(
     auto grad_in_d  = make_ops_tensor_local_t(grad_input);
     auto grad_out_d = make_ops_tensor_local_t(grad_output);
     if (Cfg.c_abi_fn(&grad_out_d, &grad_in_d, Cfg.exact ? 1 : 0) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(grad_input, grad_output, scales_d, scales_h, scales_w);
     }
 }
@@ -5493,8 +5486,7 @@ inline void hagane_upsample_scale_alignc_1d_bridge(
     auto grad_in_d  = make_ops_tensor_local_t(grad_input);
     auto grad_out_d = make_ops_tensor_local_t(grad_output);
     if (Cfg.c_abi_fn(&grad_out_d, &grad_in_d, align_corners ? 1 : 0) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(grad_input, grad_output, align_corners, scales_w);
     }
 }
@@ -5506,8 +5498,7 @@ inline void hagane_upsample_scale_alignc_2d_bridge(
     auto grad_in_d  = make_ops_tensor_local_t(grad_input);
     auto grad_out_d = make_ops_tensor_local_t(grad_output);
     if (Cfg.c_abi_fn(&grad_out_d, &grad_in_d, align_corners ? 1 : 0) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(grad_input, grad_output, align_corners, scales_h, scales_w);
     }
 }
@@ -5520,8 +5511,7 @@ inline void hagane_upsample_scale_alignc_3d_bridge(
     auto grad_in_d  = make_ops_tensor_local_t(grad_input);
     auto grad_out_d = make_ops_tensor_local_t(grad_output);
     if (Cfg.c_abi_fn(&grad_out_d, &grad_in_d, align_corners ? 1 : 0) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(grad_input, grad_output, align_corners, scales_d, scales_h, scales_w);
     }
 }
@@ -5657,8 +5647,7 @@ inline void hagane_avg_pool2d_backward_bridge(
     if (Cfg.c_abi_fn(&go, &gi, kH, kW, dH, dW, padH, padW,
                      count_include_pad ? 1 : 0,
                      divisor_override.value_or(0)) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(gradInput, gradOutput, kW, kH, dW, dH, padW, padH,
                          count_include_pad, divisor_override);
     }
@@ -5674,8 +5663,7 @@ inline void hagane_avg_pool3d_backward_bridge(
     if (Cfg.c_abi_fn(&go, &gi, kD, kH, kW, dD, dH, dW, padD, padH, padW,
                      count_include_pad ? 1 : 0,
                      divisor_override.value_or(0)) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(gradInput, gradOutput, kW, kH, kD, dW, dH, dD,
                          padW, padH, padD, count_include_pad, divisor_override);
     }
@@ -5687,8 +5675,7 @@ inline void hagane_max_pool3d_backward_bridge(
     auto go  = make_ops_tensor_local_t(gradOutput);
     auto idx = make_ops_tensor_local_t(indices);
     if (Cfg.c_abi_fn(&go, &gi, &idx) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(gradInput, gradOutput, indices);
     }
 }
@@ -5699,8 +5686,7 @@ inline void hagane_pool_backward_with_indices_bridge(
     auto go  = make_ops_tensor_local_t(gradOutput);
     auto idx = make_ops_tensor_local_t(indices);
     if (Cfg.c_abi_fn(&go, &gi, &idx) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(gradInput, gradOutput, indices);
     }
 }
@@ -5714,8 +5700,7 @@ inline void hagane_adaptive_avg_pool_backward_bridge(
     auto gi = make_ops_tensor_local_t(gradInput);
     auto go = make_ops_tensor_local_t(gradOutput);
     if (Cfg.c_abi_fn(&go, &gi) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(gradInput, gradOutput);
     }
 }
@@ -5730,8 +5715,7 @@ inline void hagane_adaptive_avg_pool_forward_bridge(
     auto i = make_ops_tensor_local_t(input);
     auto o = make_ops_tensor_local_t(output);
     if (Cfg.c_abi_fn(&i, &o) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(output, input, output_size);
     }
 }
@@ -5751,8 +5735,7 @@ inline void hagane_avg_pool2d_forward_bridge(
                      (int)padH, (int)padW,
                      count_include_pad ? 1 : 0,
                      divisor_override.value_or(0)) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(output, input, kW, kH, dW, dH, padW, padH,
                          count_include_pad, divisor_override);
     }
@@ -5770,8 +5753,7 @@ inline void hagane_avg_pool3d_forward_bridge(
                      (int)padD, (int)padH, (int)padW,
                      count_include_pad ? 1 : 0,
                      divisor_override.value_or(0)) != HAGANE_OPS_SUCCESS) {
-        ::haganeOpsFlush();
-        ::haganeOpsHostFallbackNote(Cfg.op_name, "c_abi_declined");
+        hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(output, input, kW, kH, kD, dW, dH, dD,
                          padW, padH, padD, count_include_pad, divisor_override);
     }
