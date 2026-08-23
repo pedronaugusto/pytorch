@@ -360,6 +360,10 @@ TORCH_IMPL_FUNC(ufunc_add_CUDA)(const at::Tensor& self, const at::Tensor& other,
 // These are called directly (not through DispatchStub) from compiled .cpp files.
 // ---------------------------------------------------------------------------
 
+// Forward-declared because the two gelu entries below sit ABOVE its definition
+// and must not hand-roll their own copy of it — see #1210.
+static int32_t hagane_dtype(c10::ScalarType st);
+
 C10_EXPORT void GeluCUDAKernelImpl(TensorIteratorBase& iter, GeluType approximate) {
   // 1.8: our own transpiled kernel first — MLX ships no gelu, so this is the
   // only path that computes it in one dispatch into the caller's own block.
@@ -381,11 +385,19 @@ C10_EXPORT void GeluCUDAKernelImpl(TensorIteratorBase& iter, GeluType approximat
           static_cast<int32_t>(out_t.dim()), HAGANE_DTYPE_FLOAT32 };
   in = { iter.data_ptr(1), in_t.sizes().data(), in_t.strides().data(),
          static_cast<int32_t>(in_t.dim()), HAGANE_DTYPE_FLOAT32 };
-  // Map ScalarType
-  auto st = iter.dtype();
-  int32_t dt = HAGANE_DTYPE_FLOAT32;
-  if (st == c10::ScalarType::Half) dt = HAGANE_DTYPE_FLOAT16;
-  else if (st == c10::ScalarType::BFloat16) dt = HAGANE_DTYPE_BFLOAT16;
+  // #1210 — hagane_dtype(), NOT a hand-rolled map. This site listed only Half
+  // and BFloat16, so a float64 tensor was DESCRIBED AS FLOAT32 and the descriptor
+  // lied about the element width in both directions: wrap_tensor read N float32
+  // out of an 8N-byte buffer (the low and high words of the first N/2 doubles,
+  // type-punned), and copy_result wrote 4N bytes into an 8N-byte output, leaving
+  // the SECOND HALF holding whatever the allocator last put there. Measured
+  // poison-verified, forward and backward — an nn.GELU model training in float64
+  // got the previous tenant's memory as its gradient.
+  //
+  // The metallib arm above is not involved and that is worth recording: its
+  // metallib_dtype_tag(Double) returns nullptr, so it declines fp64 correctly.
+  // Only this fallback punned it — the two arms disagreed about what fp64 means.
+  const int32_t dt = hagane_dtype(iter.dtype());
   out.dtype = dt;
   in.dtype = dt;
   // haganeOpsGeluApprox, not haganeOpsGelu: the declined path has to honour
@@ -407,10 +419,7 @@ C10_EXPORT void GeluBackwardCUDAKernelImpl(TensorIteratorBase& iter, GeluType ap
   const at::Tensor& gi_t   = iter.tensor(0);  // grad_input (output)
   const at::Tensor& go_t   = iter.tensor(1);  // grad_output (dy)
   const at::Tensor& self_t = iter.tensor(2);  // self (x)
-  auto st = iter.dtype();
-  int32_t dt = HAGANE_DTYPE_FLOAT32;
-  if (st == c10::ScalarType::Half) dt = HAGANE_DTYPE_FLOAT16;
-  else if (st == c10::ScalarType::BFloat16) dt = HAGANE_DTYPE_BFLOAT16;
+  const int32_t dt = hagane_dtype(iter.dtype());   // #1210 — see the forward pass
   haganeOpsTensor_t gi   = { iter.data_ptr(0), gi_t.sizes().data(), gi_t.strides().data(),
                              static_cast<int32_t>(gi_t.dim()), dt };
   haganeOpsTensor_t go   = { iter.data_ptr(1), go_t.sizes().data(), go_t.strides().data(),
@@ -8080,15 +8089,15 @@ C10_EXPORT Tensor group_gemm_ck(
 
 namespace {
 
-inline int32_t hagane_dtype_for_scalar_type(c10::ScalarType st) {
-  switch (st) {
-    case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
-    case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
-    case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
-    default:                        return HAGANE_DTYPE_FLOAT32;
-  }
-}
-
+// #1210 — `hagane_dtype_for_scalar_type` USED to live here with only Float/Half/
+// BFloat16 arms, so it labelled a float64 view FLOAT32 on the capture tape: the
+// same wrong-width descriptor that made gelu read punned bytes and write half its
+// output block. LATENT rather than live — #1157 already taints a capture that sees
+// float64, so the mistagged node is refused before it can replay — but latent is
+// not a reason to keep a second, truncated copy of a map whose COMPLETE version is
+// defined ten lines below in this same anonymous namespace. Deleted; the one
+// caller now uses `to_hagane_dtype`.
+//
 // Sprint X+5 Lane A (X+1 compound-risk fix) — full-coverage dtype mapper for
 // the global-anon-namespace call sites added by Sprint X+1 Lane B.2. The
 // `to_hagane_dtype` at HaganeOps.cpp:1751 has internal linkage inside
@@ -8126,7 +8135,7 @@ inline void hagane_register_view_from_tensor(const at::Tensor& result,
     shape_i32[i]   = static_cast<int32_t>(result.size(i));
     strides_i32[i] = static_cast<int32_t>(result.stride(i));
   }
-  int32_t dtype = hagane_dtype_for_scalar_type(result.scalar_type());
+  int32_t dtype = to_hagane_dtype(result.scalar_type());   // #1210
   haganeOpsRegisterView(child_ptr, parent_ptr, byte_offset,
                         shape_i32, strides_i32, ndim, dtype);
 }
