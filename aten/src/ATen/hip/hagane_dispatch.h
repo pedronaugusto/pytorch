@@ -502,8 +502,17 @@ struct UnaryScalarOpConfig {
 
 inline constexpr UnaryScalarOpConfig kPowTsCfg      = {"pow_ts",     nullptr, &pow_scalar_wrap,     &cpu_dispatch_pow_ts,     nullptr};
 inline constexpr UnaryScalarOpConfig kLeakyReluCfg  = {"leaky_relu", "hagane_leaky_relu_kernel", &haganeOpsLeakyRelu,  &cpu_dispatch_leaky_relu, nullptr};
-inline constexpr UnaryScalarOpConfig kHardshrinkCfg = {"hardshrink", nullptr, &haganeOpsHardshrink, &cpu_dispatch_hardshrink, nullptr};
-inline constexpr UnaryScalarOpConfig kSoftshrinkCfg = {"softshrink", nullptr, &haganeOpsSoftshrink, &cpu_dispatch_softshrink, nullptr};
+inline constexpr UnaryScalarOpConfig kHardshrinkCfg = {"hardshrink", "hagane_hardshrink_kernel", &haganeOpsHardshrink, &cpu_dispatch_hardshrink, nullptr};
+inline constexpr UnaryScalarOpConfig kSoftshrinkCfg = {"softshrink", "hagane_softshrink_kernel", &haganeOpsSoftshrink, &cpu_dispatch_softshrink, nullptr};
+// logit STAYS on nullptr, and the reason is measured rather than assumed.
+// S4-b-2-0's probe harvests 12 logit kernels, but they are TWO shapes: a plain
+// `..._float_wpt2_unrolled_contig` (3 params) and `..._float_a1_s2_wpt2_...`
+// (5 params).  logit's lambda captures TWO scalars (the eps clamp's lo and hi),
+// so its arm is `_a1_s2` -- and this bridge, and every launcher it can reach,
+// knows only the one-scalar `_a1_s1` shape.  Setting the field would build a
+// name no metallib contains and decline as "dispatch failed", which names the
+// symptom rather than the cause.  Tracked as its own item; the honest state is
+// no route, not a route that lies about why it did not fire.
 inline constexpr UnaryScalarOpConfig kLogitCfg      = {"logit",      nullptr, &haganeOpsLogit,      &cpu_dispatch_logit,      nullptr};
 
 // Drains both the MLX lazy graph and the Hagane Metal command queue. (M3c moved
@@ -1311,10 +1320,21 @@ inline bool resolve_scalar_width(const std::string& kname, unsigned arg_index,
 // which is where the contiguous launcher puts it too. It crosses as RAW BITS in
 // the compute dtype for the reason 1.11-A gives: a float round-trip loses an
 // int64 past 2^24.
+// `scalar_from` names the dtype `scalar_bits` is ALREADY IN, and it exists
+// because this launcher serves two families with two different scalar
+// conventions.  The `_a1_sA`/`_a1_sB` binary arms carry the operand as RAW BITS
+// IN THE COMPUTE DTYPE (1.11-A's rule: a float round-trip loses an int64 past
+// 2^24), which is the default and what `Undefined` selects.  The `_a1_s1`
+// captured-scalar arms carry a FLOAT, always -- #1174's reflection census says
+// so for all 24 such kernels shipped -- and handing those bits to
+// resolve_scalar_width as though they were the tensor's dtype would reinterpret
+// them.  Naming the source type is the difference; guessing it is #1174 again.
 inline bool try_launch_unary_strided_metallib(const std::string& kname,
                                               TensorIteratorBase& iter,
                                               int in_idx = 1,
-                                              const uint64_t* scalar_bits = nullptr) {
+                                              const uint64_t* scalar_bits = nullptr,
+                                              c10::ScalarType scalar_from =
+                                                  c10::ScalarType::Undefined) {
     constexpr const char* R = "unary_strided";
     route_enter(R, nullptr);
     // #1156 — no `tape_recording` decline; the dispatch below declares both
@@ -1360,8 +1380,12 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
         // exact sentence that was wrong for the contiguous arm and returned
         // zeros. The width is asked of the kernel here too; it is the same
         // premise, so it was the same bug waiting for a strided fp16 multiply.
-        size_t sc_bytes = static_cast<size_t>(iter.element_size(0));
-        if (!resolve_scalar_width(kname, 2, iter.dtype(), &sc, &sc_bytes))
+        const c10::ScalarType sfrom =
+            (scalar_from == c10::ScalarType::Undefined) ? iter.dtype() : scalar_from;
+        size_t sc_bytes = (scalar_from == c10::ScalarType::Undefined)
+                              ? static_cast<size_t>(iter.element_size(0))
+                              : static_cast<size_t>(c10::elementSize(sfrom));
+        if (!resolve_scalar_width(kname, 2, sfrom, &sc, &sc_bytes))
             return decline(R, nullptr, "scalar_width");
         args[2] = &sc;      arg_types[2] = 1; arg_sizes[2] = sc_bytes;
         args[3] = &N;       arg_types[3] = 1; arg_sizes[3] = sizeof(int);
@@ -5140,15 +5164,58 @@ inline void hagane_unary_scalar_bridge(TensorIteratorBase& iter, const Scalar& s
         }
     }
 
-    // Native captured-scalar (a1_s1) path: the kernel takes the input tensor,
-    // output, the opmath scalar (always float) and N.
+    // ---- TIER 1: the owned metallib, contiguous AND strided -----------------
+    //
+    // S4-b-2-2.  This arm used to hardcode `unrolled_contig` and guard the whole
+    // branch on `iter.is_contiguous()`, which made it the ONLY metallib call
+    // site in the tree that could not name a strided kernel -- the other three
+    // (clamp :3481, kernel_bridge :4778, binary_bridge :4904) all pass
+    // `contig ? "unrolled_contig" : "strided"`.  #1270: leaky_relu.metallib has
+    // shipped three `_strided` arms on every build since the row was added, and
+    // nothing could reach them.  A strided leaky_relu fell past a tier-1 route
+    // that HAD the kernel, past a tier 2 this template does not have, onto the
+    // mx:: tail.
+    //
+    // The ENTER is recorded HERE rather than inside the two launchers, because
+    // what a caller needs to know is "did this bridge's tier 1 fire", and the
+    // launchers are shared with families that have their own route names.  A
+    // route with zero ENTERs is never reached, which is a different problem
+    // from a route that declines -- and the one case reading the code cannot
+    // distinguish (hagane_ops.cpp:863).
     if constexpr (Cfg.metallib_kernel != nullptr) {
-        if (MetallibState<Cfg>::available && iter.is_contiguous()) {
-            std::string kname =
-                metallib_kernel_name(Cfg.metallib_kernel, iter.dtype(), "_a1_s1");
-            if (!kname.empty()
-                && try_launch_unary_scalar_metallib(kname, iter, scalar.toFloat()))
-                return;
+        constexpr const char* R = "unary_scalar_metallib";
+        route_enter(R, Cfg.op_name);
+        if (!MetallibState<Cfg>::available) {
+            decline(R, Cfg.op_name, "metallib_unavailable");
+        } else if (iter.ninputs() != 1) {
+            decline(R, Cfg.op_name, "not_unary");
+        } else if (iter.dtype(0) != iter.dtype(1)) {
+            // A promoted operand read as the output dtype is #1045's
+            // silent-wrong, in this family.  Refuse rather than reinterpret.
+            decline(R, Cfg.op_name, "operand_dtype_differs");
+        } else {
+            const bool contig = iter.is_contiguous();
+            const std::string kname = metallib_kernel_name(
+                Cfg.metallib_kernel, iter.dtype(), "_a1_s1",
+                contig ? "unrolled_contig" : "strided");
+            if (kname.empty()) {
+                decline(R, Cfg.op_name, "no_dtype_tag");
+            } else if (contig) {
+                if (try_launch_unary_scalar_metallib(kname, iter, scalar.toFloat()))
+                    return;
+                decline(R, Cfg.op_name, "contig_dispatch_failed");
+            } else {
+                // The `_a1_s1` scalar is a FLOAT by the arm's own convention,
+                // so the source dtype is named rather than inferred from the
+                // tensor -- see try_launch_unary_strided_metallib's comment.
+                const float sf = scalar.toFloat();
+                uint64_t sbits = 0;
+                std::memcpy(&sbits, &sf, sizeof(float));
+                if (try_launch_unary_strided_metallib(kname, iter, 1, &sbits,
+                                                      c10::ScalarType::Float))
+                    return;
+                decline(R, Cfg.op_name, "strided_dispatch_failed");
+            }
         }
     }
 
