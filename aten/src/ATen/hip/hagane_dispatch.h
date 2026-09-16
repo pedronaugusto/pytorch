@@ -312,13 +312,13 @@ struct BinaryIterOpConfig {
     Tensor (*at_fp64_fn)(const Tensor&, const Tensor&);
 };
 
-inline constexpr BinaryIterOpConfig kLogicalAndCfg = {"logical_and", nullptr, &haganeOpsLogicalAnd, &cpu_dispatch_logical_and, nullptr};
-inline constexpr BinaryIterOpConfig kLogicalOrCfg  = {"logical_or",  nullptr, &haganeOpsLogicalOr,  &cpu_dispatch_logical_or,  nullptr};
-inline constexpr BinaryIterOpConfig kLogicalXorCfg = {"logical_xor", nullptr, &haganeOpsLogicalXor, &cpu_dispatch_logical_xor, nullptr};
+inline constexpr BinaryIterOpConfig kLogicalAndCfg = {"logical_and", "hagane_logical_and_kernel_cuda", &haganeOpsLogicalAnd, &cpu_dispatch_logical_and, nullptr};
+inline constexpr BinaryIterOpConfig kLogicalOrCfg  = {"logical_or",  "hagane_logical_or_kernel_cuda",  &haganeOpsLogicalOr,  &cpu_dispatch_logical_or,  nullptr};
+inline constexpr BinaryIterOpConfig kLogicalXorCfg = {"logical_xor", "hagane_logical_xor_kernel_cuda", &haganeOpsLogicalXor, &cpu_dispatch_logical_xor, nullptr};
 
 // X+26 Lane B — hardswish_backward / mish_backward via BinaryIterOpConfig.
-inline constexpr BinaryIterOpConfig kHardswishBackwardCfg = {"hardswish_backward", nullptr, &haganeOpsHardswishBackward, &cpu_dispatch_hardswish_backward, nullptr};
-inline constexpr BinaryIterOpConfig kMishBackwardCfg      = {"mish_backward",      nullptr, &haganeOpsMishBackward,      &cpu_dispatch_mish_backward,      nullptr};
+inline constexpr BinaryIterOpConfig kHardswishBackwardCfg = {"hardswish_backward", "hagane_hardswish_backward_kernel", &haganeOpsHardswishBackward, &cpu_dispatch_hardswish_backward, nullptr};
+inline constexpr BinaryIterOpConfig kMishBackwardCfg      = {"mish_backward",      "hagane_mish_backward_kernel",      &haganeOpsMishBackward,      &cpu_dispatch_mish_backward,      nullptr};
 
 
 // ---- Unary-iter-op configuration (X+22) -----------------------------------
@@ -577,6 +577,43 @@ inline int metallib_work_per_thread(c10::ScalarType st) {
     return (bytes > 0 && bytes <= 8) ? 8 / bytes : 1;
 }
 
+// THE NAME IS THE AUTHORITY ON `wpt`, AND EVERY LAUNCHER USED TO RE-DERIVE IT.
+//
+// `metallib_kernel_name` bakes `_wpt<N>` in from the dtype it was handed, and
+// each launcher then computed `metallib_work_per_thread(iter.dtype())` AGAIN to
+// size the grid.  Two independent derivations of one number, which agree only
+// while the name's dtype and `iter.dtype()` are the same dtype -- true for
+// every caller that existed before S4-b-2-2, and FALSE for the first op that
+// needs a tier-1 arm next: `logical_and` names its kernel by the INPUT dtype
+// (`..._float_a2_wpt2_...`) and writes a BOOL output, so `iter.dtype()` is bool
+// and the re-derivation returns 8.  A grid sized for wpt=8 against a kernel
+// compiled for wpt=2 covers a QUARTER of the elements and leaves the rest
+// holding the output block's previous tenant -- #1210's class, arrived at by
+// arithmetic rather than by punning.
+//
+// `clamp` is the one site that already got this right (it threads `compute`
+// through both), which is the precedent rather than the exception.  Reading the
+// count back out of the name removes the possibility of disagreement BY
+// CONSTRUCTION instead of asking six callers to keep agreeing.
+//
+// A name with no `_wpt<N>_` is not an error: the reduction, softmax and norm
+// launchers build their names another way and have always used the caller's
+// dtype.  Those keep exactly today's answer, and say so rather than declining.
+inline int metallib_wpt_from_name(const std::string& kname, c10::ScalarType fallback) {
+    const size_t p = kname.rfind("_wpt");
+    if (p != std::string::npos) {
+        int n = 0;
+        size_t i = p + 4;
+        for (; i < kname.size() && kname[i] >= '0' && kname[i] <= '9'; ++i)
+            n = n * 10 + (kname[i] - '0');
+        // Guard the shape as well as the digits: `_wpt` must be FOLLOWED by a
+        // count and then the arm suffix, or this matched something else.
+        if (n > 0 && i < kname.size() && kname[i] == '_')
+            return n;
+    }
+    return metallib_work_per_thread(fallback);
+}
+
 // #1138 — the ARM suffix is a parameter now. The transpiler emits two arms per
 // specialization from one body: `_unrolled_contig` (flat loads) and `_strided`
 // (the same body, loads decomposed through an ext/stride triple). Defaulted so
@@ -690,7 +727,7 @@ inline bool try_launch_unary_metallib(const std::string& kname,
     flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
     // A8: each thread handles wpt elements (matches the kernel's _wptN); the
     // grid covers ceil(N/wpt) threads.
-    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int wpt = metallib_wpt_from_name(kname, iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     // #1146 — the same two numbers this function already computes for its own
@@ -1359,7 +1396,7 @@ inline bool try_launch_unary_strided_metallib(const std::string& kname,
     flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
 
     int N = static_cast<int>(N64);
-    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int wpt = metallib_wpt_from_name(kname, iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     uint64_t sc = scalar_bits ? *scalar_bits : 0;
@@ -2011,7 +2048,7 @@ inline bool try_launch_binary_metallib(const std::string& kname,
     flush_or_commit_metallib_input(d_a, static_cast<int64_t>(a_bytes));
     flush_or_commit_metallib_input(d_b, static_cast<int64_t>(b_bytes));
     // A8: wpt elements per thread (matches the kernel's _wptN).
-    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int wpt = metallib_wpt_from_name(kname, iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_a, d_b, d_out, &N};
@@ -4610,7 +4647,7 @@ inline bool try_launch_unary_scalar_metallib(const std::string& kname,
     flush_or_commit_metallib_input(d_in, static_cast<int64_t>(in_bytes));
     float sc = scalar;
     // A8: wpt elements per thread (matches the kernel's _wptN).
-    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int wpt = metallib_wpt_from_name(kname, iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     // #1174 — this sent sizeof(float) on the stated belief that the `_a1_s1`
@@ -4678,7 +4715,7 @@ inline bool try_launch_binary_scalar_metallib(const std::string& kname,
     size_t esz = static_cast<size_t>(iter.element_size(0));
     if (!resolve_scalar_width(kname, 2, iter.dtype(), &sc, &esz))
         return false;
-    const int wpt = metallib_work_per_thread(iter.dtype());
+    const int wpt = metallib_wpt_from_name(kname, iter.dtype());
     const int nthreads = (N + wpt - 1) / wpt;
     dim3 block(256, 1, 1), grid((nthreads + 255) / 256, 1, 1);
     void*  args[]      = {d_in, d_out, &sc, &N};
@@ -4970,12 +5007,72 @@ inline void hagane_binary_bridge(TensorIteratorBase& iter) {
 // function pointer.
 template <const BinaryIterOpConfig& Cfg>
 inline void hagane_binary_iter_bridge(TensorIterator& iter) {
+    if constexpr (Cfg.metallib_kernel != nullptr) {
+        std::call_once(MetallibState<Cfg>::once, maybe_register_metallib<Cfg>);
+    }
+
     if constexpr (Cfg.at_fp64_fn != nullptr) {
         if (iter.common_dtype() == c10::ScalarType::Double) {
             auto a = iter.tensor(1).to(c10::ScalarType::Float);
             auto b = iter.tensor(2).to(c10::ScalarType::Float);
             iter.tensor(0).copy_(Cfg.at_fp64_fn(a, b));
             return;
+        }
+    }
+
+    // ---- TIER 1: the owned metallib, tensor-tensor (`_a2`), CONTIGUOUS ONLY --
+    //
+    // S4-b-2-2, template 2 of 6.  `BinaryIterOpConfig::metallib_kernel` has
+    // existed since the struct did and this template never read it -- the field
+    // was dead for all five configs, which is why S4-b-0 counted the whole
+    // family as `no_tier2_attempted` with nothing to point at.
+    //
+    // CONTIGUOUS ONLY, and that is MEASURED rather than conservative.
+    // S4-b-2-0's harvest emits, per op:
+    //     logical_{and,or,xor}   _a2 x 9 dtypes contig   +   _a1_sA x 9 contig
+    //                                                     +   _a1_sA x 9 STRIDED
+    //     hardswish_backward     _a2 x 3 dtypes contig
+    //     mish_backward          _a2 x 3 dtypes contig
+    // -- so the nine `_strided` kernels the probe counts for each logical op
+    // are ALL on the cpu-scalar arm.  There is no `_a2_*_strided` for any dtype
+    // in this family, and a count of "_strided" arms that does not separate the
+    // shape says otherwise.  A non-contiguous tensor-tensor call therefore
+    // DECLINES BY NAME here; it does not fall through silently, which would be
+    // indistinguishable from the route never having been reached.
+    //
+    // THE NAME IS BUILT FROM THE INPUT DTYPE, not `iter.dtype()`.  A logical op
+    // writes BOOL, while its kernel is instantiated over the operand type, so
+    // `..._float_a2_wpt2_...` is the right name for a float pair.  That is also
+    // why metallib_wpt_from_name exists: sizing the grid from the bool output
+    // would ask for wpt=8 against a kernel compiled for wpt=2.
+    if constexpr (Cfg.metallib_kernel != nullptr) {
+        constexpr const char* R = "binary_iter_metallib";
+        route_enter(R, Cfg.op_name);
+        if (!MetallibState<Cfg>::available) {
+            decline(R, Cfg.op_name, "metallib_unavailable");
+        } else if (iter.ninputs() != 2) {
+            decline(R, Cfg.op_name, "not_binary");
+        } else if (iter.is_cpu_scalar(1) || iter.is_cpu_scalar(2)) {
+            // The `_a1_sA` arm exists for the logical trio and is a separate
+            // slice; naming it here would bind the wrong operand count.
+            decline(R, Cfg.op_name, "cpu_scalar_operand");
+        } else if (iter.dtype(1) != iter.dtype(2)) {
+            decline(R, Cfg.op_name, "operand_dtype_differs");
+        } else if (iter.tensor(1).sizes() != iter.tensor(0).sizes()
+                || iter.tensor(2).sizes() != iter.tensor(0).sizes()) {
+            decline(R, Cfg.op_name, "broadcast");
+        } else if (!iter.is_contiguous()) {
+            decline(R, Cfg.op_name, "no_strided_a2_arm");
+        } else {
+            const std::string kname =
+                metallib_kernel_name(Cfg.metallib_kernel, iter.dtype(1), "_a2");
+            if (kname.empty()) {
+                decline(R, Cfg.op_name, "no_dtype_tag");
+            } else if (try_launch_binary_metallib(kname, iter)) {
+                return;
+            } else {
+                decline(R, Cfg.op_name, "contig_dispatch_failed");
+            }
         }
     }
 
