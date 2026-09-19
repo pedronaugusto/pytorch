@@ -340,6 +340,24 @@ struct UnaryIterOpConfig {
     // contract there, so routing them would be a numerics decision rather than
     // an ownership one — and sum/mean already have the owned Tier-a reducer.
     const char* mlx_reduce_op;
+
+    // S4-b-2-2, template 6 of 6 — the owned ELEMENTWISE kernel's BASE name, and
+    // it is a separate field from `metallib_kernel` on purpose.
+    //
+    // In THIS config `metallib_kernel` is a SENTINEL, not a name: every row that
+    // carries it carries the literal string "reduce", and the only thing it does
+    // is gate the two reduction launchers below. A base name put in that field
+    // would be handed to `try_launch_reduction_metallib`, which declines it by
+    // name — a wasted ENTER and a decline row in the very tally the route gates
+    // read — and, worse, `metallib_kernel_name("reduce", ...)` is a well-formed
+    // string, so a future row wiring a second elementwise op there would build
+    // `hagane_reduce_float_wpt2_...` and simply fail to launch.
+    //
+    // Two facts, two fields: which ops reduce, and which ops own an elementwise
+    // arm. No row carries both, and the bridge gates them independently.
+    //
+    // Rows that leave this null are the reductions, which is every row but one.
+    const char* metallib_elem_kernel;
 };
 
 // A9: kSumCfg/kMeanCfg carry a non-null metallib_kernel sentinel ("reduce") so
@@ -368,7 +386,17 @@ inline constexpr UnaryIterOpConfig kMinValuesCfg = {"min_values", "reduce", &hag
 // the semantic, not the stub name.
 inline constexpr UnaryIterOpConfig kAndCfg       = {"and",        "reduce", &haganeOpsAll,       &cpu_dispatch_and,        nullptr, "and"};
 inline constexpr UnaryIterOpConfig kOrCfg        = {"or",         "reduce", &haganeOpsAny,       &cpu_dispatch_or,         nullptr, "or"};
-inline constexpr UnaryIterOpConfig kHardswishCfg = {"hardswish",  nullptr, &haganeOpsHardswish, &cpu_dispatch_hardswish,  nullptr, nullptr};
+// hardswish is the one ELEMENTWISE op in this config, and it is here for a
+// signature reason rather than a semantic one: `hardswish_stub` is declared
+// `void(*)(TensorIterator&)`, which is the reductions' stub type, while
+// `hagane_kernel_bridge`'s unary family takes `TensorIteratorBase&`. So it
+// inherited the reduction bridge and, until now, that bridge's two tier-1 calls
+// were both reduction launchers — neither of which fires for this op name.
+// It keeps `metallib_kernel` null (it does not reduce) and carries its owned
+// kernel in `metallib_elem_kernel` instead. Six arms ship — float/half/bfloat16
+// x unrolled_contig/strided — in the bare `_wpt<N>` shape the unary launchers
+// already drive, which is why this needed no new launcher.
+inline constexpr UnaryIterOpConfig kHardswishCfg = {"hardswish",  nullptr, &haganeOpsHardswish, &cpu_dispatch_hardswish,  nullptr, nullptr, "hagane_hardswish_kernel"};
 
 // ---- Reduce-with-flag op configuration (X+23) -----------------------------
 // `reduce_fn_flag = void(*)(TensorIterator&, const Scalar&)` stubs
@@ -5091,11 +5119,59 @@ inline void hagane_binary_iter_bridge(TensorIterator& iter) {
 // the 10 X+22 candidates have metallibs today; deferred to X+23+ if needed).
 template <const UnaryIterOpConfig& Cfg>
 inline void hagane_unary_iter_bridge(TensorIterator& iter) {
+    if constexpr (Cfg.metallib_elem_kernel != nullptr) {
+        std::call_once(MetallibState<Cfg>::once, maybe_register_metallib<Cfg>);
+    }
+
     if constexpr (Cfg.at_fp64_fn != nullptr) {
         if (iter.common_dtype() == c10::ScalarType::Double) {
             auto in = iter.tensor(1).to(c10::ScalarType::Float);
             iter.tensor(0).copy_(Cfg.at_fp64_fn(in).to(c10::ScalarType::Double));
             return;
+        }
+    }
+
+    // S4-b-2-2, template 6 of 6 — tier 1 for the ELEMENTWISE row in a bridge
+    // whose other two tier-1 calls are reduction launchers. Those take
+    // `Cfg.op_name` and decline by name, so neither has ever fired for
+    // hardswish: this template was a TWO-tier ladder for it (C-ABI `mx::` tail,
+    // then CPU), which is the 267-cell gap S4-b-0 measured.
+    //
+    // The body is `hagane_kernel_bridge`'s unary arm — the bare `_wpt<N>` shape,
+    // contig and strided — because the harvested kernels are the same shape.
+    // What it adds is the decline tally: that arm records nothing, so a route
+    // that stopped firing there would be invisible (#1131). Retrofitting it onto
+    // this tally is worth doing and is NOT done here: it would add ENTER rows
+    // for 37 shipped unary ops to an instrument several gates and the S4-b-0
+    // census already read, which is a change that needs its own verification
+    // rather than a ride-along on one op.
+    if constexpr (Cfg.metallib_elem_kernel != nullptr) {
+        constexpr const char* R = "unary_iter_elem_metallib";
+        route_enter(R, Cfg.op_name);
+        if (!MetallibState<Cfg>::available) {
+            decline(R, Cfg.op_name, "metallib_unavailable");
+        } else if (iter.ninputs() != 1) {
+            decline(R, Cfg.op_name, "not_unary");
+        } else if (iter.dtype(1) != iter.dtype(0)) {
+            // The kernel is named by the OUTPUT dtype and binds data_ptr(1) raw,
+            // so a PROMOTED INPUT would be read as the output's type. That is the
+            // silent-wrong `hagane_kernel_bridge` documents at its own arm, and
+            // it is the same class here: decline and let the tail cast.
+            decline(R, Cfg.op_name, "operand_dtype_differs");
+        } else {
+            const bool contig = iter.is_contiguous();
+            const std::string kname = metallib_kernel_name(
+                Cfg.metallib_elem_kernel, iter.dtype(), "",
+                contig ? "unrolled_contig" : "strided");
+            if (kname.empty()) {
+                decline(R, Cfg.op_name, "no_dtype_tag");
+            } else if (contig) {
+                if (try_launch_unary_metallib(kname, iter)) return;
+                decline(R, Cfg.op_name, "contig_dispatch_failed");
+            } else {
+                if (try_launch_unary_strided_metallib(kname, iter)) return;
+                decline(R, Cfg.op_name, "strided_dispatch_failed");
+            }
         }
     }
 
