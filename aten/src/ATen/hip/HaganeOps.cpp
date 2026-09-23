@@ -435,19 +435,7 @@ C10_EXPORT void GeluBackwardCUDAKernelImpl(TensorIteratorBase& iter, GeluType ap
 }
 
 static int32_t to_hagane_dtype_ext(c10::ScalarType st) {
-  switch (st) {
-    case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
-    case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
-    case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
-    case c10::ScalarType::Double:   return HAGANE_DTYPE_FLOAT64;
-    case c10::ScalarType::Int:      return HAGANE_DTYPE_INT32;
-    case c10::ScalarType::Long:     return HAGANE_DTYPE_INT64;
-    case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
-    case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
-    case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
-    case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
-    default:                        return HAGANE_DTYPE_FLOAT32;
-  }
+  return hagane_dispatch::detail::hagane_dtype_checked(st);
 }
 
 static haganeOpsTensor_t make_ops_tensor_ext(TensorIteratorBase& iter, int arg) {
@@ -462,19 +450,7 @@ static haganeOpsTensor_t make_ops_tensor_ext(TensorIteratorBase& iter, int arg) 
 }
 
 static int32_t hagane_dtype(c10::ScalarType st) {
-  switch (st) {
-    case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
-    case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
-    case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
-    case c10::ScalarType::Double:   return HAGANE_DTYPE_FLOAT64;
-    case c10::ScalarType::Int:      return HAGANE_DTYPE_INT32;
-    case c10::ScalarType::Long:     return HAGANE_DTYPE_INT64;
-    case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
-    case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
-    case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
-    case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
-    default:                        return HAGANE_DTYPE_FLOAT32;
-  }
+  return hagane_dispatch::detail::hagane_dtype_checked(st);
 }
 
 // THIS is where a full `torch.max(t)` lands — not hagane_max_all_kernel and not
@@ -2043,22 +2019,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 static int32_t to_hagane_dtype(c10::ScalarType st) {
-  switch (st) {
-    case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
-    case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
-    case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
-    case c10::ScalarType::Double:   return HAGANE_DTYPE_FLOAT64;
-    case c10::ScalarType::Int:      return HAGANE_DTYPE_INT32;
-    case c10::ScalarType::Long:     return HAGANE_DTYPE_INT64;
-    case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
-    case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
-    case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
-    case c10::ScalarType::UInt16:   return HAGANE_DTYPE_UINT16;
-    case c10::ScalarType::UInt32:   return HAGANE_DTYPE_UINT32;
-    case c10::ScalarType::UInt64:   return HAGANE_DTYPE_UINT64;
-    case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
-    default:                        return HAGANE_DTYPE_FLOAT32;
-  }
+  return hagane_dispatch::detail::hagane_dtype_checked(st);
 }
 
 static haganeOpsTensor_t make_ops_tensor(TensorIteratorBase& iter, int arg) {
@@ -2204,6 +2165,29 @@ static Tensor hagane_add_scalar(const Tensor& t, double val) {
 // Copy + Fill (memcpy is optimal on UMA for copy)
 // ---------------------------------------------------------------------------
 
+// Complex has no device descriptor: its bytes are a real pair, so every complex
+// copy is a composition of real copies over view_as_real, each on the ordinary
+// float/double routes. A complex tensor used to be described as FLOAT32 here,
+// and complex64 moved 4 of its 8 bytes ([1+2j, 3-4j] -> [1+2j, 0j]).
+static void hagane_copy_complex(const at::Tensor& dst, const at::Tensor& src) {
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      !dst.is_conj() && !src.is_conj() && !dst.is_neg() && !src.is_neg(),
+      "hagane: copy of a complex tensor with a lazy conj/neg bit is not "
+      "implemented (resolve_conj()/resolve_neg() first)");
+  if (dst.is_complex() && src.is_complex()) {
+    // Same precision is a byte copy; complex64 <-> complex128 casts each
+    // component, which is what torch's complex conversion does.
+    at::view_as_real(dst).copy_(at::view_as_real(src));
+  } else if (dst.is_complex()) {
+    auto d = at::view_as_real(dst);
+    d.select(-1, 0).copy_(src);
+    d.select(-1, 1).zero_();
+  } else {
+    // torch discards the imaginary part (copy_ has already warned).
+    dst.copy_(at::view_as_real(src).select(-1, 0));
+  }
+}
+
 void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
   hagane_register_allocator_hook();
   // Build descriptors from the actual tensors' data_ptr — NOT iter.data_ptr().
@@ -2243,6 +2227,11 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
     src_expanded = src_raw.expand(dst_t.sizes());
   }
   const at::Tensor& src_t = src_expanded.defined() ? src_expanded : src_raw;
+
+  if (dst_t.is_complex() || src_t.is_complex()) {
+    hagane_copy_complex(dst_t, src_t);
+    return;
+  }
 
   const bool gpu_to_cpu =
       src_t.device().is_cuda() && !dst_t.device().is_cuda();
@@ -2385,6 +2374,18 @@ void hagane_copy_kernel(TensorIterator& iter, bool non_blocking) {
 }
 
 void hagane_fill_kernel(TensorIterator& iter, const c10::Scalar& value) {
+  if (at::isComplexType(iter.dtype(0))) {
+    // Complex fill writes the two components of the real pair. Each is the
+    // component torch's own complex conversion produces (a cast per part).
+    const at::Tensor& out = iter.tensor(0);
+    TORCH_CHECK_NOT_IMPLEMENTED(!out.is_conj() && !out.is_neg(),
+        "hagane: fill of a complex tensor with a lazy conj/neg bit is not implemented");
+    const c10::complex<double> v = value.toComplexDouble();
+    auto r = at::view_as_real(out);
+    r.select(-1, 0).fill_(v.real());
+    r.select(-1, 1).fill_(v.imag());
+    return;
+  }
   if (hagane_dispatch::detail::try_vendor_fill(iter, value)) return;
   auto out = make_ops_tensor(iter, 0);
   if (haganeOpsFill(&out, value.toDouble()) != HAGANE_OPS_SUCCESS) {
@@ -8142,24 +8143,10 @@ namespace {
 // defined ten lines below in this same anonymous namespace. Deleted; the one
 // caller now uses `to_hagane_dtype`.
 //
-// Sprint X+5 Lane A (X+1 compound-risk fix) — full-coverage dtype mapper for
-// the global-anon-namespace call sites added by Sprint X+1 Lane B.2. The
-// `to_hagane_dtype` at HaganeOps.cpp:1751 has internal linkage inside
-// `at::native::{anonymous}::` and is unreachable from this scope.
+// The global-anon-namespace spelling of the ONE map
+// (hagane_dispatch::detail::hagane_dtype_checked), for the call sites below.
 inline int32_t to_hagane_dtype(c10::ScalarType st) {
-  switch (st) {
-    case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
-    case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
-    case c10::ScalarType::BFloat16: return HAGANE_DTYPE_BFLOAT16;
-    case c10::ScalarType::Double:   return HAGANE_DTYPE_FLOAT64;
-    case c10::ScalarType::Int:      return HAGANE_DTYPE_INT32;
-    case c10::ScalarType::Long:     return HAGANE_DTYPE_INT64;
-    case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
-    case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
-    case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
-    case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
-    default:                        return HAGANE_DTYPE_FLOAT32;
-  }
+  return at::native::hagane_dispatch::detail::hagane_dtype_checked(st);
 }
 
 inline void hagane_register_view_from_tensor(const at::Tensor& result,
@@ -8179,7 +8166,13 @@ inline void hagane_register_view_from_tensor(const at::Tensor& result,
     shape_i32[i]   = static_cast<int32_t>(result.size(i));
     strides_i32[i] = static_cast<int32_t>(result.stride(i));
   }
-  int32_t dtype = to_hagane_dtype(result.scalar_type());   // #1210
+  // A view of a dtype with no descriptor (complex) is not registered: slicing
+  // it must still work, and a descriptor naming it as another dtype would
+  // mis-size every element offset. No complex op records onto a tape — each
+  // refuses at hagane_dtype_checked, and complex copies run as real copies.
+  const int32_t dtype = at::native::hagane_dispatch::detail::hagane_dtype_or_none(
+      result.scalar_type());
+  if (dtype < 0) return;
   haganeOpsRegisterView(child_ptr, parent_ptr, byte_offset,
                         shape_i32, strides_i32, ndim, dtype);
 }

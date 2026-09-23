@@ -68,7 +68,14 @@ using c10::Scalar;
 // model-shaped logic and must not depend on HaganeOps.cpp internals
 // (ADR-036 §6.1).
 
-inline int32_t to_hagane_dtype_local(c10::ScalarType st) {
+// THE ScalarType -> HAGANE_DTYPE map. Every descriptor Hagane builds on the
+// torch side goes through it; there is no second copy. -1 means the runtime has
+// no descriptor for the dtype (complex, quantized, float8, bits, ...).
+//
+// Five maps used to exist, each ending `default: return HAGANE_DTYPE_FLOAT32`,
+// and four lacked UInt16/32/64. So an unspelled dtype was DESCRIBED as float32:
+// complex64 moved 4 of its 8 bytes, uint16 was read at 4 — twice its block.
+inline int32_t hagane_dtype_or_none(c10::ScalarType st) {
     switch (st) {
         case c10::ScalarType::Float:    return HAGANE_DTYPE_FLOAT32;
         case c10::ScalarType::Half:     return HAGANE_DTYPE_FLOAT16;
@@ -79,9 +86,28 @@ inline int32_t to_hagane_dtype_local(c10::ScalarType st) {
         case c10::ScalarType::Short:    return HAGANE_DTYPE_INT16;
         case c10::ScalarType::Char:     return HAGANE_DTYPE_INT8;
         case c10::ScalarType::Byte:     return HAGANE_DTYPE_UINT8;
+        case c10::ScalarType::UInt16:   return HAGANE_DTYPE_UINT16;
+        case c10::ScalarType::UInt32:   return HAGANE_DTYPE_UINT32;
+        case c10::ScalarType::UInt64:   return HAGANE_DTYPE_UINT64;
         case c10::ScalarType::Bool:     return HAGANE_DTYPE_BOOL;
-        default:                        return HAGANE_DTYPE_FLOAT32;
+        default:                        return -1;
     }
+}
+
+// The form every descriptor builder uses: a dtype the runtime cannot describe
+// is REFUSED by name, never handed over as another dtype. Complex byte-movers
+// (copy, fill) never reach here — they run as real copies over view_as_real.
+inline int32_t hagane_dtype_checked(c10::ScalarType st) {
+    const int32_t d = hagane_dtype_or_none(st);
+    TORCH_CHECK_NOT_IMPLEMENTED(
+        d >= 0, "hagane: no device descriptor for dtype ", st,
+        " — this operator is not implemented for it on Hagane (refused rather "
+        "than described as another dtype)");
+    return d;
+}
+
+inline int32_t to_hagane_dtype_local(c10::ScalarType st) {
+    return hagane_dtype_checked(st);
 }
 
 inline haganeOpsTensor_t make_ops_tensor_local(TensorIteratorBase& iter, int arg) {
