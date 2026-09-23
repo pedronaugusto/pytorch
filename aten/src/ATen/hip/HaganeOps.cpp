@@ -34,6 +34,8 @@
 #include <ATen/native/hip/TensorTopK.h>
 #include <ATen/native/hip/ScanKernels.h>
 #include <ATen/TensorIterator.h>
+#include <ATen/Dispatch.h>        // #1121 — scatter.value converts with CUDA's own dispatch list
+#include <ATen/MemoryOverlap.h>   // #1121 — and asserts no internal overlap, as CUDA does
 #include <ATen/ExpandUtils.h>
 #include <ATen/core/IListRef.h>
 #include <ATen/Functions.h>
@@ -2799,13 +2801,55 @@ void hagane_scatter_kernel(const Tensor& self, int64_t dim,
 
 void hagane_scatter_fill_kernel(const Tensor& self, int64_t dim,
                                 const Tensor& index, const Scalar& src) {
-  auto self_d = make_tensor_desc(self);
-  auto idx_d = make_tensor_desc(index);
-  if (haganeOpsScatterFill(&self_d, &idx_d, src.toFloat(), static_cast<int32_t>(dim)) != HAGANE_OPS_SUCCESS) {
-    HAGANE_HOST_FALLBACK("raw_read");
-    HAGANE_BEFORE_RAW_READ();
-    scatter_fill_stub(c10::DeviceType::CPU, self, dim, index, src);
-  }
+  // #1121 — scatter.VALUE on the owned scatter route, with the value converted
+  // EXACTLY as CUDA converts it: the same dispatch list and `src.to<scalar_t>()`,
+  // its raw bytes handed to the kernel (native/hip/ScatterGatherKernel.hip,
+  // cuda_scatter_fill_base_kernel). This used to be `src.toFloat()` into an
+  // mx:: tail — int64 2^24+1 stored as 2^24, float64 0.1 as 0.10000000149,
+  // and 1e300 or a complex value RAISED where CUDA does not. Unsupported dtypes
+  // raise from the dispatch macro exactly where CUDA's does.
+  at::assert_no_internal_overlap(self);
+  uint64_t vbits = 0;
+  bool fits = false;
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(
+      at::ScalarType::Half, at::ScalarType::Bool, at::ScalarType::BFloat16,
+      self.scalar_type(), "cuda_scatter_fill_base_kernel_func", [&] {
+        if constexpr (sizeof(scalar_t) <= sizeof(uint64_t)) {
+          const scalar_t v = src.to<scalar_t>();
+          std::memcpy(&vbits, &v, sizeof(scalar_t));
+          fits = true;
+        }
+      });
+  if (fits &&
+      hagane_dispatch::detail::try_index_scatter_fill_axis(self, dim, index, vbits))
+    return;
+  // Declined (a 16-byte complex128, a geometry the route refuses, route off):
+  // torch's own CPU kernel, counted. NEVER the float-typed mx:: tail — it
+  // cannot represent an integer or 8-byte value, which is the defect above.
+  //
+  // ON HOST COPIES, not on `self` in place. torch's CPU scatter kernel is not
+  // written for device tensors: for Half/BFloat16 it builds a float
+  // accumulation buffer with `self.to(float)` and copies back with `copy_`,
+  // and it converts an int32 index with `index.to(Long)` — each a DEVICE op
+  // here, created INSIDE the call, after any settle this bridge can make.
+  // Measured by forcing this arm: float16/bfloat16 wrote nothing (raw UMA
+  // bytes stayed 0) and an int32 index scattered to wrong positions, while
+  // int16 and float32 were exact. A CPU kernel runs on CPU tensors.
+  //
+  // COMPLEX REFUSES, by name, until complex copies are fixed: a complex64
+  // host<->device copy on this tree loses half its bytes ([1+2j, 3-4j]
+  // round-trips as [1+2j, 0j]), so a host-copy fallback would return a wrong
+  // answer where an error is honest. complex64 itself is owned above and exact;
+  // only a DECLINED complex call (and every complex128, 16 bytes) lands here.
+  TORCH_CHECK_NOT_IMPLEMENTED(!self.is_complex(),
+      "hagane: scatter.value fallback for ", self.scalar_type(),
+      " is refused — complex host<->device copies are broken on this device "
+      "(complex64 loses half its bytes); refused rather than answered wrongly");
+  HAGANE_HOST_FALLBACK("raw_read");
+  HAGANE_BEFORE_RAW_READ();
+  Tensor self_h = self.cpu();
+  scatter_fill_stub(c10::DeviceType::CPU, self_h, dim, index.cpu(), src);
+  self.copy_(self_h);
 }
 
 void hagane_scatter_add_kernel(const Tensor& self, int64_t dim,

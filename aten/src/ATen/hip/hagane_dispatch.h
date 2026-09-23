@@ -3827,7 +3827,7 @@ inline bool index_metallib_available() {
         }
         std::fprintf(stderr,
             "[hagane-path-alpha] index metallib registered "
-            "(gather/scatter/index_put/triangle/compact, 52 kernels)\n");
+            "(gather/scatter/scatter_fill/index_put/triangle/compact, 64 kernels)\n");
         return true;
     }();
     return available;
@@ -4003,21 +4003,34 @@ inline bool try_index_gather_axis(const char* torch_op, const at::Tensor& in,
 // Duplicate indices are a plain write with an UNSPECIFIED winner in torch (it
 // is scatter_ADD that accumulates), so no atomics are needed — which is also
 // why the atomicCAS transpiler gap does not block this slice.
-inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
-                                   const at::Tensor& index, const at::Tensor& src) {
+// scatter's two overloads, ONE route. `.src` reads a tensor; `.value` (#1121)
+// broadcasts a scalar the caller has already converted to self's dtype with
+// CUDA's own conversion and handed over as RAW BITS — never through a float.
+// Everything that is the risk surface (the settle that materialises `self`, the
+// INOUT declaration, the spans, every named decline) is shared verbatim.
+struct ScatterSource {
+    const at::Tensor* src;   // .src overload, else nullptr
+    uint64_t vbits;          // .value overload: scalar_t's bytes, little-endian
+};
+
+inline bool try_index_scatter_axis_impl(const char* OP, const at::Tensor& self,
+                                        int64_t dim, const at::Tensor& index,
+                                        const ScatterSource& S) {
     const char* R = "index_axis";
-    const char* OP = "scatter";
     if (!index_metallib_available()) return false;
     route_enter(R, OP);
     // #1156 — no `tape_recording` decline; self is declared INOUT below.
-    if (!self.defined() || !index.defined() || !src.defined())
+    if (!self.defined() || !index.defined() || (S.src && !S.src->defined()))
         return decline(R, OP, "undefined_operand");
-    if (!self.is_cuda() || !index.is_cuda() || !src.is_cuda())
+    if (!self.is_cuda() || !index.is_cuda() || (S.src && !S.src->is_cuda()))
         return decline(R, OP, "not_device");
-    if (self.scalar_type() != src.scalar_type())
+    if (S.src && self.scalar_type() != S.src->scalar_type())
         return decline_dtypes(R, OP, "self_src_dtype_differ",
-                              src.scalar_type(), self.scalar_type());
-    if (index.scalar_type() != at::kLong)
+                              S.src->scalar_type(), self.scalar_type());
+    // torch accepts int64 AND int32 scatter indices (ScatterGatherChecks.h);
+    // both have kernel arms. Anything else is not a scatter index torch allows.
+    const bool idx32 = index.scalar_type() == at::kInt;
+    if (index.scalar_type() != at::kLong && !idx32)
         return decline_dtypes(R, OP, "index_dtype", index.scalar_type(),
                               self.scalar_type());
     const int64_t esz = self.element_size();
@@ -4026,7 +4039,7 @@ inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
 
     const int ndim = static_cast<int>(self.dim());
     if (ndim <= 0 || ndim > HAGANE_INDEX_MAX_DIMS) return decline(R, OP, "ndim");
-    if (index.dim() != ndim || src.dim() != ndim)
+    if (index.dim() != ndim || (S.src && S.src->dim() != ndim))
         return decline(R, OP, "rank_mismatch");
     if (dim < 0 || dim >= ndim) return decline(R, OP, "dim_out_of_range");
     const int64_t total = index.numel();
@@ -4039,10 +4052,11 @@ inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
         d.shape[k] = index.size(k);
         d.a_es[k]  = self.stride(k);
         d.b_es[k]  = index.stride(k);
-        d.c_es[k]  = src.stride(k);
+        d.c_es[k]  = S.src ? S.src->stride(k) : 0;   // .value: `ro` is dead
         if (d.a_es[k] < 0 || d.b_es[k] < 0 || d.c_es[k] < 0)
             return decline(R, OP, "negative_stride");
-        if (d.shape[k] > src.size(k)) return decline(R, OP, "index_exceeds_src");
+        if (S.src && d.shape[k] > S.src->size(k))
+            return decline(R, OP, "index_exceeds_src");
         if (k != dim && d.shape[k] > self.size(k))
             return decline(R, OP, "index_exceeds_self");
     }
@@ -4051,33 +4065,40 @@ inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
     for (int k = 0; k < ndim; ++k) self_shape[k] = self.size(k);
     const int64_t self_span = index_span_elems(self_shape, d.a_es, ndim);
     const int64_t idx_span  = index_span_elems(d.shape, d.b_es, ndim);
-    const int64_t src_span  = index_span_elems(d.shape, d.c_es, ndim);
+    const int64_t src_span  = S.src ? index_span_elems(d.shape, d.c_es, ndim) : 0;
 
     void* p_self = self.data_ptr();
     void* p_idx  = const_cast<void*>(index.const_data_ptr());
-    void* p_src  = const_cast<void*>(src.const_data_ptr());
+    void* p_src  = S.src ? const_cast<void*>(S.src->const_data_ptr()) : nullptr;
 
     flush_or_commit_metallib_input(p_idx, idx_span * index.element_size());
-    flush_or_commit_metallib_input(p_src, src_span * esz);
+    if (S.src) flush_or_commit_metallib_input(p_src, src_span * esz);
     // MATERIALISE, never drop — see the header comment. The write is partial by
     // construction (that is what scatter IS), so there is no branch here.
     haganeOpsFlushRegion(p_self, self_span * esz);
 
-    std::string kname = std::string("hagane_scatter_axis_") + bsfx;
+    std::string kname = std::string(S.src ? "hagane_scatter_axis_"
+                                          : "hagane_scatter_fill_axis_") +
+                        bsfx + (idx32 ? "_i32" : "");
     int64_t c_ndim = ndim, c_total = total, c_dim = dim, c_dimsz = dim_size;
+    uint64_t c_vbits = S.vbits;
     // #1156 — `self` is INOUT, not OUT. The write is PARTIAL by construction
     // (that is what scatter IS, and it is why the settle above materialises
     // rather than supersedes), so declaring it OUT would claim this dispatch
     // produces the whole buffer when it produces only the scattered positions.
     // INOUT also arms the -607 guard, which refuses honestly if the buffer still
     // holds a value node's result instead of reading capture-time bytes.
-    void*  args[] = {p_self, p_idx, p_src, &d, &c_ndim, &c_total, &c_dim, &c_dimsz};
+    // .value binds its 8 raw bytes BY VALUE at the slot .src binds a buffer;
+    // a scalar is recorded into a capture by value, so replay is exact.
+    void*  args[] = {p_self, p_idx, S.src ? p_src : static_cast<void*>(&c_vbits),
+                     &d, &c_ndim, &c_total, &c_dim, &c_dimsz};
     int    at_[]  = {HAGANE_ARG_BUFFER_INOUT, HAGANE_ARG_BUFFER_IN,
-                     HAGANE_ARG_BUFFER_IN, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
+                     S.src ? HAGANE_ARG_BUFFER_IN : HAGANE_ARG_SCALAR,
+                     HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR,
                      HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR, HAGANE_ARG_SCALAR};
     size_t as_[]  = {static_cast<size_t>(self_span * esz),
                      static_cast<size_t>(idx_span * index.element_size()),
-                     static_cast<size_t>(src_span * esz),
+                     S.src ? static_cast<size_t>(src_span * esz) : sizeof(uint64_t),
                      sizeof(d), sizeof(int64_t), sizeof(int64_t),
                      sizeof(int64_t), sizeof(int64_t)};
     int64_t nb = (total + 255) / 256;
@@ -4090,6 +4111,17 @@ inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
     note_native_launch(kname);
     haganeOpsMarkMetallibWrite(p_self, static_cast<size_t>(self_span * esz));
     return true;
+}
+
+inline bool try_index_scatter_axis(const at::Tensor& self, int64_t dim,
+                                   const at::Tensor& index, const at::Tensor& src) {
+    return try_index_scatter_axis_impl("scatter", self, dim, index, {&src, 0});
+}
+
+inline bool try_index_scatter_fill_axis(const at::Tensor& self, int64_t dim,
+                                        const at::Tensor& index, uint64_t vbits) {
+    return try_index_scatter_axis_impl("scatter_fill", self, dim, index,
+                                       {nullptr, vbits});
 }
 
 // 1.11-C — triu / tril, into the caller's own block.
