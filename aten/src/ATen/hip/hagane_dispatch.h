@@ -5481,16 +5481,56 @@ struct UnaryOptionalTripleOpConfig {
 inline constexpr UnaryOptionalTripleOpConfig kNanToNumCfg = {
     "nan_to_num", &haganeOpsNanToNum, &cpu_dispatch_nan_to_num};
 
+// nan_to_num's absent-replacement defaults, per scalar_t — upstream's
+// `std::numeric_limits<scalar_t>::max()/lowest()` (native/hip/
+// UnaryOpsKernel.hip), which is a DIFFERENT number per dtype: 65504 at half,
+// ~3.39e38 at bfloat16, FLT_MAX at float. This bridge used
+// numeric_limits<double> for all of them, and the runtime's float32 clamp
+// hid that for float32 alone — half and bfloat16 returned inf where CUDA
+// returns the dtype max (scripts/test_nan_to_num_route.py).
+//
+// A CLOSED SET that returns false for anything unlisted, so the caller takes
+// its CPU arm rather than a default width — `hagane_vendor_dtype`'s rule:
+// "declined, never narrowed behind the caller's back". float64 is deliberately
+// NOT listed: the mx:: tail computes it in float32 (#1206), which loses every
+// finite value's low bits and cannot represent DBL_MAX at all.
+inline bool nan_to_num_default_limits(c10::ScalarType st, double* hi, double* lo) {
+    switch (st) {
+        case c10::ScalarType::Float:
+            *hi = std::numeric_limits<float>::max();
+            *lo = std::numeric_limits<float>::lowest();
+            return true;
+        case c10::ScalarType::Half:
+            *hi = static_cast<float>(std::numeric_limits<c10::Half>::max());
+            *lo = static_cast<float>(std::numeric_limits<c10::Half>::lowest());
+            return true;
+        case c10::ScalarType::BFloat16:
+            *hi = static_cast<float>(std::numeric_limits<c10::BFloat16>::max());
+            *lo = static_cast<float>(std::numeric_limits<c10::BFloat16>::lowest());
+            return true;
+        default:
+            return false;
+    }
+}
+
 template <const UnaryOptionalTripleOpConfig& Cfg>
 inline void hagane_unary_optional_triple_bridge(TensorIteratorBase& iter,
                                                  std::optional<double> nan_val,
                                                  std::optional<double> pos_inf_val,
                                                  std::optional<double> neg_inf_val) {
+    double dflt_hi = 0.0, dflt_lo = 0.0;
+    if (!nan_to_num_default_limits(iter.dtype(), &dflt_hi, &dflt_lo)) {
+        hagane_cpu_fallback_boundary(
+            Cfg.op_name, iter.dtype() == c10::ScalarType::Double
+                             ? "fp64_computed_in_f32" : "dtype_not_float");
+        Cfg.cpu_fallback(iter, nan_val, pos_inf_val, neg_inf_val);
+        return;
+    }
     auto out = make_ops_tensor_local(iter, 0);
     auto in  = make_ops_tensor_local(iter, 1);
     double n = nan_val.value_or(0.0);
-    double p = pos_inf_val.value_or(std::numeric_limits<double>::max());
-    double m = neg_inf_val.value_or(std::numeric_limits<double>::lowest());
+    double p = pos_inf_val.value_or(dflt_hi);
+    double m = neg_inf_val.value_or(dflt_lo);
     if (Cfg.c_abi_fn(&in, &out, n, p, m) != HAGANE_OPS_SUCCESS) {
         hagane_cpu_fallback_boundary(Cfg.op_name, "c_abi_declined");
         Cfg.cpu_fallback(iter, nan_val, pos_inf_val, neg_inf_val);
