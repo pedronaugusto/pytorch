@@ -475,8 +475,13 @@ struct RegisterPRIVATEUSE1Dispatch {
 // is HIP in the PyTorch HIPify build.
 #define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
 // #define REGISTER_DISPATCH(name, fn) REGISTER_HIP_DISPATCH(name, fn)
-#elif defined(__HIP_PLATFORM_HAGANE__) && !defined(CPU_CAPABILITY)
-// Hagane: .hip files compiled as C++ without __HIPCC__, but still need CUDA dispatch
+#elif defined(__HIP_PLATFORM_HAGANE__) && !defined(CPU_CAPABILITY) && !defined(__OBJC__)
+// Hagane: .hip files compiled as C++ without __HIPCC__, but still need CUDA dispatch.
+// NOT the MPS .mm files: torch_cpu compiles them with this macro defined too, and
+// without the __OBJC__ exclusion every MPS kernel registered as the CUDA kernel.
+// Where no torch_hip registration overrode it (lerp, isposinf, unfold_backward,
+// polar, ... 15 stubs) a device tensor reached an MPS kernel that binds its
+// storage pointer as an id<MTLBuffer> — objc_retain on a non-object, SIGSEGV.
 #define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
 #elif defined(__OBJC__) && defined(USE_MPS)
 // NB: this macro must be used from a 'mm' file in order to dispatch a MPS kernel

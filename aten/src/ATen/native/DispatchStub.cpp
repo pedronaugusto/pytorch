@@ -265,6 +265,16 @@ void* DispatchStubImpl::get_call_ptr(
     auto error = std::get<ErrorType>(result);
     switch (error) {
       case ErrorType::MissingDeviceKernel:
+#if defined(__HIP_PLATFORM_HAGANE__)
+        // Not a PyTorch bug on Hagane: torch's HIP kernel for this stub is not
+        // built (it needs hipcc) and Hagane registers no kernel for it yet. A
+        // capability gap, refused by name rather than asserted.
+        TORCH_CHECK_NOT_IMPLEMENTED(
+            device_type != c10::DeviceType::CUDA,
+            "hagane: this operator's device kernel (a DispatchStub) is not "
+            "implemented on Hagane — torch's HIP kernel is not built and no "
+            "Hagane kernel is registered for it. The op is refused, not computed.");
+#endif
         TORCH_INTERNAL_ASSERT(
             false, "DispatchStub: missing kernel for ", device_type);
       case ErrorType::DeviceNotSupported:
